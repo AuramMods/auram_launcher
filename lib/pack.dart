@@ -50,6 +50,7 @@ class PackInstance {
   StreamSubscription<String>? gameStdoutSubscription;
   StreamSubscription<String>? gameStderrSubscription;
   IOSink? gameLogSink;
+  int gameStreamsOpen = 0;
 
   PackInstance() : progressStream = BehaviorSubject.seeded(null);
 
@@ -168,12 +169,7 @@ class PackInstance {
       });
 
   void dispose() {
-    gameStdoutSubscription?.cancel();
-    gameStderrSubscription?.cancel();
-    gameLogSink?.close();
-    gameStdoutSubscription = null;
-    gameStderrSubscription = null;
-    gameLogSink = null;
+    _resetGameOutputTracking();
     progressStream.close();
   }
 
@@ -462,6 +458,181 @@ class PackInstance {
   String _toPlatformPath(String path) =>
       path.replaceAll("/", Platform.pathSeparator);
 
+  String _joinPath(List<String> parts) => parts.join(Platform.pathSeparator);
+
+  List<_DownloadTarget> _forgeRuntimeDownloadTargets({
+    required String minecraftVersion,
+    required String forgeVersion,
+    required String mcpVersion,
+  }) {
+    String mcpCoordinate = "$minecraftVersion-$mcpVersion";
+    String forgeCoordinate = "$minecraftVersion-$forgeVersion";
+    List<File> files = _forgeRuntimeFiles(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      mcpVersion: mcpVersion,
+    );
+    List<Uri> uris = <Uri>[
+      Uri.parse(
+        "$forgeMavenBaseUrl"
+        "net/minecraft/client/$mcpCoordinate/client-$mcpCoordinate-srg.jar",
+      ),
+      Uri.parse(
+        "$forgeMavenBaseUrl"
+        "net/minecraft/client/$mcpCoordinate/client-$mcpCoordinate-extra.jar",
+      ),
+      Uri.parse(
+        "$forgeMavenBaseUrl"
+        "net/minecraftforge/forge/$forgeCoordinate/forge-$forgeCoordinate-client.jar",
+      ),
+    ];
+
+    List<_DownloadTarget> targets = <_DownloadTarget>[];
+    int count = files.length;
+    for (int i = 0; i < count; i++) {
+      targets.add(_DownloadTarget(uri: uris[i], file: files[i], size: 0));
+    }
+    return targets;
+  }
+
+  Future<File> _downloadForgeInstaller({
+    required String minecraftVersion,
+    required String forgeVersion,
+    required String progressLabel,
+  }) async {
+    String forgeCoordinate = _forgeInstallerCoordinate(
+      minecraftVersion,
+      forgeVersion,
+    );
+    String installerPath =
+        "net/minecraftforge/forge/$forgeCoordinate/forge-$forgeCoordinate-installer.jar";
+    Uri installerUri = Uri.parse("$forgeMavenBaseUrl$installerPath");
+    File installerFile = File(
+      "${tempDir.path}${Platform.pathSeparator}forge-installer-$forgeCoordinate.jar",
+    );
+
+    await _downloadFile(
+      uri: installerUri,
+      target: installerFile,
+      progressLabel: progressLabel,
+      itemName: "Forge installer",
+    );
+    return installerFile;
+  }
+
+  Future<bool> _downloadForgeRuntimeTarget(_DownloadTarget target) async {
+    try {
+      await _downloadFile(
+        uri: target.uri,
+        target: target.file,
+        progressLabel: "Downloading Forge Runtime Files",
+        itemName: "Forge runtime file",
+        emitByteProgress: false,
+      );
+      return true;
+    } catch (_) {
+      if (await target.file.exists()) {
+        await target.file.delete();
+      }
+      return false;
+    }
+  }
+
+  Future<bool> _tryDownloadForgeRuntimeFromMaven({
+    required String minecraftVersion,
+    required String forgeVersion,
+    required String mcpVersion,
+  }) async {
+    List<_DownloadTarget> allTargets = _forgeRuntimeDownloadTargets(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      mcpVersion: mcpVersion,
+    );
+    List<_DownloadTarget> missingTargets = <_DownloadTarget>[];
+    for (_DownloadTarget target in allTargets) {
+      if (await target.file.exists()) continue;
+      missingTargets.add(target);
+    }
+    if (missingTargets.isEmpty) return true;
+
+    int total = missingTargets.length;
+    int completed = 0;
+    bool allDownloaded = true;
+    progressStream.add(("0 forge files downloaded / $total", 0));
+
+    List<Future<void>> futures = <Future<void>>[];
+    for (_DownloadTarget target in missingTargets) {
+      Future<void> future = _downloadForgeRuntimeTarget(target).then((success) {
+        if (!success) {
+          allDownloaded = false;
+          return;
+        }
+
+        completed += 1;
+        progressStream.add((
+          "$completed forge files downloaded / $total",
+          completed / total,
+        ));
+      });
+      futures.add(future);
+    }
+    await Future.wait(futures);
+    if (!allDownloaded) return false;
+
+    for (_DownloadTarget target in allTargets) {
+      if (await target.file.exists()) continue;
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _ensureForgeLauncherProfiles({
+    required String minecraftVersion,
+    required String forgeVersion,
+  }) async {
+    if (!await minecraftDir.exists()) {
+      await minecraftDir.create(recursive: true);
+    }
+
+    String versionId = "$minecraftVersion-forge-$forgeVersion";
+    String now = DateTime.now().toUtc().toIso8601String();
+    Map<String, dynamic> launcherProfile = <String, dynamic>{
+      "profiles": <String, dynamic>{
+        "Auram": <String, dynamic>{
+          "name": "Auram",
+          "type": "custom",
+          "created": now,
+          "lastUsed": now,
+          "icon": "Furnace",
+          "gameDir": minecraftDir.path,
+          "lastVersionId": versionId,
+        },
+      },
+      "selectedProfile": "Auram",
+      "clientToken": "",
+      "authenticationDatabase": <String, dynamic>{},
+      "settings": <String, dynamic>{},
+      "version": 3,
+    };
+
+    File launcherProfiles = File(
+      _joinPath(<String>[minecraftDir.path, "launcher_profiles.json"]),
+    );
+    if (!await launcherProfiles.exists()) {
+      await launcherProfiles.writeAsString(jsonEncode(launcherProfile));
+    }
+
+    File launcherProfilesStore = File(
+      _joinPath(<String>[
+        minecraftDir.path,
+        "launcher_profiles_microsoft_store.json",
+      ]),
+    );
+    if (!await launcherProfilesStore.exists()) {
+      await launcherProfilesStore.writeAsString(jsonEncode(launcherProfile));
+    }
+  }
+
   Future<(String, String)> _readPackVersions() async {
     File packMeta = File(
       "${gameDir.path}${Platform.pathSeparator}mmc-pack.json",
@@ -521,22 +692,10 @@ class PackInstance {
     required String minecraftVersion,
     required String forgeVersion,
   }) async {
-    String forgeCoordinate = _forgeInstallerCoordinate(
-      minecraftVersion,
-      forgeVersion,
-    );
-    String installerPath =
-        "net/minecraftforge/forge/$forgeCoordinate/forge-$forgeCoordinate-installer.jar";
-    Uri installerUri = Uri.parse("$forgeMavenBaseUrl$installerPath");
-    File installerFile = File(
-      "${tempDir.path}${Platform.pathSeparator}forge-installer-$forgeCoordinate.jar",
-    );
-
-    await _downloadFile(
-      uri: installerUri,
-      target: installerFile,
+    File installerFile = await _downloadForgeInstaller(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
       progressLabel: "Downloading Forge Installer",
-      itemName: "Forge installer",
     );
 
     List<int> installerBytes = await installerFile.readAsBytes();
@@ -869,7 +1028,155 @@ class PackInstance {
       minecraftLibraries: minecraftLibraries,
       forgeLibraries: forgeLibraries,
     );
+    await _ensureForgeRuntimeArtifacts(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      forgeVersionJson: forgeVersionJson,
+    );
     await _ensureAssets(minecraftVersionJson);
+  }
+
+  String _resolveForgeMcpVersion(Map<String, dynamic> forgeVersionJson) {
+    Map<String, dynamic> data = _map(forgeVersionJson["data"]);
+    Map<String, dynamic> mcp = _map(data["MCP_VERSION"]);
+    String mcpVersion = mcp["client"]?.toString() ?? "";
+    if (mcpVersion.isNotEmpty) return mcpVersion;
+    mcpVersion = mcp["value"]?.toString() ?? "";
+    if (mcpVersion.isNotEmpty) return mcpVersion;
+
+    List<String> gameArgs = _collectVersionArguments(
+      versionJson: forgeVersionJson,
+      side: "game",
+      features: _defaultLaunchFeatures(),
+    );
+    if (gameArgs.isEmpty) {
+      gameArgs = _collectLegacyGameArguments(forgeVersionJson);
+    }
+
+    for (int i = 0; i < gameArgs.length; i++) {
+      String arg = gameArgs[i];
+      if (arg == "--fml.mcpVersion" && i + 1 < gameArgs.length) {
+        String value = gameArgs[i + 1];
+        if (value.isNotEmpty) return value;
+      }
+
+      if (arg.startsWith("--fml.mcpVersion=")) {
+        String value = arg.substring("--fml.mcpVersion=".length);
+        if (value.isNotEmpty) return value;
+      }
+    }
+
+    throw Exception("Failed to resolve Forge MCP version");
+  }
+
+  List<File> _forgeRuntimeFiles({
+    required String minecraftVersion,
+    required String forgeVersion,
+    required String mcpVersion,
+  }) {
+    String mcpCoordinate = "$minecraftVersion-$mcpVersion";
+    String forgeCoordinate = "$minecraftVersion-$forgeVersion";
+    return <File>[
+      File(
+        _joinPath(<String>[
+          librariesDir.path,
+          "net",
+          "minecraft",
+          "client",
+          mcpCoordinate,
+          "client-$mcpCoordinate-srg.jar",
+        ]),
+      ),
+      File(
+        _joinPath(<String>[
+          librariesDir.path,
+          "net",
+          "minecraft",
+          "client",
+          mcpCoordinate,
+          "client-$mcpCoordinate-extra.jar",
+        ]),
+      ),
+      File(
+        _joinPath(<String>[
+          librariesDir.path,
+          "net",
+          "minecraftforge",
+          "forge",
+          forgeCoordinate,
+          "forge-$forgeCoordinate-client.jar",
+        ]),
+      ),
+    ];
+  }
+
+  Future<void> _ensureForgeRuntimeArtifacts({
+    required String minecraftVersion,
+    required String forgeVersion,
+    required Map<String, dynamic> forgeVersionJson,
+  }) async {
+    String mcpVersion = _resolveForgeMcpVersion(forgeVersionJson);
+    List<File> requiredFiles = _forgeRuntimeFiles(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      mcpVersion: mcpVersion,
+    );
+
+    bool allPresent = true;
+    for (File file in requiredFiles) {
+      if (await file.exists()) continue;
+      allPresent = false;
+      break;
+    }
+    if (allPresent) return;
+
+    bool downloadedFromMaven = await _tryDownloadForgeRuntimeFromMaven(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      mcpVersion: mcpVersion,
+    );
+    if (downloadedFromMaven) return;
+
+    File installerFile = await _downloadForgeInstaller(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+      progressLabel: "Downloading Forge Runtime",
+    );
+
+    progressStream.add(("Installing Forge Runtime", -1));
+    await _ensureForgeLauncherProfiles(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+    );
+    String javaExecutable = await _resolveJavaExecutable();
+    await _ensureExecutable(javaExecutable);
+
+    ProcessResult result = await Process.run(javaExecutable, <String>[
+      "-jar",
+      installerFile.path,
+      "--installClient",
+      minecraftDir.path,
+    ], workingDirectory: tempDir.path);
+    if (result.exitCode != 0) {
+      String stderr = result.stderr.toString().trim();
+      String stdout = result.stdout.toString().trim();
+      String details = stderr.isNotEmpty ? stderr : stdout;
+      if (details.length > 4000) {
+        details = details.substring(details.length - 4000);
+      }
+      throw Exception("Forge installer failed (${result.exitCode}): $details");
+    }
+
+    List<String> missing = <String>[];
+    for (File file in requiredFiles) {
+      if (await file.exists()) continue;
+      missing.add(file.path);
+    }
+    if (missing.isNotEmpty) {
+      throw Exception(
+        "Forge runtime files are missing after install: ${missing.join(", ")}",
+      );
+    }
   }
 
   File _versionJsonFile(String versionId) => File(
@@ -1067,6 +1374,25 @@ class PackInstance {
       output.add(_applyPlaceholders(input: item, values: values));
     }
     return output;
+  }
+
+  void _appendIgnoreListJar({
+    required List<String> jvmArgs,
+    required String jarName,
+  }) {
+    if (jarName.isEmpty) return;
+    String key = "-DignoreList=";
+    for (int i = 0; i < jvmArgs.length; i++) {
+      String arg = jvmArgs[i];
+      if (!arg.startsWith(key)) continue;
+      String existing = arg.substring(key.length);
+      List<String> entries = existing.split(",");
+      for (String entry in entries) {
+        if (entry.trim() == jarName) return;
+      }
+      jvmArgs[i] = "$key$existing,$jarName";
+      return;
+    }
   }
 
   bool _hasClasspathArgument(List<String> jvmArgs) {
@@ -1347,6 +1673,10 @@ class PackInstance {
       minecraftLibraries: minecraftLibraries,
       forgeLibraries: forgeLibraries,
     );
+    String inheritedJarVersion = forgeVersionJson["jar"]?.toString() ?? "";
+    if (inheritedJarVersion.isEmpty) {
+      inheritedJarVersion = minecraftVersion;
+    }
 
     String classpathSeparator = Platform.isWindows ? ";" : ":";
     String classpath = classpathEntries.join(classpathSeparator);
@@ -1405,6 +1735,10 @@ class PackInstance {
       input: mergedGameArgs,
       values: placeholders,
     );
+    _appendIgnoreListJar(
+      jvmArgs: resolvedJvmArgs,
+      jarName: "$inheritedJarVersion.jar",
+    );
 
     if (!_hasClasspathArgument(resolvedJvmArgs)) {
       resolvedJvmArgs.add("-cp");
@@ -1435,12 +1769,7 @@ class PackInstance {
     required List<String> launchArguments,
     required String workingDirectory,
   }) async {
-    gameStdoutSubscription?.cancel();
-    gameStderrSubscription?.cancel();
-    gameLogSink?.close();
-    gameStdoutSubscription = null;
-    gameStderrSubscription = null;
-    gameLogSink = null;
+    _resetGameOutputTracking();
 
     Directory logDirectory = Directory(
       "${launcherDir.path}${Platform.pathSeparator}logs",
@@ -1472,9 +1801,26 @@ class PackInstance {
         .transform(utf8.decoder)
         .transform(LineSplitter());
 
-    gameStdoutSubscription = outLines.listen(_onGameStdout);
-    gameStderrSubscription = errLines.listen(_onGameStderr);
-    process.exitCode.then(_onGameExit);
+    gameStreamsOpen = 2;
+    gameStdoutSubscription = outLines.listen(
+      _onGameStdout,
+      onDone: _onGameStdoutClosed,
+    );
+    gameStderrSubscription = errLines.listen(
+      _onGameStderr,
+      onDone: _onGameStderrClosed,
+    );
+  }
+
+  void _resetGameOutputTracking() {
+    gameStdoutSubscription?.cancel();
+    gameStderrSubscription?.cancel();
+    gameLogSink?.close();
+    gameStdoutSubscription = null;
+    gameStderrSubscription = null;
+    gameLogSink = null;
+    gameProcess = null;
+    gameStreamsOpen = 0;
   }
 
   void _onGameStdout(String line) {
@@ -1487,15 +1833,24 @@ class PackInstance {
     gameLogSink?.writeln("[ERR] $line");
   }
 
-  void _onGameExit(int code) {
-    verbose("Game exited with code $code");
-    gameLogSink?.writeln("Game exited with code $code");
+  void _onGameStdoutClosed() {
+    gameStdoutSubscription = null;
+    _onGameOutputClosed();
+  }
+
+  void _onGameStderrClosed() {
+    gameStderrSubscription = null;
+    _onGameOutputClosed();
+  }
+
+  void _onGameOutputClosed() {
+    if (gameStreamsOpen <= 0) return;
+    gameStreamsOpen -= 1;
+    if (gameStreamsOpen > 0) return;
+    gameStreamsOpen = 0;
+    gameLogSink?.writeln("Game output streams closed");
     gameLogSink?.close();
     gameLogSink = null;
-    gameStdoutSubscription?.cancel();
-    gameStderrSubscription?.cancel();
-    gameStdoutSubscription = null;
-    gameStderrSubscription = null;
     gameProcess = null;
   }
 
