@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:arcane/arcane.dart';
 import 'package:auram_launcher/pack.dart';
 import 'package:flutter/services.dart';
@@ -50,6 +52,7 @@ class _MainScreenState extends State<MainScreen> {
     verboseAnnounce("Launching Auram");
     Shafted auth = await getShafted();
     await packInstance.launch(auth);
+    exit(0);
   }
 
   @override

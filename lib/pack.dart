@@ -50,7 +50,6 @@ class PackInstance {
   StreamSubscription<String>? gameStdoutSubscription;
   StreamSubscription<String>? gameStderrSubscription;
   IOSink? gameLogSink;
-  int gameStreamsOpen = 0;
 
   PackInstance() : progressStream = BehaviorSubject.seeded(null);
 
@@ -1771,45 +1770,13 @@ class PackInstance {
   }) async {
     _resetGameOutputTracking();
 
-    Directory logDirectory = Directory(
-      "${launcherDir.path}${Platform.pathSeparator}logs",
-    );
-    if (!await logDirectory.exists()) {
-      await logDirectory.create(recursive: true);
-    }
-    String logName = "game-${DateTime.now().millisecondsSinceEpoch}.log";
-    File logFile = File(
-      "${logDirectory.path}${Platform.pathSeparator}$logName",
-    );
-    gameLogSink = logFile.openWrite(mode: FileMode.writeOnlyAppend);
-    gameLogSink?.writeln("Starting java: $javaExecutable");
-    gameLogSink?.writeln("Working directory: $workingDirectory");
-    gameLogSink?.writeln("Argument count: ${launchArguments.length}");
-
     Process process = await Process.start(
       javaExecutable,
       launchArguments,
       workingDirectory: workingDirectory,
-      mode: ProcessStartMode.detachedWithStdio,
+      mode: ProcessStartMode.detached,
     );
     gameProcess = process;
-
-    Stream<String> outLines = process.stdout
-        .transform(utf8.decoder)
-        .transform(LineSplitter());
-    Stream<String> errLines = process.stderr
-        .transform(utf8.decoder)
-        .transform(LineSplitter());
-
-    gameStreamsOpen = 2;
-    gameStdoutSubscription = outLines.listen(
-      _onGameStdout,
-      onDone: _onGameStdoutClosed,
-    );
-    gameStderrSubscription = errLines.listen(
-      _onGameStderr,
-      onDone: _onGameStderrClosed,
-    );
   }
 
   void _resetGameOutputTracking() {
@@ -1818,38 +1785,6 @@ class PackInstance {
     gameLogSink?.close();
     gameStdoutSubscription = null;
     gameStderrSubscription = null;
-    gameLogSink = null;
-    gameProcess = null;
-    gameStreamsOpen = 0;
-  }
-
-  void _onGameStdout(String line) {
-    verbose("[GAME] $line");
-    gameLogSink?.writeln("[OUT] $line");
-  }
-
-  void _onGameStderr(String line) {
-    verbose("[GAME-ERR] $line");
-    gameLogSink?.writeln("[ERR] $line");
-  }
-
-  void _onGameStdoutClosed() {
-    gameStdoutSubscription = null;
-    _onGameOutputClosed();
-  }
-
-  void _onGameStderrClosed() {
-    gameStderrSubscription = null;
-    _onGameOutputClosed();
-  }
-
-  void _onGameOutputClosed() {
-    if (gameStreamsOpen <= 0) return;
-    gameStreamsOpen -= 1;
-    if (gameStreamsOpen > 0) return;
-    gameStreamsOpen = 0;
-    gameLogSink?.writeln("Game output streams closed");
-    gameLogSink?.close();
     gameLogSink = null;
     gameProcess = null;
   }
