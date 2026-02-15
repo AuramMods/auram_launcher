@@ -13,7 +13,13 @@ class AuramLauncher extends StatelessWidget {
   const AuramLauncher({super.key});
 
   @override
-  Widget build(BuildContext context) => ArcaneApp(home: MainScreen());
+  Widget build(BuildContext context) => ArcaneApp(
+    home: MainScreen(),
+    title: "Auram",
+    theme: ArcaneTheme(
+      scheme: ContrastedColorScheme.fromScheme(ColorSchemes.violet),
+    ),
+  );
 }
 
 class MainScreen extends StatefulWidget {
