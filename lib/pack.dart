@@ -108,23 +108,26 @@ class PackInstance {
   }
 
   AArch get currentArch {
-    if (Platform.isMacOS) {
+    if (Platform.isWindows) {
+      String arch = _windowsArchToken();
+      if (arch.contains("arm64") || arch.contains("aarch64")) {
+        return AArch.arm64;
+      }
+      return AArch.x64;
+    }
+
+    if (Platform.isMacOS || Platform.isLinux) {
       ProcessResult result = Process.runSync("uname", ["-m"]);
       if (result.exitCode != 0) {
         throw Exception("Failed to determine architecture: ${result.stderr}");
       }
-      String arch = result.stdout.toString().trim();
-      if (arch == "x86_64") return AArch.x64;
-      if (arch == "arm64") return AArch.arm64;
+      String arch = result.stdout.toString().trim().toLowerCase();
+      if (arch == "x86_64" || arch == "amd64") return AArch.x64;
+      if (arch == "arm64" || arch == "aarch64") return AArch.arm64;
       throw UnsupportedError("Unsupported architecture: $arch");
-    } else if (Platform.isWindows || Platform.isLinux) {
-      bool isArm64 = Process.runSync("uname", [
-        "-m",
-      ]).stdout.toString().contains("aarch64");
-      return isArm64 ? AArch.arm64 : AArch.x64;
-    } else {
-      throw UnsupportedError("Unsupported platform");
     }
+
+    throw UnsupportedError("Unsupported platform");
   }
 
   String get jdkDownload =>
@@ -149,19 +152,15 @@ class PackInstance {
       Directory("${minecraftDir.path}${Platform.pathSeparator}natives");
 
   Future<void> initialize() => getApplicationSupportDirectory()
-      .then(
-        (v) => Directory("${v.absolute.path}${Platform.pathSeparator}/Auram"),
-      )
+      .then((v) => Directory(_joinPath(<String>[v.absolute.path, "Auram"])))
       .then((v) async {
         await v.create(recursive: true);
         launcherDir = v;
-        tempDir = Directory("${v.absolute.path}${Platform.pathSeparator}temp");
+        tempDir = Directory(_joinPath(<String>[v.absolute.path, "temp"]));
         if (await tempDir.exists()) await tempDir.delete(recursive: true);
         await tempDir.create(recursive: true);
-        javaDir = Directory("${v.absolute.path}${Platform.pathSeparator}jvm");
-        gameDir = Directory(
-          "${v.absolute.path}${Platform.pathSeparator}minecraft",
-        );
+        javaDir = Directory(_joinPath(<String>[v.absolute.path, "jvm"]));
+        gameDir = Directory(_joinPath(<String>[v.absolute.path, "minecraft"]));
         verbose("Launcher: ${launcherDir.absolute.path}");
         await ensureInstall();
         progressStream.add(null);
@@ -174,11 +173,18 @@ class PackInstance {
 
   String _basename(String path) {
     List<String> parts = path
-        .split(Platform.pathSeparator)
+        .split(RegExp(r"[\\/]+"))
         .where((v) => v.isNotEmpty)
         .toList();
     if (parts.isEmpty) return path;
     return parts.last;
+  }
+
+  String _windowsArchToken() {
+    String wow64 =
+        Platform.environment["PROCESSOR_ARCHITEW6432"]?.toLowerCase() ?? "";
+    if (wow64.isNotEmpty) return wow64;
+    return Platform.environment["PROCESSOR_ARCHITECTURE"]?.toLowerCase() ?? "";
   }
 
   String _psQuote(String input) => "'${input.replaceAll("'", "''")}'";

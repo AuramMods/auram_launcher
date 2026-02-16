@@ -8,7 +8,7 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  arcane: ^6.5.9
+  arcane: ^6.5.11
   archive: ^4.0.7
   artifact: ^1.0.33
   toxic_flutter: ^1.1.0
