@@ -1454,7 +1454,7 @@ packages:
     source: hosted
     version: "0.1.0+1"
   tinycolor2:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: tinycolor2
       sha256: "81850c32ac8d4dcff37299bf3e52bcad4f4db6bc73d4b06727c9922de3766390"

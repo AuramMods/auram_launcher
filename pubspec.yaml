@@ -17,6 +17,7 @@ dependencies:
   url_launcher: ^6.3.2
   fast_log: ^1.0.7
   path_provider: ^2.1.5
+  tinycolor2: ^3.0.1
 dependency_overrides:
   skeletonizer: ^2.1.3
 dev_dependencies:
