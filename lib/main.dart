@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:microshaft/microshaft.dart';
 import 'package:microshaft/src/model/shafted.dart';
+import 'package:patterns_canvas/patterns_canvas.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 void main() => runApp("auram_launcher", AuramLauncher());
@@ -57,7 +58,7 @@ class _MainScreenState extends State<MainScreen> {
 
   Future<void> simulateLoading() async {
     while (true) {
-      for (var i = 0; i <= 100; i++) {
+      for (int i = 0; i <= 100; i++) {
         await Future.delayed(
           Duration(milliseconds: (500 * Random().nextDouble()).round()),
         );
@@ -78,6 +79,26 @@ class _MainScreenState extends State<MainScreen> {
     exit(0);
   }
 
+  Future<void> openDataFolder() async {
+    try {
+      await initFuture;
+      await packInstance.openDataFolder();
+    } on Object catch (error) {
+      if (!mounted) return;
+      TextToast("Failed to open data folder: $error").open(context);
+    }
+  }
+
+  Future<void> forceReinstall() async {
+    try {
+      await initFuture;
+      await packInstance.forceReinstall();
+    } on Object catch (error) {
+      if (!mounted) return;
+      TextToast("Force reinstall failed: $error").open(context);
+    }
+  }
+
   @override
   void dispose() {
     packInstance.dispose();
@@ -88,23 +109,118 @@ class _MainScreenState extends State<MainScreen> {
   Widget build(BuildContext context) => Screen(
     gutter: false,
     overrideBackgroundColor: Colors.black,
-    child: Container(
-      color: Colors.black,
-      child: Center(
-        child: packInstance.progressStream.buildNullable(
-          (p) => p == null
-              ? PrimaryButton(onPressed: launch, child: Text("Play"))
-              : Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Center(
-                      child: ProgressRing(value: p.$2 == -1 ? null : p.$2),
+    child: Stack(
+      children: [
+        Transform.scale(
+          scale: 2,
+          child:
+              CustomPaint(
+                    painter: AuramBackgroundPainter(
+                      w: MediaQuery.of(context).size.width ~/ 16,
+                      bg: Theme.of(context).colorScheme.background,
+                      fg: Theme.of(
+                        context,
+                      ).colorScheme.primary.withOpacity(0.4),
                     ),
-                    Center(child: Text(p.$1)),
-                  ],
-                ),
+                    child: SizedBox(
+                      child: Row(children: [Column(children: [])]),
+                    ),
+                  )
+                  .shadeWarpAnimation(
+                    frequency: 1,
+                    amplitude: 10,
+                    zSpeed: 0.025,
+                  )
+                  .shadeWarpAnimation(
+                    frequency: 3,
+                    amplitude: 50,
+                    zSpeed: 0.01,
+                    z: 500,
+                  )
+                  .shadeWarpAnimation(
+                    frequency: 0.5,
+                    amplitude: 150,
+                    zSpeed: 0.04,
+                    z: 100,
+                  )
+                  .shadeRGB(radius: 3)
+                  .shadeWarpAnimation(
+                    frequency: 4,
+                    amplitude: 80,
+                    zSpeed: 0.05,
+                    z: 10000,
+                  )
+                  .shadeEdge(0.0001),
         ),
-      ),
+        Center(
+          child: packInstance.progressStream.buildNullable(
+            (p) => p == null
+                ? Row(
+                    mainAxisSize: .min,
+                    children: [
+                      PrimaryButton(onPressed: launch, child: Text("Play")),
+                      Gap(8),
+                      IconButtonMenu(
+                        icon: Icons.gear_six_fill,
+                        items: [
+                          MenuButton(
+                            leading: Icon(Icons.folder),
+                            onPressed: () {
+                              openDataFolder();
+                            },
+                            child: Text("Data Folder"),
+                          ),
+                          MenuButton(
+                            leading: Icon(Icons.triangle),
+                            onPressed: () => DialogConfirm(
+                              title: "Are you sure?",
+                              description:
+                                  "This will also delete your settings, saved worlds, resource packs, everything!",
+                              destructive: true,
+                              confirmText: "Force Reinstall",
+                              onConfirm: () {
+                                forceReinstall();
+                              },
+                            ).open(context),
+                            child: Text("Force Reinstall"),
+                          ),
+                        ],
+                      ),
+                    ],
+                  )
+                : Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      OverflowBox(
+                        alignment: Alignment.center,
+                        child: Center(
+                          child: ProgressRing(value: p.$2 == -1 ? null : p.$2),
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.bottomCenter,
+                        child: Column(
+                          crossAxisAlignment: .start,
+                          mainAxisSize: .min,
+                          children: [
+                            Text(p.$1).muted.xSmall.padLeft(8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: LinearProgressIndicator(
+                                    value: p.$2 == -1 ? null : p.$2,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ).padBottom(1),
+                    ],
+                  ),
+          ),
+        ),
+      ],
     ),
   );
 }
@@ -182,8 +298,32 @@ class _ProgressRingState extends State<ProgressRing>
           repeats: 12,
           shimmer: 10 * v.abs(),
           thickness: 0.1 + (0.7 * v.abs()),
-          size: 600,
+          size: 500,
         ),
     ],
   );
+}
+
+class AuramBackgroundPainter extends CustomPainter {
+  final Color fg;
+  final Color bg;
+  final int w;
+
+  const AuramBackgroundPainter({
+    required this.fg,
+    required this.bg,
+    required this.w,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    Raindrops(
+      bgColor: bg,
+      fgColor: fg,
+      featuresCount: w,
+    ).paintOnWidget(canvas, size);
+  }
+
+  @override
+  bool shouldRepaint(CustomPainter oldDelegate) => true;
 }

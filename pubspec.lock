@@ -29,18 +29,18 @@ packages:
     dependency: "direct main"
     description:
       name: arcane
-      sha256: "5221da9e30d37fd293fee8f66d23d4fe1314213b3bead8e0d57486eb6d585c7e"
+      sha256: ee607f85e704e98fd292a68fb30328c77bb8be97f33af3418827615cf7bb508c
       url: "https://pub.dev"
     source: hosted
-    version: "6.5.11"
+    version: "6.5.12"
   archive:
     dependency: "direct main"
     description:
       name: archive
-      sha256: "2fde1607386ab523f7a36bb3e7edb43bd58e6edaf2ffb29d8a6d578b297fdbbd"
+      sha256: a96e8b390886ee8abb49b7bd3ac8df6f451c621619f52a26e815fdcf568959ff
       url: "https://pub.dev"
     source: hosted
-    version: "4.0.7"
+    version: "4.0.9"
   args:
     dependency: transitive
     description:
@@ -61,10 +61,10 @@ packages:
     dependency: "direct dev"
     description:
       name: artifact_gen
-      sha256: "9db28c3efbff6b682372f9d930d93d05ca0824cc430a6e8bda681b736321324e"
+      sha256: "4069b77bf08d20038f7ea740e1a76e4b33a23e8bab6aabeca8a0fc26e7465bf6"
       url: "https://pub.dev"
     source: hosted
-    version: "1.3.7"
+    version: "1.3.8"
   asn1lib:
     dependency: transitive
     description:
@@ -477,10 +477,10 @@ packages:
     dependency: "direct dev"
     description:
       name: fire_crud_gen
-      sha256: "1d37fff8e3a1eaded50d372d35c3de2db744adeb51d8b7c21bcef3de2fbafad0"
+      sha256: b98d2a11f014f8242bef1e777763713756827d60e24496696f2d61c20d8c92a8
       url: "https://pub.dev"
     source: hosted
-    version: "1.1.4"
+    version: "1.1.5"
   fixnum:
     dependency: transitive
     description:
@@ -1072,6 +1072,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.3.0"
+  patterns_canvas:
+    dependency: "direct main"
+    description:
+      name: patterns_canvas
+      sha256: f839fcc2b365a16c8391f488cb3ef9c78c565fe590664ce29f68fc4cf54f90b8
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.5.0"
   petitparser:
     dependency: transitive
     description:

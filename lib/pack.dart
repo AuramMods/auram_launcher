@@ -4,44 +4,21 @@ import 'dart:io';
 
 import 'package:arcane/arcane.dart';
 import 'package:archive/archive.dart';
+import 'package:auram_launcher/pack/pack_constants.dart';
+import 'package:auram_launcher/pack/pack_data_utils.dart';
+import 'package:auram_launcher/pack/pack_file_utils.dart';
+import 'package:auram_launcher/pack/pack_json_utils.dart';
+import 'package:auram_launcher/pack/pack_path_utils.dart';
+import 'package:auram_launcher/pack/pack_platform_utils.dart';
+import 'package:auram_launcher/pack/pack_types.dart';
 import 'package:fast_log/fast_log.dart';
 import 'package:microshaft/src/model/shafted.dart';
 import 'package:path_provider/path_provider.dart';
 
-enum APlatform { macos, windows, linux }
-
-enum AArch { x64, arm64 }
-
-Map<(APlatform, AArch), String> jdkDownloads = {
-  (
-    APlatform.macos,
-    AArch.arm64,
-  ): "https://cdn.azul.com/zulu/bin/zulu17.64.17-ca-jdk17.0.18-macosx_aarch64.zip",
-  (APlatform.macos, AArch.x64):
-      "https://cdn.azul.com/zulu/bin/zulu17.64.17-ca-jdk17.0.18-macosx_x64.zip",
-  (APlatform.windows, AArch.x64):
-      "https://cdn.azul.com/zulu/bin/zulu17.64.17-ca-jdk17.0.18-win_x64.zip",
-  (
-    APlatform.windows,
-    AArch.arm64,
-  ): "https://cdn.azul.com/zulu/bin/zulu17.64.17-ca-jdk17.0.18-win_aarch64.zip",
-  (APlatform.linux, AArch.x64):
-      "https://cdn.azul.com/zulu/bin/zulu17.64.17-ca-jdk17.0.18-linux_x64.zip",
-};
-
 class PackInstance {
-  static const int assumedPackBytes = 1024 * 1024 * 1024;
-  static const String mojangVersionManifestUrl =
-      "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
-  static const String mojangAssetObjectBaseUrl =
-      "https://resources.download.minecraft.net";
-  static const String mojangLibraryBaseUrl = "https://libraries.minecraft.net/";
-  static const String forgeMavenBaseUrl = "https://maven.minecraftforge.net/";
-  static const String jvmFlags =
-      "-Xmx16g -Xms8g -XX:+DisableExplicitGC -XX:SoftMaxHeapSize=10g -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=16 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:MaxTenuringThreshold=1 -XX:G1NewSizePercent=40 -XX:G1MaxNewSizePercent=50 -XX:G1HeapRegionSize=16M -XX:G1ReservePercent=15 -Dfml.readTimeout=120 -Dfml.loginTimeout=120";
-
   final BehaviorSubject<(String, double)?> progressStream;
 
+  late Future<String> knownFlags;
   late Directory launcherDir;
   late Directory javaDir;
   late Directory gameDir;
@@ -51,7 +28,9 @@ class PackInstance {
   StreamSubscription<String>? gameStderrSubscription;
   IOSink? gameLogSink;
 
-  PackInstance() : progressStream = BehaviorSubject.seeded(null);
+  PackInstance()
+    : progressStream = BehaviorSubject.seeded(null),
+      knownFlags = PackConstants.jvmFlags;
 
   Future<void> launch(Shafted auth) async {
     progressStream.add(("Preparing Launch", -1));
@@ -68,8 +47,12 @@ class PackInstance {
     Map<String, dynamic> forgeVersionJson = await _readInstalledVersionJson(
       forgeVersionId,
     );
-    List<dynamic> minecraftLibraries = _list(minecraftVersionJson["libraries"]);
-    List<dynamic> forgeLibraries = _list(forgeVersionJson["libraries"]);
+    List<dynamic> minecraftLibraries = PackJsonUtils.list(
+      minecraftVersionJson["libraries"],
+    );
+    List<dynamic> forgeLibraries = PackJsonUtils.list(
+      forgeVersionJson["libraries"],
+    );
     Directory nativesDirectory = await _prepareNativesDirectory(
       minecraftLibraries: minecraftLibraries,
       forgeLibraries: forgeLibraries,
@@ -100,41 +83,11 @@ class PackInstance {
     progressStream.add(("Game Started", 1));
   }
 
-  APlatform get currentPlatform {
-    if (Platform.isMacOS) return APlatform.macos;
-    if (Platform.isWindows) return APlatform.windows;
-    if (Platform.isLinux) return APlatform.linux;
-    throw UnsupportedError("Unsupported platform");
-  }
+  APlatform get currentPlatform => PackPlatformUtils.currentPlatform();
 
-  AArch get currentArch {
-    if (Platform.isWindows) {
-      String arch = _windowsArchToken();
-      if (arch.contains("arm64") || arch.contains("aarch64")) {
-        return AArch.arm64;
-      }
-      return AArch.x64;
-    }
+  AArch get currentArch => PackPlatformUtils.currentArch();
 
-    if (Platform.isMacOS || Platform.isLinux) {
-      ProcessResult result = Process.runSync("uname", ["-m"]);
-      if (result.exitCode != 0) {
-        throw Exception("Failed to determine architecture: ${result.stderr}");
-      }
-      String arch = result.stdout.toString().trim().toLowerCase();
-      if (arch == "x86_64" || arch == "amd64") return AArch.x64;
-      if (arch == "arm64" || arch == "aarch64") return AArch.arm64;
-      throw UnsupportedError("Unsupported architecture: $arch");
-    }
-
-    throw UnsupportedError("Unsupported platform");
-  }
-
-  String get jdkDownload =>
-      jdkDownloads[(currentPlatform, currentArch)] ??
-      (throw UnsupportedError(
-        "Unsupported platform/architecture combination!",
-      ));
+  String get jdkDownload => PackPlatformUtils.jdkDownload();
 
   Directory get minecraftDir =>
       Directory("${gameDir.path}${Platform.pathSeparator}minecraft");
@@ -152,15 +105,25 @@ class PackInstance {
       Directory("${minecraftDir.path}${Platform.pathSeparator}natives");
 
   Future<void> initialize() => getApplicationSupportDirectory()
-      .then((v) => Directory(_joinPath(<String>[v.absolute.path, "Auram"])))
+      .then(
+        (v) => Directory(
+          PackPathUtils.joinPath(<String>[v.absolute.path, "Auram"]),
+        ),
+      )
       .then((v) async {
         await v.create(recursive: true);
         launcherDir = v;
-        tempDir = Directory(_joinPath(<String>[v.absolute.path, "temp"]));
+        tempDir = Directory(
+          PackPathUtils.joinPath(<String>[v.absolute.path, "temp"]),
+        );
         if (await tempDir.exists()) await tempDir.delete(recursive: true);
         await tempDir.create(recursive: true);
-        javaDir = Directory(_joinPath(<String>[v.absolute.path, "jvm"]));
-        gameDir = Directory(_joinPath(<String>[v.absolute.path, "minecraft"]));
+        javaDir = Directory(
+          PackPathUtils.joinPath(<String>[v.absolute.path, "jvm"]),
+        );
+        gameDir = Directory(
+          PackPathUtils.joinPath(<String>[v.absolute.path, "minecraft"]),
+        );
         verbose("Launcher: ${launcherDir.absolute.path}");
         await ensureInstall();
         progressStream.add(null);
@@ -169,89 +132,6 @@ class PackInstance {
   void dispose() {
     _resetGameOutputTracking();
     progressStream.close();
-  }
-
-  String _basename(String path) {
-    List<String> parts = path
-        .split(RegExp(r"[\\/]+"))
-        .where((v) => v.isNotEmpty)
-        .toList();
-    if (parts.isEmpty) return path;
-    return parts.last;
-  }
-
-  String _windowsArchToken() {
-    String wow64 =
-        Platform.environment["PROCESSOR_ARCHITEW6432"]?.toLowerCase() ?? "";
-    if (wow64.isNotEmpty) return wow64;
-    return Platform.environment["PROCESSOR_ARCHITECTURE"]?.toLowerCase() ?? "";
-  }
-
-  String _psQuote(String input) => "'${input.replaceAll("'", "''")}'";
-
-  Future<void> _copyEntity({
-    required FileSystemEntity source,
-    required String destination,
-  }) async {
-    if (source is File) {
-      await source.copy(destination);
-      return;
-    }
-
-    if (source is Directory) {
-      Directory destinationDir = Directory(destination);
-      await destinationDir.create(recursive: true);
-      await for (FileSystemEntity child in source.list(followLinks: false)) {
-        await _copyEntity(
-          source: child,
-          destination:
-              "$destination${Platform.pathSeparator}${_basename(child.path)}",
-        );
-      }
-      return;
-    }
-
-    if (source is Link) {
-      String target = await source.target();
-      await Link(destination).create(target);
-    }
-  }
-
-  Future<void> _extractArchive({
-    required File tempZip,
-    required Directory extractDir,
-  }) async {
-    if (Platform.isWindows) {
-      String command =
-          "Expand-Archive -LiteralPath ${_psQuote(tempZip.path)} -DestinationPath ${_psQuote(extractDir.path)} -Force";
-      ProcessResult result = await Process.run("powershell", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        command,
-      ]);
-      if (result.exitCode != 0) {
-        throw ProcessException(
-          "powershell",
-          ["-Command", command],
-          result.stderr.toString(),
-          result.exitCode,
-        );
-      }
-      return;
-    }
-
-    List<String> unzipArgs = ["-q", "-o", tempZip.path, "-d", extractDir.path];
-    ProcessResult unzipResult = await Process.run("unzip", unzipArgs);
-    if (unzipResult.exitCode != 0) {
-      throw ProcessException(
-        "unzip",
-        unzipArgs,
-        unzipResult.stderr.toString(),
-        unzipResult.exitCode,
-      );
-    }
   }
 
   Future<void> _downloadFile({
@@ -356,15 +236,262 @@ class PackInstance {
     throw FormatException("Expected JSON object in ${file.path}");
   }
 
-  Map<String, dynamic> _map(dynamic value) {
-    if (value is Map<String, dynamic>) return value;
-    if (value is Map) return value.cast<String, dynamic>();
-    return <String, dynamic>{};
+  Future<List<dynamic>> _readJsonListFromUri(Uri uri) async {
+    HttpClient client = HttpClient();
+    client.connectionTimeout = Duration(seconds: 30);
+    try {
+      HttpClientRequest request = await client.getUrl(uri);
+      HttpClientResponse response = await request.close();
+      if (response.statusCode != HttpStatus.ok) {
+        throw HttpException(
+          "Failed to download metadata (status ${response.statusCode})",
+          uri: uri,
+        );
+      }
+
+      List<int> buffer = <int>[];
+      await for (List<int> chunk in response) {
+        buffer.addAll(chunk);
+      }
+      dynamic decoded = jsonDecode(utf8.decode(buffer));
+      if (decoded is List) return decoded;
+      throw FormatException("Expected JSON array at $uri");
+    } finally {
+      client.close(force: true);
+    }
   }
 
-  List<dynamic> _list(dynamic value) {
-    if (value is List) return value;
-    return <dynamic>[];
+  Future<_PackTagRef> _resolveLatestPackTag() async {
+    List<_PackTagRef> tags = await _fetchPackTags();
+    if (tags.isEmpty) {
+      throw Exception("No tags were returned for the pack repository");
+    }
+    return tags.first;
+  }
+
+  Future<List<_PackTagRef>> _fetchPackTags() async {
+    Uri tagsUri = Uri.parse(PackConstants.packTagsApiUrl);
+    List<dynamic> values = await _readJsonListFromUri(tagsUri);
+    List<_PackTagRef> tags = <_PackTagRef>[];
+
+    for (dynamic value in values) {
+      Map<String, dynamic> tagMap = PackJsonUtils.map(value);
+      if (tagMap.isEmpty) continue;
+      String name = tagMap["name"]?.toString() ?? "";
+      if (name.isEmpty) continue;
+
+      Map<String, dynamic> commit = PackJsonUtils.map(tagMap["commit"]);
+      String sha = commit["sha"]?.toString() ?? "";
+      if (sha.isEmpty) continue;
+
+      tags.add(_PackTagRef(name: name, sha: sha));
+    }
+
+    tags.sort(_comparePackTags);
+    return tags;
+  }
+
+  int _comparePackTags(_PackTagRef a, _PackTagRef b) {
+    (int, int, int, bool, String)? aVersion = _parsePackVersion(a.name);
+    (int, int, int, bool, String)? bVersion = _parsePackVersion(b.name);
+
+    if (aVersion != null && bVersion != null) {
+      if (aVersion.$1 != bVersion.$1) {
+        return bVersion.$1.compareTo(aVersion.$1);
+      }
+      if (aVersion.$2 != bVersion.$2) {
+        return bVersion.$2.compareTo(aVersion.$2);
+      }
+      if (aVersion.$3 != bVersion.$3) {
+        return bVersion.$3.compareTo(aVersion.$3);
+      }
+      if (aVersion.$4 != bVersion.$4) {
+        if (aVersion.$4) return 1;
+        return -1;
+      }
+      if (aVersion.$5 != bVersion.$5) {
+        return bVersion.$5.compareTo(aVersion.$5);
+      }
+    } else if (aVersion != null) {
+      return -1;
+    } else if (bVersion != null) {
+      return 1;
+    }
+
+    String aName = a.name.toLowerCase();
+    String bName = b.name.toLowerCase();
+    return bName.compareTo(aName);
+  }
+
+  (int, int, int, bool, String)? _parsePackVersion(String rawVersion) {
+    String value = rawVersion.trim();
+    RegExp regex = RegExp(
+      r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$",
+    );
+    RegExpMatch? match = regex.firstMatch(value);
+    if (match == null) return null;
+
+    int? majorCandidate = int.tryParse(match.group(1) ?? "");
+    if (majorCandidate == null) return null;
+    int major = majorCandidate;
+
+    int minor = 0;
+    String minorText = match.group(2) ?? "";
+    if (minorText.isNotEmpty) {
+      int? minorCandidate = int.tryParse(minorText);
+      if (minorCandidate == null) return null;
+      minor = minorCandidate;
+    }
+
+    int patch = 0;
+    String patchText = match.group(3) ?? "";
+    if (patchText.isNotEmpty) {
+      int? patchCandidate = int.tryParse(patchText);
+      if (patchCandidate == null) return null;
+      patch = patchCandidate;
+    }
+
+    String preRelease = match.group(4) ?? "";
+    bool isPreRelease = preRelease.isNotEmpty;
+    return (major, minor, patch, isPreRelease, preRelease);
+  }
+
+  String _normalizeProtectedPathSpec(String rawSpec) {
+    String normalized = rawSpec.trim().replaceAll("\\", "/");
+    while (normalized.startsWith("/")) {
+      normalized = normalized.substring(1);
+    }
+    return normalized;
+  }
+
+  Future<Directory> _backupProtectedMinecraftFiles() async {
+    Directory backupDir = Directory(
+      PackPathUtils.joinPath(<String>[tempDir.path, "protected_minecraft"]),
+    );
+    if (await backupDir.exists()) {
+      await backupDir.delete(recursive: true);
+    }
+    await backupDir.create(recursive: true);
+
+    if (!await minecraftDir.exists()) {
+      return backupDir;
+    }
+
+    for (String rawSpec in PackConstants.protectedMinecraftPaths) {
+      String normalizedSpec = _normalizeProtectedPathSpec(rawSpec);
+      if (normalizedSpec.isEmpty) continue;
+
+      bool isDirectorySpec = normalizedSpec.endsWith("/");
+      String relativeSpec = normalizedSpec;
+      if (isDirectorySpec) {
+        relativeSpec = relativeSpec.substring(0, relativeSpec.length - 1);
+      }
+      if (relativeSpec.isEmpty) continue;
+
+      String localPath = PackPathUtils.toPlatformPath(relativeSpec);
+      String sourcePath = PackPathUtils.joinPath(<String>[
+        minecraftDir.path,
+        localPath,
+      ]);
+      String backupPath = PackPathUtils.joinPath(<String>[
+        backupDir.path,
+        localPath,
+      ]);
+
+      if (isDirectorySpec) {
+        Directory sourceDirectory = Directory(sourcePath);
+        if (!await sourceDirectory.exists()) continue;
+        await PackFileUtils.copyEntity(
+          source: sourceDirectory,
+          destination: backupPath,
+        );
+        continue;
+      }
+
+      File sourceFile = File(sourcePath);
+      if (await sourceFile.exists()) {
+        Directory backupParent = Directory(backupPath).parent;
+        if (!await backupParent.exists()) {
+          await backupParent.create(recursive: true);
+        }
+        await PackFileUtils.copyEntity(
+          source: sourceFile,
+          destination: backupPath,
+        );
+        continue;
+      }
+
+      Directory sourceDirectory = Directory(sourcePath);
+      if (!await sourceDirectory.exists()) continue;
+      await PackFileUtils.copyEntity(
+        source: sourceDirectory,
+        destination: backupPath,
+      );
+    }
+
+    return backupDir;
+  }
+
+  Future<void> _restoreProtectedMinecraftFiles(Directory backupDir) async {
+    if (!await backupDir.exists()) return;
+    if (!await minecraftDir.exists()) {
+      await minecraftDir.create(recursive: true);
+    }
+
+    await for (FileSystemEntity child in backupDir.list(followLinks: false)) {
+      await PackFileUtils.copyEntity(
+        source: child,
+        destination: PackPathUtils.joinPath(<String>[
+          minecraftDir.path,
+          PackPathUtils.basename(child.path),
+        ]),
+      );
+    }
+  }
+
+  Future<void> _downloadAndInstallPackTag(_PackTagRef tag) async {
+    Uri downloadUri = Uri.parse(PackConstants.packTagZipUrl(tag.name));
+    File tempZip = File(
+      "${tempDir.absolute.path}${Platform.pathSeparator}pack.zip",
+    );
+    Directory extractDir = Directory(
+      "${tempDir.absolute.path}${Platform.pathSeparator}pack_extract",
+    );
+
+    if (await tempZip.exists()) {
+      await tempZip.delete();
+    }
+    if (await extractDir.exists()) {
+      await extractDir.delete(recursive: true);
+    }
+    await extractDir.create(recursive: true);
+
+    verbose("Downloading auram ${tag.name} (${tag.sha}) from $downloadUri");
+    await _downloadFile(
+      uri: downloadUri,
+      target: tempZip,
+      progressLabel: "Downloading Auram ${tag.name}",
+      itemName: "pack archive",
+      assumedTotalBytes: PackConstants.assumedPackBytes,
+    );
+
+    progressStream.add(("Installing Pack", -1));
+    verbose("Extracting pack ${tag.name} into ${gameDir.absolute.path}");
+    await PackFileUtils.extractArchive(
+      tempZip: tempZip,
+      extractDir: extractDir,
+    );
+    await _installExtractedDirectory(
+      extractDir: extractDir,
+      installDir: gameDir,
+    );
+
+    if (await tempZip.exists()) {
+      await tempZip.delete();
+    }
+    if (await extractDir.exists()) {
+      await extractDir.delete(recursive: true);
+    }
   }
 
   String _currentOsName() => switch (currentPlatform) {
@@ -384,7 +511,7 @@ class PackInstance {
   };
 
   bool _matchesRule(Map<String, dynamic> rule) {
-    Map<String, dynamic> os = _map(rule["os"]);
+    Map<String, dynamic> os = PackJsonUtils.map(rule["os"]);
     if (os.isEmpty) return true;
 
     String name = os["name"]?.toString() ?? "";
@@ -399,12 +526,12 @@ class PackInstance {
   }
 
   bool _isAllowedByRules(Map<String, dynamic> entry) {
-    List<dynamic> rules = _list(entry["rules"]);
+    List<dynamic> rules = PackJsonUtils.list(entry["rules"]);
     if (rules.isEmpty) return true;
 
     bool allowed = false;
     for (dynamic dynamicRule in rules) {
-      Map<String, dynamic> rule = _map(dynamicRule);
+      Map<String, dynamic> rule = PackJsonUtils.map(dynamicRule);
       if (rule.isEmpty) continue;
       if (!_matchesRule(rule)) continue;
       allowed = rule["action"]?.toString() == "allow";
@@ -413,7 +540,7 @@ class PackInstance {
   }
 
   String? _resolveNativeClassifier(Map<String, dynamic> library) {
-    Map<String, dynamic> natives = _map(library["natives"]);
+    Map<String, dynamic> natives = PackJsonUtils.map(library["natives"]);
     if (natives.isEmpty) return null;
 
     String classifier = natives[_currentOsName()]?.toString() ?? "";
@@ -450,7 +577,7 @@ class PackInstance {
 
   Uri _libraryBaseUri(Map<String, dynamic> library) {
     String base = library["url"]?.toString() ?? "";
-    if (base.isEmpty) base = mojangLibraryBaseUrl;
+    if (base.isEmpty) base = PackConstants.mojangLibraryBaseUrl;
     if (!base.endsWith("/")) base = "$base/";
     return Uri.parse(base);
   }
@@ -459,11 +586,6 @@ class PackInstance {
     String minecraftVersion,
     String forgeVersion,
   ) => "$minecraftVersion-$forgeVersion";
-
-  String _toPlatformPath(String path) =>
-      path.replaceAll("/", Platform.pathSeparator);
-
-  String _joinPath(List<String> parts) => parts.join(Platform.pathSeparator);
 
   List<_DownloadTarget> _forgeRuntimeDownloadTargets({
     required String minecraftVersion,
@@ -479,15 +601,15 @@ class PackInstance {
     );
     List<Uri> uris = <Uri>[
       Uri.parse(
-        "$forgeMavenBaseUrl"
+        "${PackConstants.forgeMavenBaseUrl}"
         "net/minecraft/client/$mcpCoordinate/client-$mcpCoordinate-srg.jar",
       ),
       Uri.parse(
-        "$forgeMavenBaseUrl"
+        "${PackConstants.forgeMavenBaseUrl}"
         "net/minecraft/client/$mcpCoordinate/client-$mcpCoordinate-extra.jar",
       ),
       Uri.parse(
-        "$forgeMavenBaseUrl"
+        "${PackConstants.forgeMavenBaseUrl}"
         "net/minecraftforge/forge/$forgeCoordinate/forge-$forgeCoordinate-client.jar",
       ),
     ];
@@ -511,7 +633,9 @@ class PackInstance {
     );
     String installerPath =
         "net/minecraftforge/forge/$forgeCoordinate/forge-$forgeCoordinate-installer.jar";
-    Uri installerUri = Uri.parse("$forgeMavenBaseUrl$installerPath");
+    Uri installerUri = Uri.parse(
+      "${PackConstants.forgeMavenBaseUrl}$installerPath",
+    );
     File installerFile = File(
       "${tempDir.path}${Platform.pathSeparator}forge-installer-$forgeCoordinate.jar",
     );
@@ -621,14 +745,17 @@ class PackInstance {
     };
 
     File launcherProfiles = File(
-      _joinPath(<String>[minecraftDir.path, "launcher_profiles.json"]),
+      PackPathUtils.joinPath(<String>[
+        minecraftDir.path,
+        "launcher_profiles.json",
+      ]),
     );
     if (!await launcherProfiles.exists()) {
       await launcherProfiles.writeAsString(jsonEncode(launcherProfile));
     }
 
     File launcherProfilesStore = File(
-      _joinPath(<String>[
+      PackPathUtils.joinPath(<String>[
         minecraftDir.path,
         "launcher_profiles_microsoft_store.json",
       ]),
@@ -647,12 +774,12 @@ class PackInstance {
     }
 
     Map<String, dynamic> packJson = await _readJsonFile(packMeta);
-    List<dynamic> components = _list(packJson["components"]);
+    List<dynamic> components = PackJsonUtils.list(packJson["components"]);
     String minecraftVersion = "";
     String forgeVersion = "";
 
     for (dynamic dynamicComponent in components) {
-      Map<String, dynamic> component = _map(dynamicComponent);
+      Map<String, dynamic> component = PackJsonUtils.map(dynamicComponent);
       if (component.isEmpty) continue;
       String uid = component["uid"]?.toString() ?? "";
       String version = component["version"]?.toString() ?? "";
@@ -676,12 +803,12 @@ class PackInstance {
     String minecraftVersion,
   ) async {
     Map<String, dynamic> manifest = await _readJsonFromUri(
-      Uri.parse(mojangVersionManifestUrl),
+      Uri.parse(PackConstants.mojangVersionManifestUrl),
     );
-    List<dynamic> versions = _list(manifest["versions"]);
+    List<dynamic> versions = PackJsonUtils.list(manifest["versions"]);
     String versionUrl = "";
     for (dynamic dynamicVersion in versions) {
-      Map<String, dynamic> version = _map(dynamicVersion);
+      Map<String, dynamic> version = PackJsonUtils.map(dynamicVersion);
       if (version["id"]?.toString() == minecraftVersion) {
         versionUrl = version["url"]?.toString() ?? "";
         break;
@@ -719,6 +846,47 @@ class PackInstance {
     throw Exception("Forge version.json has invalid format");
   }
 
+  File _minecraftVersionJsonFile(String minecraftVersion) => File(
+    "${versionsDir.path}${Platform.pathSeparator}$minecraftVersion${Platform.pathSeparator}$minecraftVersion.json",
+  );
+
+  Future<Map<String, dynamic>> _loadMinecraftVersionJson(
+    String minecraftVersion,
+  ) async {
+    File installed = _minecraftVersionJsonFile(minecraftVersion);
+    if (await installed.exists()) {
+      return _readJsonFile(installed);
+    }
+    return _resolveMinecraftVersionJson(minecraftVersion);
+  }
+
+  Future<Map<String, dynamic>> _loadForgeVersionJson({
+    required String minecraftVersion,
+    required String forgeVersion,
+  }) async {
+    String expectedVersionId = "$minecraftVersion-forge-$forgeVersion";
+    File expected = _versionJsonFile(expectedVersionId);
+    if (await expected.exists()) {
+      return _readJsonFile(expected);
+    }
+
+    try {
+      String installedVersionId = await _resolveForgeVersionId(
+        minecraftVersion: minecraftVersion,
+        forgeVersion: forgeVersion,
+      );
+      File installed = _versionJsonFile(installedVersionId);
+      if (await installed.exists()) {
+        return _readJsonFile(installed);
+      }
+    } catch (_) {}
+
+    return _resolveForgeVersionJson(
+      minecraftVersion: minecraftVersion,
+      forgeVersion: forgeVersion,
+    );
+  }
+
   Future<void> _ensureVersionFiles({
     required String minecraftVersion,
     required Map<String, dynamic> minecraftVersionJson,
@@ -740,8 +908,12 @@ class PackInstance {
       );
     }
 
-    Map<String, dynamic> downloads = _map(minecraftVersionJson["downloads"]);
-    Map<String, dynamic> clientDownload = _map(downloads["client"]);
+    Map<String, dynamic> downloads = PackJsonUtils.map(
+      minecraftVersionJson["downloads"],
+    );
+    Map<String, dynamic> clientDownload = PackJsonUtils.map(
+      downloads["client"],
+    );
     String clientUrl = clientDownload["url"]?.toString() ?? "";
     int clientSize = clientDownload["size"] is num
         ? (clientDownload["size"] as num).toInt()
@@ -784,9 +956,9 @@ class PackInstance {
   }) {
     if (!_isAllowedByRules(library)) return;
 
-    Map<String, dynamic> downloads = _map(library["downloads"]);
+    Map<String, dynamic> downloads = PackJsonUtils.map(library["downloads"]);
     if (downloads.isNotEmpty) {
-      Map<String, dynamic> artifact = _map(downloads["artifact"]);
+      Map<String, dynamic> artifact = PackJsonUtils.map(downloads["artifact"]);
       if (artifact.isNotEmpty) {
         String path = artifact["path"]?.toString() ?? "";
         String url = artifact["url"]?.toString() ?? "";
@@ -797,7 +969,7 @@ class PackInstance {
           outputs[path] = _DownloadTarget(
             uri: Uri.parse(url),
             file: File(
-              "${librariesDir.path}${Platform.pathSeparator}${_toPlatformPath(path)}",
+              "${librariesDir.path}${Platform.pathSeparator}${PackPathUtils.toPlatformPath(path)}",
             ),
             size: size,
           );
@@ -810,7 +982,7 @@ class PackInstance {
           outputs[path] = _DownloadTarget(
             uri: base.resolve(path),
             file: File(
-              "${librariesDir.path}${Platform.pathSeparator}${_toPlatformPath(path)}",
+              "${librariesDir.path}${Platform.pathSeparator}${PackPathUtils.toPlatformPath(path)}",
             ),
             size: 0,
           );
@@ -818,8 +990,10 @@ class PackInstance {
       }
 
       String? nativeClassifier = _resolveNativeClassifier(library);
-      Map<String, dynamic> classifiers = _map(downloads["classifiers"]);
-      Map<String, dynamic> nativeArtifact = _map(
+      Map<String, dynamic> classifiers = PackJsonUtils.map(
+        downloads["classifiers"],
+      );
+      Map<String, dynamic> nativeArtifact = PackJsonUtils.map(
         nativeClassifier == null ? null : classifiers[nativeClassifier],
       );
       if (nativeArtifact.isNotEmpty) {
@@ -832,7 +1006,7 @@ class PackInstance {
           outputs[path] = _DownloadTarget(
             uri: Uri.parse(url),
             file: File(
-              "${librariesDir.path}${Platform.pathSeparator}${_toPlatformPath(path)}",
+              "${librariesDir.path}${Platform.pathSeparator}${PackPathUtils.toPlatformPath(path)}",
             ),
             size: size,
           );
@@ -850,7 +1024,7 @@ class PackInstance {
     outputs[path] = _DownloadTarget(
       uri: base.resolve(path),
       file: File(
-        "${librariesDir.path}${Platform.pathSeparator}${_toPlatformPath(path)}",
+        "${librariesDir.path}${Platform.pathSeparator}${PackPathUtils.toPlatformPath(path)}",
       ),
       size: 0,
     );
@@ -866,12 +1040,12 @@ class PackInstance {
 
     Map<String, _DownloadTarget> outputs = <String, _DownloadTarget>{};
     for (dynamic dynamicLibrary in minecraftLibraries) {
-      Map<String, dynamic> library = _map(dynamicLibrary);
+      Map<String, dynamic> library = PackJsonUtils.map(dynamicLibrary);
       if (library.isEmpty) continue;
       _addLibraryDownloads(library: library, outputs: outputs);
     }
     for (dynamic dynamicLibrary in forgeLibraries) {
-      Map<String, dynamic> library = _map(dynamicLibrary);
+      Map<String, dynamic> library = PackJsonUtils.map(dynamicLibrary);
       if (library.isEmpty) continue;
       _addLibraryDownloads(library: library, outputs: outputs);
     }
@@ -908,8 +1082,24 @@ class PackInstance {
     await Future.wait(futures);
   }
 
+  File _assetCompletionMarker(String indexId) => File(
+    "${assetsDir.path}${Platform.pathSeparator}.assets_complete_$indexId",
+  );
+
+  Future<void> _clearAssetCompletionMarkers() async {
+    if (!await assetsDir.exists()) return;
+    await for (FileSystemEntity entity in assetsDir.list(followLinks: false)) {
+      if (entity is! File) continue;
+      String name = PackPathUtils.basename(entity.path);
+      if (!name.startsWith(".assets_complete_")) continue;
+      await entity.delete();
+    }
+  }
+
   Future<void> _ensureAssets(Map<String, dynamic> minecraftVersionJson) async {
-    Map<String, dynamic> assetIndex = _map(minecraftVersionJson["assetIndex"]);
+    Map<String, dynamic> assetIndex = PackJsonUtils.map(
+      minecraftVersionJson["assetIndex"],
+    );
     String indexId = assetIndex["id"]?.toString() ?? "";
     String indexUrl = assetIndex["url"]?.toString() ?? "";
     int indexSize = assetIndex["size"] is num
@@ -935,28 +1125,49 @@ class PackInstance {
     File indexFile = File(
       "${indexDir.path}${Platform.pathSeparator}$indexId.json",
     );
-    await _downloadFile(
-      uri: Uri.parse(indexUrl),
-      target: indexFile,
-      progressLabel: "Downloading Asset Index",
-      itemName: "asset index",
-      expectedTotalBytes: indexSize,
-    );
+    File completionMarker = _assetCompletionMarker(indexId);
+    if (await completionMarker.exists() && await indexFile.exists()) {
+      progressStream.add(("Assets Up To Date", 1));
+      return;
+    }
+
+    if (!await indexFile.exists()) {
+      await _downloadFile(
+        uri: Uri.parse(indexUrl),
+        target: indexFile,
+        progressLabel: "Downloading Asset Index",
+        itemName: "asset index",
+        expectedTotalBytes: indexSize,
+      );
+    }
 
     Map<String, dynamic> indexJson = await _readJsonFile(indexFile);
-    Map<String, dynamic> objects = _map(indexJson["objects"]);
+    Map<String, dynamic> objects = PackJsonUtils.map(indexJson["objects"]);
     List<MapEntry<String, dynamic>> entries = objects.entries.toList();
     List<_DownloadTarget> downloads = <_DownloadTarget>[];
     for (MapEntry<String, dynamic> entry in entries) {
-      Map<String, dynamic> object = _map(entry.value);
+      Map<String, dynamic> object = PackJsonUtils.map(entry.value);
       String hash = object["hash"]?.toString() ?? "";
       int size = object["size"] is num ? (object["size"] as num).toInt() : 0;
       if (hash.length < 2) continue;
       String prefix = hash.substring(0, 2);
-      Uri objectUri = Uri.parse("$mojangAssetObjectBaseUrl/$prefix/$hash");
+      Uri objectUri = Uri.parse(
+        "${PackConstants.mojangAssetObjectBaseUrl}/$prefix/$hash",
+      );
       File objectFile = File(
         "${objectsDir.path}${Platform.pathSeparator}$prefix${Platform.pathSeparator}$hash",
       );
+      bool needsDownload = true;
+      if (await objectFile.exists()) {
+        if (size <= 0) {
+          needsDownload = false;
+        } else {
+          int length = await objectFile.length();
+          needsDownload = length != size;
+        }
+      }
+      if (!needsDownload) continue;
+
       downloads.add(
         _DownloadTarget(uri: objectUri, file: objectFile, size: size),
       );
@@ -964,7 +1175,9 @@ class PackInstance {
 
     int total = downloads.length;
     if (total <= 0) {
-      progressStream.add(("0 Assets Installed", 1));
+      await _clearAssetCompletionMarkers();
+      await completionMarker.writeAsString("ok");
+      progressStream.add(("Assets Up To Date", 1));
       return;
     }
 
@@ -972,7 +1185,7 @@ class PackInstance {
     int downloading = 0;
     int index = 0;
     List<Future<void>> futures = <Future<void>>[];
-    progressStream.add(("Installing $total", 0));
+    progressStream.add(("0 assets downloaded / $total assets to download", 0));
 
     while (index < total) {
       if (downloading >= 64) {
@@ -995,7 +1208,7 @@ class PackInstance {
               .then((_) {
                 completed += 1;
                 progressStream.add((
-                  "$completed assets installed",
+                  "$completed assets downloaded / $total assets to download",
                   completed / total,
                 ));
               })
@@ -1006,6 +1219,8 @@ class PackInstance {
     }
 
     await Future.wait(futures);
+    await _clearAssetCompletionMarkers();
+    await completionMarker.writeAsString("ok");
   }
 
   Future<void> ensureMinecraftFiles() async {
@@ -1014,9 +1229,10 @@ class PackInstance {
     String minecraftVersion = versions.$1;
     String forgeVersion = versions.$2;
 
-    Map<String, dynamic> minecraftVersionJson =
-        await _resolveMinecraftVersionJson(minecraftVersion);
-    Map<String, dynamic> forgeVersionJson = await _resolveForgeVersionJson(
+    Map<String, dynamic> minecraftVersionJson = await _loadMinecraftVersionJson(
+      minecraftVersion,
+    );
+    Map<String, dynamic> forgeVersionJson = await _loadForgeVersionJson(
       minecraftVersion: minecraftVersion,
       forgeVersion: forgeVersion,
     );
@@ -1027,8 +1243,12 @@ class PackInstance {
       forgeVersionJson: forgeVersionJson,
     );
 
-    List<dynamic> minecraftLibraries = _list(minecraftVersionJson["libraries"]);
-    List<dynamic> forgeLibraries = _list(forgeVersionJson["libraries"]);
+    List<dynamic> minecraftLibraries = PackJsonUtils.list(
+      minecraftVersionJson["libraries"],
+    );
+    List<dynamic> forgeLibraries = PackJsonUtils.list(
+      forgeVersionJson["libraries"],
+    );
     await _ensureLibraries(
       minecraftLibraries: minecraftLibraries,
       forgeLibraries: forgeLibraries,
@@ -1042,8 +1262,8 @@ class PackInstance {
   }
 
   String _resolveForgeMcpVersion(Map<String, dynamic> forgeVersionJson) {
-    Map<String, dynamic> data = _map(forgeVersionJson["data"]);
-    Map<String, dynamic> mcp = _map(data["MCP_VERSION"]);
+    Map<String, dynamic> data = PackJsonUtils.map(forgeVersionJson["data"]);
+    Map<String, dynamic> mcp = PackJsonUtils.map(data["MCP_VERSION"]);
     String mcpVersion = mcp["client"]?.toString() ?? "";
     if (mcpVersion.isNotEmpty) return mcpVersion;
     mcpVersion = mcp["value"]?.toString() ?? "";
@@ -1083,7 +1303,7 @@ class PackInstance {
     String forgeCoordinate = "$minecraftVersion-$forgeVersion";
     return <File>[
       File(
-        _joinPath(<String>[
+        PackPathUtils.joinPath(<String>[
           librariesDir.path,
           "net",
           "minecraft",
@@ -1093,7 +1313,7 @@ class PackInstance {
         ]),
       ),
       File(
-        _joinPath(<String>[
+        PackPathUtils.joinPath(<String>[
           librariesDir.path,
           "net",
           "minecraft",
@@ -1103,7 +1323,7 @@ class PackInstance {
         ]),
       ),
       File(
-        _joinPath(<String>[
+        PackPathUtils.joinPath(<String>[
           librariesDir.path,
           "net",
           "minecraftforge",
@@ -1209,7 +1429,7 @@ class PackInstance {
         .toList();
     for (FileSystemEntity entry in entries) {
       if (entry is! Directory) continue;
-      String candidate = _basename(entry.path);
+      String candidate = PackPathUtils.basename(entry.path);
       if (!candidate.contains("forge")) continue;
       if (!candidate.contains(forgeVersion)) continue;
       File candidateJson = _versionJsonFile(candidate);
@@ -1246,7 +1466,7 @@ class PackInstance {
   }) {
     if (!_matchesRule(rule)) return false;
 
-    Map<String, dynamic> featureRules = _map(rule["features"]);
+    Map<String, dynamic> featureRules = PackJsonUtils.map(rule["features"]);
     if (featureRules.isEmpty) return true;
 
     for (MapEntry<String, dynamic> entry in featureRules.entries) {
@@ -1262,12 +1482,12 @@ class PackInstance {
     required Map<String, dynamic> entry,
     required Map<String, bool> features,
   }) {
-    List<dynamic> rules = _list(entry["rules"]);
+    List<dynamic> rules = PackJsonUtils.list(entry["rules"]);
     if (rules.isEmpty) return true;
 
     bool allowed = false;
     for (dynamic dynamicRule in rules) {
-      Map<String, dynamic> rule = _map(dynamicRule);
+      Map<String, dynamic> rule = PackJsonUtils.map(dynamicRule);
       if (rule.isEmpty) continue;
       if (!_matchesArgumentRule(rule: rule, features: features)) continue;
       allowed = rule["action"]?.toString() == "allow";
@@ -1302,7 +1522,7 @@ class PackInstance {
       return;
     }
 
-    Map<String, dynamic> entryMap = _map(entry);
+    Map<String, dynamic> entryMap = PackJsonUtils.map(entry);
     if (entryMap.isEmpty) return;
     if (!_isArgumentEntryAllowed(entry: entryMap, features: features)) return;
     _appendArgumentValue(output: output, value: entryMap["value"]);
@@ -1313,7 +1533,9 @@ class PackInstance {
     required String side,
     required Map<String, bool> features,
   }) {
-    Map<String, dynamic> arguments = _map(versionJson["arguments"]);
+    Map<String, dynamic> arguments = PackJsonUtils.map(
+      versionJson["arguments"],
+    );
     dynamic sideArguments = arguments[side];
     if (sideArguments is! List) return <String>[];
 
@@ -1427,12 +1649,12 @@ class PackInstance {
   }) async {
     Map<String, _DownloadTarget> downloadMap = <String, _DownloadTarget>{};
     for (dynamic dynamicLibrary in minecraftLibraries) {
-      Map<String, dynamic> library = _map(dynamicLibrary);
+      Map<String, dynamic> library = PackJsonUtils.map(dynamicLibrary);
       if (library.isEmpty) continue;
       _addLibraryDownloads(library: library, outputs: downloadMap);
     }
     for (dynamic dynamicLibrary in forgeLibraries) {
-      Map<String, dynamic> library = _map(dynamicLibrary);
+      Map<String, dynamic> library = PackJsonUtils.map(dynamicLibrary);
       if (library.isEmpty) continue;
       _addLibraryDownloads(library: library, outputs: downloadMap);
     }
@@ -1479,15 +1701,19 @@ class PackInstance {
     combined.addAll(forgeLibraries);
 
     for (dynamic dynamicLibrary in combined) {
-      Map<String, dynamic> library = _map(dynamicLibrary);
+      Map<String, dynamic> library = PackJsonUtils.map(dynamicLibrary);
       if (library.isEmpty) continue;
       if (!_isAllowedByRules(library)) continue;
       String? classifier = _resolveNativeClassifier(library);
       if (classifier == null || classifier.isEmpty) continue;
 
-      Map<String, dynamic> downloads = _map(library["downloads"]);
-      Map<String, dynamic> classifiers = _map(downloads["classifiers"]);
-      Map<String, dynamic> nativeArtifact = _map(classifiers[classifier]);
+      Map<String, dynamic> downloads = PackJsonUtils.map(library["downloads"]);
+      Map<String, dynamic> classifiers = PackJsonUtils.map(
+        downloads["classifiers"],
+      );
+      Map<String, dynamic> nativeArtifact = PackJsonUtils.map(
+        classifiers[classifier],
+      );
       String path = nativeArtifact["path"]?.toString() ?? "";
       if (path.isEmpty) {
         String name = library["name"]?.toString() ?? "";
@@ -1498,7 +1724,7 @@ class PackInstance {
       if (path.isEmpty) continue;
 
       String localPath =
-          "${librariesDir.path}${Platform.pathSeparator}${_toPlatformPath(path)}";
+          "${librariesDir.path}${Platform.pathSeparator}${PackPathUtils.toPlatformPath(path)}";
       if (seen.contains(localPath)) continue;
       seen.add(localPath);
       File nativeJar = File(localPath);
@@ -1522,7 +1748,7 @@ class PackInstance {
       if (entry.name.startsWith("META-INF/")) continue;
       List<int>? entryBytes = entry.readBytes();
       if (entryBytes == null) continue;
-      String localName = _toPlatformPath(entry.name);
+      String localName = PackPathUtils.toPlatformPath(entry.name);
       File out = File("${destination.path}${Platform.pathSeparator}$localName");
       Directory parent = out.parent;
       if (!await parent.exists()) {
@@ -1589,9 +1815,11 @@ class PackInstance {
       followLinks: false,
     )) {
       if (entity is! File) continue;
-      String fileName = _basename(entity.path).toLowerCase();
+      String fileName = PackPathUtils.basename(entity.path).toLowerCase();
       if (fileName != "java" && fileName != "java.exe") continue;
-      String parentName = _basename(entity.parent.path).toLowerCase();
+      String parentName = PackPathUtils.basename(
+        entity.parent.path,
+      ).toLowerCase();
       if (parentName != "bin") continue;
       return entity.path;
     }
@@ -1612,7 +1840,8 @@ class PackInstance {
     }
   }
 
-  List<String> _collectJvmFlagArguments() => _splitArguments(jvmFlags);
+  Future<List<String>> _collectJvmFlagArguments() async =>
+      _splitArguments(await knownFlags);
 
   Future<List<String>> _buildLaunchArguments({
     required Shafted auth,
@@ -1701,7 +1930,9 @@ class PackInstance {
       authToken = "0";
     }
 
-    Map<String, dynamic> assetIndex = _map(minecraftVersionJson["assetIndex"]);
+    Map<String, dynamic> assetIndex = PackJsonUtils.map(
+      minecraftVersionJson["assetIndex"],
+    );
     String assetIndexName = assetIndex["id"]?.toString() ?? "";
     String versionType = forgeVersionJson["type"]?.toString() ?? "";
     if (versionType.isEmpty) {
@@ -1752,7 +1983,7 @@ class PackInstance {
 
     List<String> allJvmArgs = <String>[];
     allJvmArgs.addAll(resolvedJvmArgs);
-    allJvmArgs.addAll(_collectJvmFlagArguments());
+    allJvmArgs.addAll(await _collectJvmFlagArguments());
 
     String mainClass = forgeVersionJson["mainClass"]?.toString() ?? "";
     if (mainClass.isEmpty) {
@@ -1821,12 +2052,39 @@ class PackInstance {
 
     await installDir.create(recursive: true);
     await for (FileSystemEntity child in sourceRoot.list(followLinks: false)) {
-      await _copyEntity(
+      await PackFileUtils.copyEntity(
         source: child,
         destination:
-            "${installDir.path}${Platform.pathSeparator}${_basename(child.path)}",
+            "${installDir.path}${Platform.pathSeparator}${PackPathUtils.basename(child.path)}",
       );
     }
+  }
+
+  Future<void> openDataFolder() async {
+    if (!await launcherDir.exists()) {
+      await launcherDir.create(recursive: true);
+    }
+    String folderPath = launcherDir.absolute.path;
+    (String, List<String>) command = switch (currentPlatform) {
+      APlatform.windows => ("explorer", <String>[folderPath]),
+      APlatform.macos => ("open", <String>[folderPath]),
+      APlatform.linux => ("xdg-open", <String>[folderPath]),
+    };
+    await Process.start(
+      command.$1,
+      command.$2,
+      mode: ProcessStartMode.detached,
+    );
+  }
+
+  Future<void> forceReinstall() async {
+    progressStream.add(("Force Reinstall", -1));
+    _resetGameOutputTracking();
+    if (await launcherDir.exists()) {
+      await launcherDir.delete(recursive: true);
+    }
+    PackDataUtils.setCurrentVersion("");
+    await initialize();
   }
 
   Future<void> ensureInstall() async {
@@ -1864,7 +2122,10 @@ class PackInstance {
 
     progressStream.add(("Installing JDK", -1));
     verbose("Extracting JDK into ${javaDir.absolute.path}");
-    await _extractArchive(tempZip: tempZip, extractDir: extractDir);
+    await PackFileUtils.extractArchive(
+      tempZip: tempZip,
+      extractDir: extractDir,
+    );
     await _installExtractedDirectory(
       extractDir: extractDir,
       installDir: javaDir,
@@ -1881,76 +2142,41 @@ class PackInstance {
   }
 
   Future<void> ensurePack() async {
+    bool hasLocalPack = false;
     if (await gameDir.exists()) {
-      bool hasContents = !(await gameDir.list(followLinks: false).isEmpty);
-      if (hasContents) return;
-      await gameDir.delete(recursive: true);
+      hasLocalPack = !(await gameDir.list(followLinks: false).isEmpty);
     }
 
-    List<Uri> downloadUris = [
-      Uri.parse(
-        "https://codeload.github.com/AuramMods/Auram/zip/refs/heads/main",
-      ),
-      Uri.parse(
-        "https://codeload.github.com/AuramMods/Auram/zip/refs/heads/master",
-      ),
-    ];
-
-    File tempZip = File(
-      "${tempDir.absolute.path}${Platform.pathSeparator}pack.zip",
-    );
-    Directory extractDir = Directory(
-      "${tempDir.absolute.path}${Platform.pathSeparator}pack_extract",
-    );
-
-    if (await tempZip.exists()) {
-      await tempZip.delete();
+    progressStream.add(("Checking Pack Updates", -1));
+    _PackTagRef latestTag;
+    try {
+      latestTag = await _resolveLatestPackTag();
+    } on Object catch (error) {
+      if (hasLocalPack) {
+        warn("Failed to fetch pack tags, using local pack: $error");
+        return;
+      }
+      rethrow;
     }
-    if (await extractDir.exists()) {
-      await extractDir.delete(recursive: true);
-    }
-    await extractDir.create(recursive: true);
+    verbose("Latest pack tag: ${latestTag.name} (${latestTag.sha})");
 
-    bool downloaded = false;
-    for (Uri uri in downloadUris) {
-      try {
-        verbose("Downloading auram from $uri");
-        await _downloadFile(
-          uri: uri,
-          target: tempZip,
-          progressLabel: "Downloading Auram",
-          itemName: "pack archive",
-          assumedTotalBytes: assumedPackBytes,
-        );
-        downloaded = true;
-        break;
-      } catch (_) {
-        if (await tempZip.exists()) {
-          await tempZip.delete();
-        }
+    String? currentVersion = PackDataUtils.getCurrentVersion();
+    if (hasLocalPack && currentVersion == latestTag.name) {
+      return;
+    }
+
+    Directory backupDir = await _backupProtectedMinecraftFiles();
+    try {
+      await _downloadAndInstallPackTag(latestTag);
+      await _restoreProtectedMinecraftFiles(backupDir);
+      PackDataUtils.setCurrentVersion(latestTag.name);
+    } finally {
+      if (await backupDir.exists()) {
+        await backupDir.delete(recursive: true);
       }
     }
 
-    if (!downloaded) {
-      throw Exception("Failed to download modpack archive from GitHub");
-    }
-
-    progressStream.add(("Installing Pack", -1));
-    verbose("Extracting pack into ${gameDir.absolute.path}");
-    await _extractArchive(tempZip: tempZip, extractDir: extractDir);
-    await _installExtractedDirectory(
-      extractDir: extractDir,
-      installDir: gameDir,
-    );
-
-    if (await tempZip.exists()) {
-      await tempZip.delete();
-    }
-    if (await extractDir.exists()) {
-      await extractDir.delete(recursive: true);
-    }
-
-    verbose("Pack ready: ${gameDir.absolute.path}");
+    verbose("Pack ready: ${gameDir.absolute.path} (${latestTag.name})");
   }
 }
 
@@ -1964,4 +2190,11 @@ class _DownloadTarget {
     required this.file,
     required this.size,
   });
+}
+
+class _PackTagRef {
+  final String name;
+  final String sha;
+
+  const _PackTagRef({required this.name, required this.sha});
 }
