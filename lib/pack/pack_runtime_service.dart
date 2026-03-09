@@ -767,6 +767,7 @@ class PackRuntimeService {
         progressLabel: "Downloading Asset Index",
         itemName: "asset index",
         expectedTotalBytes: indexSize,
+        maxAttempts: 6,
       );
     }
 
@@ -821,7 +822,7 @@ class PackRuntimeService {
     progressStream.add(("0 assets downloaded / $total assets to download", 0));
 
     while (index < total) {
-      if (downloading >= 64) {
+      if (downloading >= 32) {
         await Future.delayed(Duration(milliseconds: 1));
         continue;
       }
@@ -838,6 +839,7 @@ class PackRuntimeService {
                 itemName: "asset object",
                 expectedTotalBytes: target.size,
                 emitByteProgress: false,
+                maxAttempts: 8,
               )
               .then((_) {
                 completed += 1;
