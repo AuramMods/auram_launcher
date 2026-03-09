@@ -1,8 +1,10 @@
 import 'dart:io';
 import 'dart:math';
 
-import 'package:arcane/arcane.dart';
+import 'package:arcane/arcane.dart' hide FilePicker;
 import 'package:auram_launcher/pack.dart';
+import 'package:fast_log/fast_log.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:microshaft/microshaft.dart';
@@ -183,6 +185,40 @@ class _MainScreenState extends State<MainScreen> {
                               },
                             ).open(context),
                             child: Text("Force Reinstall"),
+                          ),
+                          MenuButton(
+                            leading: Icon(Icons.server_ionic),
+                            onPressed: () {
+                              FilePicker.platform
+                                  .pickFileAndDirectoryPaths()
+                                  .then((v) {
+                                    if (v != null && v.length > 1) {
+                                      TextToast(
+                                        "Select only one directory!",
+                                      ).open(context);
+                                      return;
+                                    }
+
+                                    String? path = v?.firstOrNull;
+                                    verbose("Selected $path");
+                                    if (path == null) {
+                                      return;
+                                    }
+
+                                    FileSystemEntityType t =
+                                        FileSystemEntity.typeSync(path);
+
+                                    if (t != .directory) {
+                                      TextToast(
+                                        "Selected path is not a directory!",
+                                      ).open(context);
+                                      return;
+                                    }
+
+                                    verbose("Installing Server into $path");
+                                  });
+                            },
+                            child: Text("Build Server"),
                           ),
                         ],
                       ),
