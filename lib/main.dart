@@ -33,6 +33,26 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
+class AuramShaftStorage extends MicroshaftStorage {
+  @override
+  bool containsKey(String key) => hotBox.containsKey(key);
+
+  @override
+  Future<void> flush() => hotBox.flush();
+
+  @override
+  String? get(String key, [String? or]) => hotBox.get(key, defaultValue: or);
+
+  @override
+  List<String> keys() => hotBox.keys.whereType<String>().toList();
+
+  @override
+  void remove(String key) => hotBox.delete(key);
+
+  @override
+  void set(String key, String value) => hotBox.put(key, value);
+}
+
 class _MainScreenState extends State<MainScreen> {
   late PackInstance packInstance;
   late Future<void> initFuture;
@@ -44,17 +64,16 @@ class _MainScreenState extends State<MainScreen> {
     initFuture = packInstance.initialize();
   }
 
-  Future<Shafted> getShafted() =>
-      MicroshaftClient(storage: FileStorage.load("tokens.dat"))
-          .authenticate((url, code) async {
-            warningAnnounce("CODE: $code");
-            await Clipboard.setData(ClipboardData(text: code));
-            TextToast("Copied code '$code' to clipboard!").open(context);
-            launchUrl(Uri.parse(url));
-          })
-          .thenRun((value) {
-            successAnnounce("Logged in as ${value.profileName}");
-          });
+  Future<Shafted> getShafted() => MicroshaftClient(storage: AuramShaftStorage())
+      .authenticate((url, code) async {
+        warningAnnounce("CODE: $code");
+        await Clipboard.setData(ClipboardData(text: code));
+        TextToast("Copied code '$code' to clipboard!").open(context);
+        launchUrl(Uri.parse(url));
+      })
+      .thenRun((value) {
+        successAnnounce("Logged in as ${value.profileName}");
+      });
 
   Future<void> simulateLoading() async {
     while (true) {
@@ -96,6 +115,16 @@ class _MainScreenState extends State<MainScreen> {
     } on Object catch (error) {
       if (!mounted) return;
       TextToast("Force reinstall failed: $error").open(context);
+    }
+  }
+
+  Future<void> buildServer() async {
+    try {
+      await initFuture;
+      await packInstance.buildServer();
+    } on Object catch (error) {
+      if (!mounted) return;
+      TextToast("Build server failed: $error").open(context);
     }
   }
 
@@ -155,41 +184,54 @@ class _MainScreenState extends State<MainScreen> {
         Center(
           child: packInstance.progressStream.buildNullable(
             (p) => p == null
-                ? Row(
-                    mainAxisSize: .min,
+                ? Stack(
+                    alignment: Alignment.center,
                     children: [
-                      PrimaryButton(onPressed: launch, child: Text("Play")),
-                      Gap(8),
-                      IconButtonMenu(
-                        icon: Icons.gear_six_fill,
-                        items: [
-                          MenuButton(
-                            leading: Icon(Icons.folder),
-                            onPressed: () {
-                              openDataFolder();
-                            },
-                            child: Text("Data Folder"),
-                          ),
-                          MenuButton(
-                            leading: Icon(Icons.triangle),
-                            onPressed: () => DialogConfirm(
-                              title: "Are you sure?",
-                              description:
-                                  "This will also delete your settings, saved worlds, resource packs, everything!",
-                              destructive: true,
-                              confirmText: "Force Reinstall",
-                              onConfirm: () {
-                                forceReinstall();
-                              },
-                            ).open(context),
-                            child: Text("Force Reinstall"),
-                          ),
-                          MenuButton(
-                            leading: Icon(Icons.server_outline_ionic),
-                            onPressed: () {},
-                            child: Text("Build Server"),
+                      Row(
+                        mainAxisSize: .min,
+                        children: [
+                          PrimaryButton(onPressed: launch, child: Text("Play")),
+                          Gap(8),
+                          IconButtonMenu(
+                            icon: Icons.gear_six_fill,
+                            items: [
+                              MenuButton(
+                                leading: Icon(Icons.folder),
+                                onPressed: () {
+                                  openDataFolder();
+                                },
+                                child: Text("Data Folder"),
+                              ),
+                              MenuButton(
+                                leading: Icon(Icons.triangle),
+                                onPressed: () => DialogConfirm(
+                                  title: "Are you sure?",
+                                  description:
+                                      "This will also delete your settings, saved worlds, resource packs, everything!",
+                                  destructive: true,
+                                  confirmText: "Force Reinstall",
+                                  onConfirm: () {
+                                    forceReinstall();
+                                  },
+                                ).open(context),
+                                child: Text("Force Reinstall"),
+                              ),
+                              MenuButton(
+                                leading: Icon(Icons.server_outline_ionic),
+                                onPressed: () {
+                                  buildServer();
+                                },
+                                child: Text("Build Server"),
+                              ),
+                            ],
                           ),
                         ],
+                      ),
+                      Align(
+                        alignment: Alignment.bottomCenter,
+                        child: Text(
+                          "v${packInstance.currentPackTag ?? "unknown"}",
+                        ).muted.xSmall.pad(8),
                       ),
                     ],
                   )

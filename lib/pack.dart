@@ -9,6 +9,7 @@ import 'package:auram_launcher/pack/pack_path_utils.dart';
 import 'package:auram_launcher/pack/pack_platform_utils.dart';
 import 'package:auram_launcher/pack/pack_repository_service.dart';
 import 'package:auram_launcher/pack/pack_runtime_service.dart';
+import 'package:auram_launcher/pack/pack_server_service.dart';
 import 'package:auram_launcher/pack/pack_types.dart';
 import 'package:fast_log/fast_log.dart';
 import 'package:microshaft/src/model/shafted.dart';
@@ -33,6 +34,8 @@ class PackInstance {
 
   String get jdkDownload => PackPlatformUtils.jdkDownload();
 
+  String? get currentPackTag => PackDataUtils.getCurrentVersion();
+
   Directory get minecraftDir =>
       Directory("${gameDir.path}${Platform.pathSeparator}minecraft");
 
@@ -47,6 +50,9 @@ class PackInstance {
 
   Directory get nativesRootDir =>
       Directory("${minecraftDir.path}${Platform.pathSeparator}natives");
+
+  Directory get serverDir =>
+      Directory("${gameDir.path}${Platform.pathSeparator}server");
 
   Future<void> launch(Shafted auth) async {
     info("Launch requested");
@@ -102,19 +108,23 @@ class PackInstance {
     if (!await launcherDir.exists()) {
       await launcherDir.create(recursive: true);
     }
-    String folderPath = launcherDir.absolute.path;
+    await _openDirectory(launcherDir);
+  }
+
+  Future<void> _openDirectory(Directory directory) async {
+    String folderPath = directory.absolute.path;
     (String, List<String>) command = switch (currentPlatform) {
       APlatform.windows => ("explorer", <String>[folderPath]),
       APlatform.macos => ("open", <String>[folderPath]),
       APlatform.linux => ("xdg-open", <String>[folderPath]),
     };
-    info("Opening launcher data folder: $folderPath");
+    info("Opening folder: $folderPath");
     await Process.start(
       command.$1,
       command.$2,
       mode: ProcessStartMode.detached,
     );
-    success("Open data folder command sent");
+    success("Open folder command sent");
   }
 
   Future<void> forceReinstall() async {
@@ -134,6 +144,22 @@ class PackInstance {
     await ensurePack();
     await ensureMinecraftFiles();
     success("Installation ensure completed");
+  }
+
+  Future<void> buildServer() async {
+    info("Build server requested");
+    if (!await minecraftDir.exists()) {
+      error("Client minecraft directory missing: ${minecraftDir.path}");
+      throw Exception("Client minecraft directory does not exist");
+    }
+
+    await PackServerService.buildServerFromClient(
+      progressStream: progressStream,
+      clientMinecraftDir: minecraftDir,
+      serverDir: serverDir,
+    );
+    await _openDirectory(serverDir);
+    success("Build server finished");
   }
 
   Future<void> ensureJDK() => PackJdkService.ensureJdk(
