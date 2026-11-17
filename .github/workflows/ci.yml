@@ -35,3 +35,5 @@ jobs:
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
       - run: cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_java_args
       - run: pnpm build --no-bundle
+      - if: runner.os == 'Windows'
+        run: cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_java_args -- src-tauri/target/release/auram-launcher.exe
