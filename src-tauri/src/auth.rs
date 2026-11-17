@@ -32,40 +32,8 @@ pub trait Vault: Send + Sync {
     fn save(&self, value: &Credentials) -> Result<()>;
     fn clear(&self) -> Result<()>;
 }
-pub struct NativeVault;
-impl NativeVault {
-    fn entry() -> Result<keyring::Entry> {
-        Ok(keyring::Entry::new(
-            if cfg!(feature = "qa") {
-                "art.arcane.auram.qa"
-            } else if cfg!(debug_assertions) {
-                "art.arcane.auram.dev"
-            } else {
-                "art.arcane.auram.launcher"
-            },
-            "microsoft",
-        )?)
-    }
-}
-impl Vault for NativeVault {
-    fn load(&self) -> Result<Option<Credentials>> {
-        match Self::entry()?.get_password() {
-            Ok(value) => Ok(Some(serde_json::from_str(&value)?)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-    fn save(&self, value: &Credentials) -> Result<()> {
-        Self::entry()?.set_password(&serde_json::to_string(value)?)?;
-        Ok(())
-    }
-    fn clear(&self) -> Result<()> {
-        match Self::entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
+mod vault;
+pub use vault::NativeVault;
 #[derive(Clone)]
 pub struct Auth {
     client: reqwest::Client,
@@ -112,7 +80,7 @@ impl Auth {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
-            vault: Arc::new(NativeVault),
+            vault: Arc::new(NativeVault::default()),
             gate: Arc::new(Mutex::new(())),
             token_url: TOKEN.into(),
             device_url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode".into(),

@@ -71,6 +71,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - if: runner.os == 'Windows'
+        run: cargo run --manifest-path src-tauri/Cargo.toml --locked --no-default-features --example verify_auth_vault
+      - if: runner.os == 'Windows'
         run: cargo run --manifest-path src-tauri/Cargo.toml --locked --no-default-features --example verify_java_args -- src-tauri/target/${{ matrix.target }}/release/auram-launcher.exe
       - run: node scripts/collect-artifacts.mjs ${{ matrix.target }} ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
