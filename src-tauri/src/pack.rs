@@ -47,6 +47,24 @@ pub struct Packs {
     repository: Repository,
 }
 impl Packs {
+    pub async fn server_changelists(
+        &self,
+        version: &str,
+        commit: &str,
+        target: &PackTag,
+        job: &Job,
+    ) -> Result<(Manifest, BTreeSet<String>, usize)> {
+        let tag = self.source().resolve(version, job).await?;
+        if !commit.is_empty() && commit != tag.sha {
+            bail!("Remote version commit disagrees with its immutable pack tag");
+        }
+        let base = self.manifest(tag, job).await?;
+        let (_, changes, count) = self
+            .source()
+            .delta(&base, target, &Selection::Server, job)
+            .await?;
+        Ok((base, changes, count))
+    }
     pub fn new(layout: Layout, net: Downloader) -> Self {
         Self {
             layout,

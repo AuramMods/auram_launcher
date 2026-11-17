@@ -164,7 +164,7 @@ impl<'a> Source<'a> {
             result=self.packs.net.json(url)=>result,
         }
     }
-    async fn resolve(&self, name: &str, job: &Job) -> Result<PackTag> {
+    pub(super) async fn resolve(&self, name: &str, job: &Job) -> Result<PackTag> {
         if version(name).is_none() {
             bail!("Invalid pack release tag: {name}");
         }
@@ -495,14 +495,19 @@ impl<'a> Source<'a> {
         storage::write_json(&self.snapshot(&manifest.tag.sha), &manifest)?;
         Ok((manifest, None))
     }
-    async fn delta(
+    pub(super) async fn delta(
         &self,
         base: &Manifest,
         target: &PackTag,
         selection: &Selection,
         job: &Job,
     ) -> Result<(Manifest, BTreeSet<String>, usize)> {
-        if base.schema != 1 || base.policy != CLIENT_POLICY {
+        let policy = if matches!(selection, Selection::Client(_)) {
+            CLIENT_POLICY
+        } else {
+            0
+        };
+        if base.schema != 1 || base.policy != policy {
             bail!("Installation policy changed");
         }
         validate_inventory(base)?;

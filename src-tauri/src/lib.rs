@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod deploy;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod download;

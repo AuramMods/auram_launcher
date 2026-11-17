@@ -225,6 +225,160 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_renames() {
+    use crate::deploy::{self, tests::DiskRemote, Baseline, OwnedFile};
+    use crate::server::ServerVersion;
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[
+            ("minecraft/mods/old.jar", "same"),
+            ("minecraft/config/stable.toml", "defaults"),
+            ("minecraft/config/changed.toml", "before"),
+            ("server_config.conf", "server rules"),
+        ]),
+        None,
+        Some(vec![]),
+    );
+    let middle = f.snapshot(
+        "143",
+        files(&[
+            ("minecraft/mods/middle.jar", "same"),
+            ("minecraft/config/stable.toml", "defaults"),
+            ("minecraft/config/changed.toml", "middle"),
+            ("server_config.conf", "server rules"),
+        ]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/old.jar".into(),
+            "+minecraft/mods/middle.jar".into(),
+            "+minecraft/config/changed.toml".into(),
+        ]),
+    );
+    let target = f.snapshot(
+        "145",
+        files(&[
+            ("minecraft/mods/new.jar", "same"),
+            ("minecraft/config/stable.toml", "defaults"),
+            ("minecraft/config/changed.toml", "after"),
+            ("server_config.conf", "new server rules"),
+        ]),
+        Some(&middle),
+        Some(vec![
+            "-minecraft/mods/middle.jar".into(),
+            "+minecraft/mods/new.jar".into(),
+            "+minecraft/config/changed.toml".into(),
+            "+server_config.conf".into(),
+        ]),
+    );
+    let old = f
+        .packs
+        .manifest(base.clone(), &Job::default())
+        .await
+        .unwrap();
+    assert!(old.files.contains_key("server_config.conf"));
+    let remote = DiskRemote::new();
+    let version = ServerVersion {
+        schema: 1,
+        version: base.name.clone(),
+        commit: base.sha.clone(),
+        minecraft: "1.20.1".into(),
+        forge: "47.4.10".into(),
+    };
+    let owned = Baseline {
+        schema: 1,
+        version: version.clone(),
+        files: old
+            .files
+            .iter()
+            .filter_map(|(path, file)| {
+                let path = path
+                    .strip_prefix("minecraft/")
+                    .filter(|p| deploy::payload_path(p))?;
+                Some((
+                    path.into(),
+                    OwnedFile {
+                        path: path.into(),
+                        file: file.clone(),
+                    },
+                ))
+            })
+            .collect(),
+    };
+    remote.put("auram.json", &serde_json::to_vec(&version).unwrap());
+    remote.put(".auram-deploy.json", &serde_json::to_vec(&owned).unwrap());
+    remote.put("mods/old.jar.client", b"same");
+    remote.put("config/stable.toml", b"custom server setting");
+    remote.put("config/changed.toml", b"before");
+    remote.put("server.properties", b"private");
+    let mut payload = deploy::tests::payload(
+        &f.packs,
+        "145",
+        &[
+            ("mods/new.jar", b"same"),
+            ("config/stable.toml", b"defaults"),
+            ("config/changed.toml", b"after"),
+        ],
+    );
+    payload.tag = target.clone();
+    storage::write_json(
+        &f.packs.layout.state("server-deploy-payload.json"),
+        &payload,
+    )
+    .unwrap();
+    storage::write_json(
+        &f.packs.layout.server().join("auram.json"),
+        &ServerVersion {
+            version: target.name.clone(),
+            commit: target.sha.clone(),
+            ..version
+        },
+    )
+    .unwrap();
+    f.clear_requests();
+    let job = Job::default();
+    let plan = deploy::inspect(&f.packs, &remote, &job).await.unwrap();
+    assert_eq!(plan.strategy, "changelists");
+    assert_eq!(plan.changelists, 2);
+    assert_eq!(plan.renames, 1);
+    assert_eq!(plan.uploads, 1);
+    deploy::apply(&f.packs, &remote, plan, &job).await.unwrap();
+    assert_eq!(remote.get("mods/new.jar.client").unwrap(), b"same");
+    assert!(remote.get("mods/old.jar.client").is_none());
+    assert_eq!(
+        remote.get("config/stable.toml").unwrap(),
+        b"custom server setting"
+    );
+    assert_eq!(remote.get("config/changed.toml").unwrap(), b"after");
+    assert_eq!(remote.get("server.properties").unwrap(), b"private");
+    assert!(
+        f.payloads().iter().all(|p| !p.ends_with(".jar")),
+        "Intermediate or unchanged mod bytes were downloaded"
+    );
+    let legacy = DiskRemote::new();
+    legacy.put(
+        "auram.json",
+        &serde_json::to_vec(&json!({"version":139})).unwrap(),
+    );
+    legacy.put("mods/old.jar.client", b"same");
+    legacy.put("config/stable.toml", b"custom server setting");
+    legacy.put("config/changed.toml", b"before");
+    let job = Job::default();
+    let plan = deploy::inspect(&f.packs, &legacy, &job).await.unwrap();
+    assert_eq!(plan.strategy, "changelists");
+    assert_eq!(plan.renames, 1);
+    assert_eq!(plan.uploads, 1);
+    assert_eq!(plan.removals, 0);
+    deploy::apply(&f.packs, &legacy, plan, &job).await.unwrap();
+    assert_eq!(legacy.get("mods/new.jar.client").unwrap(), b"same");
+    assert!(legacy.get("mods/old.jar.client").is_none());
+    assert_eq!(
+        legacy.get("config/stable.toml").unwrap(),
+        b"custom server setting"
+    );
+}
+
+#[tokio::test]
 async fn skipped_releases_compose_final_blobs_and_reuse_renames_without_a_cache() {
     let f = Fixture::new().await;
     let base = f.snapshot(

@@ -48,6 +48,8 @@ Install a client pack first, then choose **Build server**. The builder uses that
 
 Read the Minecraft EULA and explicitly accept it in the Server tab. Open the server folder and run `run.sh` on macOS or `run.bat` on Windows. The scripts prefer the launcher's managed Java 17 on the same machine, then fall back to `JAVA_HOME` or available Java if that runtime is absent; a copied server requires Java 17 on its destination. Adjust `user_jvm_args.txt` for server memory.
 
+**Deploy over SFTP** saves a connection securely, detects the remote `auram.json` version, previews changelist-based updates, and stages the built pack's `mods`, `scripts`, `config`, and `kubejs` files. It understands `.jar.client` names and preserves worlds, properties, runtime files, and untracked content. Stop the remote server before deploying. See [SFTP deployment and recovery](docs/SFTP_DEPLOYMENT.md) for scope, credential storage, comparison rules, and verification.
+
 ## Microsoft application registration
 
 The default application ID is the existing registration previously used by Auram's `microshaft` package. It supports device sign-in with `XboxLive.signin offline_access` without changing Entra. The code is needed when adding or reauthorizing an account; subsequent launches silently renew the stored refresh credentials.

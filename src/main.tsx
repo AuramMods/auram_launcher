@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { JobProgressPanel } from '@/components/job-progress';
+import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { highMemoryAboveMib, jvmProfile } from '@/lib/jvm-profile';
 import { Slider } from '@/components/ui/slider';
@@ -20,7 +21,7 @@ import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;memoryMib:number;microsoftClientId:string;browserLogin:boolean};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;eulaAccepted:boolean;dataPath:string};
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string};
 type Operation = 'install'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
@@ -87,6 +88,7 @@ function App() {
         {tab==='server'&&<>
           <div className="page-heading"><span className="eyebrow">BETTER TOGETHER</span><h1>Your own corner<br/>of the world<span>.</span></h1><p>Build an Auram server from your installed pack version.</p></div>
           <Card><CardHeader><div className="flex justify-between items-center"><CardTitle className="section-title"><Server/>Auram server</CardTitle><Badge variant="outline">{status?.serverReady?'Built':'Not built yet'}</Badge></div><CardDescription>Forge runtime, server mods, configuration, and start scripts in one place.</CardDescription></CardHeader><CardContent><div className="server-description"><p>Client-only mods are excluded using the pack’s server rules. Rebuilding preserves your worlds, access lists, and server settings.</p><div className="flex gap-3 mt-6"><Button disabled={busy||running||!installed} onClick={()=>void run('buildServer')}><Server/>{status?.serverReady?'Update server files':'Build server'}</Button><Button variant="outline" disabled={!status?.serverReady} onClick={()=>void action('open_folder',{folder:'server'})}><FolderOpen/>Open server folder</Button></div>{!installed&&<p className="mt-3 text-xs">Install Auram in the Play tab first.</p>}</div>{status?.serverReady&&<div className="eula-section"><div><Label htmlFor="eula">Minecraft EULA</Label><p>Read the agreement before accepting. Start your server with run.sh or run.bat from its folder.</p><button className="text-action" onClick={()=>void action('open_eula')}>Read the Minecraft EULA <ArrowRight size={12}/></button></div><Switch id="eula" checked={status.eulaAccepted} disabled={busy} onCheckedChange={accepted=>void action('set_server_eula',{accepted})}/></div>}</CardContent></Card>
+          <SftpDeploy saved={status?.sftp} builtVersion={status?.serverVersion?.version??null} busy={busy} refresh={refresh} onError={setError} onNotice={setNotice}/>
         </>}
         {tab==='settings'&&<>
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>

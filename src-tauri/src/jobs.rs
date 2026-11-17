@@ -45,6 +45,7 @@ pub enum TaskState {
     Checking,
     Running,
     Downloading,
+    Uploading,
     Verifying,
     Retrying,
     Complete,
@@ -55,7 +56,12 @@ impl TaskState {
     fn active(self) -> bool {
         matches!(
             self,
-            Self::Checking | Self::Running | Self::Downloading | Self::Verifying | Self::Retrying
+            Self::Checking
+                | Self::Running
+                | Self::Downloading
+                | Self::Uploading
+                | Self::Verifying
+                | Self::Retrying
         )
     }
 }
@@ -109,6 +115,7 @@ pub struct Progress {
     pub tasks: Vec<TaskProgress>,
     pub recent: Vec<TaskProgress>,
     pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
     pub error: Option<String>,
     // Retained for CLI diagnostics; individual transfers never replace the phase message.
     pub operation: String,
@@ -140,6 +147,7 @@ struct Tracker {
     tasks: BTreeMap<String, Task>,
     serial: u64,
     downloaded: u64,
+    uploaded: u64,
     error: Option<String>,
     operation: String,
     last_emit: Instant,
@@ -265,6 +273,7 @@ impl Tracker {
                 .map(|t| t.progress.clone())
                 .collect(),
             downloaded_bytes: self.downloaded,
+            uploaded_bytes: self.uploaded,
             error: self.error.clone(),
             operation: self.operation.clone(),
             message: phases
@@ -342,6 +351,7 @@ impl Job {
             tasks: BTreeMap::new(),
             serial: 0,
             downloaded: 0,
+            uploaded: 0,
             error: None,
             operation: String::new(),
             last_emit: Instant::now() - EMIT_INTERVAL,
@@ -569,6 +579,16 @@ pub struct TaskTicket {
     finished: bool,
 }
 impl TaskTicket {
+    pub fn upload(&self, bytes: u64, total: Option<u64>, network: u64) {
+        self.job.change(false, |t| {
+            t.uploaded = t.uploaded.saturating_add(network);
+            if let Some(task) = t.tasks.get_mut(&self.id) {
+                task.progress.bytes = bytes;
+                task.progress.total_bytes = total;
+                task.progress.state = TaskState::Uploading;
+            }
+        });
+    }
     pub fn state(&self, state: TaskState, attempt: u32) {
         self.job.change(false, |t| {
             t.operation = "download".into();

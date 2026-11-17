@@ -5,9 +5,32 @@ use crate::{
     storage,
 };
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use std::{collections::BTreeMap, fs, io::Read, path::Path};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerVersion {
+    #[serde(default)]
+    pub schema: u32,
+    #[serde(deserialize_with = "version_string")]
+    pub version: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub minecraft: String,
+    #[serde(default)]
+    pub forge: String,
+}
+fn version_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    match value {
+        serde_json::Value::String(v) => Ok(v),
+        serde_json::Value::Number(v) if v.is_u64() => Ok(v.to_string()),
+        _ => Err(serde::de::Error::custom("Invalid Auram version")),
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
@@ -155,6 +178,7 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     let mut desired = config.manifest(&full)?;
     filter_sided_mods(packs, &full, &config, &mut desired, job).await?;
     resolve_dependencies(packs, &full, &mut desired, job).await?;
+    let payload = desired.clone();
     let versions = Versions::read(&packs.layout.client())?;
     let java = runtime.java(job).await?;
     job.phase("server-forge", "Forge server", false);
@@ -217,6 +241,18 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
         storage::atomic_copy(entry.path(), &packs.blob_path(&file))?;
         desired.files.insert(relative, file);
     }
+    let version = ServerVersion {
+        schema: 1,
+        version: installed.tag.name.clone(),
+        commit: installed.tag.sha.clone(),
+        minecraft: versions.minecraft.clone(),
+        forge: versions.forge.clone(),
+    };
+    let marker = packs.layout.state("built-server-auram.json");
+    storage::write_json(&marker, &version)?;
+    let file = local_file(&marker)?;
+    storage::atomic_copy(&marker, &packs.blob_path(&file))?;
+    desired.files.insert("auram.json".into(), file);
     let old: Option<Manifest> =
         storage::read_optional(&packs.layout.server().join(".auram-manifest.json"))?;
     packs
@@ -229,6 +265,7 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
             true,
         )
         .await?;
+    storage::write_json(&packs.layout.state("server-deploy-payload.json"), &payload)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

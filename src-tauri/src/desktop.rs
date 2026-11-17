@@ -1,5 +1,9 @@
 use crate::{
     auth::{Auth, Profile},
+    deploy::{
+        self,
+        connection::{ConnectionSettings, HostKeyNeeded, Secret},
+    },
     download::Downloader,
     game::{Game, GameStatus},
     jobs::{Jobs, PhaseSpec, Progress},
@@ -84,6 +88,8 @@ pub struct Status {
     game: GameStatus,
     legacy_available: bool,
     server_ready: bool,
+    server_version: Option<server::ServerVersion>,
+    sftp: ConnectionSettings,
     eula_accepted: bool,
     data_path: String,
 }
@@ -108,6 +114,8 @@ fn status(core: &Core) -> Result<Status> {
             .any(|p| p.join("minecraft/minecraft").is_dir())
             && !core.layout.state("migration.json").exists(),
         server_ready: core.layout.server().join(".auram-manifest.json").exists(),
+        server_version: storage::read_optional(&core.layout.server().join("auram.json"))?,
+        sftp: ConnectionSettings::load(&core.layout)?,
         eula_accepted: eula.lines().any(|line| line.trim() == "eula=true"),
         data_path: core.layout.root.display().to_string(),
     })
@@ -398,6 +406,174 @@ fn open_eula(app: tauri::AppHandle) -> Result<(), String> {
         .open_url("https://aka.ms/MinecraftEULA", None::<&str>)
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+fn save_sftp(
+    settings: ConnectionSettings,
+    secret: Option<Secret>,
+    backend: tauri::State<Backend>,
+) -> Result<(), String> {
+    let core = backend.core()?;
+    if core.jobs.busy() {
+        return Err("Wait for the current operation to finish".into());
+    }
+    // A pin belongs to the host/port that was actually verified.
+    let previous = ConnectionSettings::load(&core.layout).map_err(|e| e.to_string())?;
+    let mut settings = settings;
+    settings.fingerprint = if settings.host == previous.host && settings.port == previous.port {
+        previous.fingerprint
+    } else {
+        String::new()
+    };
+    settings
+        .save(&core.layout, secret)
+        .map_err(|e| format!("Save SFTP connection: {e:#}"))
+}
+#[tauri::command]
+fn forget_sftp(backend: tauri::State<Backend>) -> Result<(), String> {
+    let core = backend.core()?;
+    if core.jobs.busy() {
+        return Err("Wait for the current operation to finish".into());
+    }
+    ConnectionSettings::load(&core.layout)
+        .and_then(|settings| settings.forget(&core.layout))
+        .map_err(|e| format!("Forget SFTP connection: {e:#}"))
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SftpCheck {
+    host_key: Option<HostKeyNeeded>,
+    plan: Option<deploy::DeploymentPlan>,
+    remote_version: Option<server::ServerVersion>,
+    build_required: bool,
+}
+#[tauri::command]
+async fn check_sftp(
+    trust_fingerprint: Option<String>,
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Backend>,
+) -> Result<SftpCheck, String> {
+    let core = backend.core()?;
+    let emit = app.clone();
+    let lease = core
+        .jobs
+        .begin(
+            "Inspecting SFTP server",
+            &[
+                PhaseSpec("sftp-connect", "Connect", false),
+                PhaseSpec("sftp-plan", "Compare server", false),
+            ],
+            Arc::new(move |p| {
+                let _ = emit.emit("progress", p);
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    let job = &lease.job;
+    let result = async {
+        let mut settings = ConnectionSettings::load(&core.layout)?;
+        if let Some(fingerprint) = trust_fingerprint {
+            settings.fingerprint = fingerprint;
+        }
+        let secret = settings.secret(&core.layout)?;
+        job.progress(
+            "sftp-connect",
+            "Connecting and verifying the SSH host key",
+            0,
+            0,
+        );
+        let remote = match deploy::connection::connect(&settings, &secret, job).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                if let Some(key) = error.downcast_ref::<HostKeyNeeded>() {
+                    return Ok(SftpCheck {
+                        host_key: Some(key.clone()),
+                        plan: None,
+                        remote_version: None,
+                        build_required: false,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        settings.save(&core.layout, None)?;
+        let result = async {
+            let remote_version = deploy::read_version(&remote).await?;
+            let payload: Option<crate::pack::Manifest> =
+                storage::read_optional(&core.layout.state("server-deploy-payload.json"))?;
+            let plan = if payload.is_some() {
+                Some(deploy::inspect(&core.packs, &remote, job).await?)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>(SftpCheck {
+                host_key: None,
+                plan,
+                remote_version,
+                build_required: payload.is_none(),
+            })
+        }
+        .await;
+        remote.close().await;
+        result
+    }
+    .await;
+    job.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|e: &anyhow::Error| format!("{e:#}")),
+    );
+    result.map_err(|e| format!("SFTP inspection failed: {e:#}"))
+}
+#[tauri::command]
+async fn deploy_sftp(
+    recover_only: bool,
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Backend>,
+) -> Result<String, String> {
+    let core = backend.core()?;
+    let lease = core
+        .jobs
+        .begin(
+            if recover_only {
+                "Recovering SFTP deployment"
+            } else {
+                "Deploying server over SFTP"
+            },
+            &[
+                PhaseSpec("sftp-connect", "Connect", false),
+                PhaseSpec("sftp-recover", "Recover", false),
+                PhaseSpec("sftp-plan", "Compare server", false),
+                PhaseSpec("sftp-upload", "Upload files", true),
+                PhaseSpec("sftp-apply", "Activate update", false),
+            ],
+            Arc::new(move |p| {
+                let _ = app.emit("progress", p);
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    let job = &lease.job;
+    let result=async {
+        let settings=ConnectionSettings::load(&core.layout)?;
+        let remote=deploy::connection::connect(&settings,&settings.secret(&core.layout)?,job).await?;
+        let result=async {
+            if recover_only {deploy::recover(&remote,job).await?;return Ok("Previous remote installation recovered. Inspect the server to prepare another deployment.".into());}
+            let plan=deploy::inspect(&core.packs,&remote,job).await?;
+            let version=plan.target_version.version.clone();
+            deploy::apply(&core.packs,&remote,plan,job).await?;
+            Ok::<_,anyhow::Error>(format!("Auram {version} deployed. Start the server when ready."))
+        }.await;
+        remote.close().await;
+        result
+    }.await;
+    job.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|e: &anyhow::Error| format!("{e:#}")),
+    );
+    result.map_err(|e| format!("SFTP deployment failed: {e:#}"))
+}
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -430,7 +606,11 @@ pub fn run() {
             save_settings,
             open_folder,
             set_server_eula,
-            open_eula
+            open_eula,
+            save_sftp,
+            forget_sftp,
+            check_sftp,
+            deploy_sftp
         ])
         .build(tauri::generate_context!())
         .expect("Unable to create the native launcher window");
