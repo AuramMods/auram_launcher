@@ -65,6 +65,20 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     result
 }
+pub fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination.parent().context("Destination has no parent")?)?;
+    let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
+    let result = (|| {
+        fs::copy(source, &temporary)?;
+        fs::File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
 pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }
@@ -212,7 +226,7 @@ pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Resu
         if entry.file_type().is_dir() {
             fs::create_dir_all(target)?;
         } else if !target.exists() {
-            atomic_write(&target, &fs::read(entry.path())?)?;
+            atomic_copy(entry.path(), &target)?;
         }
     }
     Ok(())
@@ -313,7 +327,7 @@ pub fn transact(
         for (relative, source) in changes {
             let target = safe_join(root, relative)?;
             if let Some(source) = source {
-                atomic_write(&target, &fs::read(source)?)?;
+                atomic_copy(source, &target)?;
             } else if target.try_exists()? {
                 fs::remove_file(target)?;
             }

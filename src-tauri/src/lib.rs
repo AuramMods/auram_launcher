@@ -1,5 +1,7 @@
+pub mod auth;
 pub mod download;
 pub mod jobs;
+pub mod pack;
 pub mod storage;
 #[cfg(feature = "desktop")]
 pub fn run() {
