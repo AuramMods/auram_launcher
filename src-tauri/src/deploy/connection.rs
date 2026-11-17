@@ -125,6 +125,20 @@ pub struct SftpRemote {
     ssh: client::Handle<Handler>,
     root: String,
 }
+pub(crate) async fn wait<T>(
+    job: &Job,
+    operation: &str,
+    timeout: Duration,
+    request: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = job.cancel.cancelled() => bail!("SFTP cancelled while {operation}"),
+        result = tokio::time::timeout(timeout, request) => result
+            .with_context(|| format!("SFTP timed out after {} seconds while {operation}", timeout.as_secs()))?
+            .with_context(|| format!("SFTP: {operation}")),
+    }
+}
 pub async fn connect(
     settings: &ConnectionSettings,
     secret: &Secret,
@@ -179,24 +193,33 @@ pub async fn connect(
         Ok::<_, anyhow::Error>(())
     };
     tokio::select! {_=job.cancel.cancelled()=>bail!("Connection cancelled"),v=tokio::time::timeout(Duration::from_secs(30),auth)=>v.context("SSH authentication timed out")??};
-    let channel = ssh.channel_open_session().await?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("Open SFTP subsystem")?;
-    let session = SftpSession::new(channel.into_stream()).await?;
-    session.set_timeout(30);
-    let root = session
-        .canonicalize(if settings.directory.trim().is_empty() {
-            "."
-        } else {
-            &settings.directory
-        })
-        .await
-        .context("Open server directory")?;
-    if !session.metadata(&root).await?.is_dir() {
-        bail!("The SFTP server path is not a directory");
-    }
+    let (session, root) = wait(
+        job,
+        "opening the SFTP subsystem and server directory",
+        Duration::from_secs(30),
+        async {
+            let channel = ssh.channel_open_session().await?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .context("Open SFTP subsystem")?;
+            let session = SftpSession::new(channel.into_stream()).await?;
+            session.set_timeout(30);
+            let root = session
+                .canonicalize(if settings.directory.trim().is_empty() {
+                    "."
+                } else {
+                    &settings.directory
+                })
+                .await
+                .context("Open server directory")?;
+            if !session.metadata(&root).await?.is_dir() {
+                bail!("The SFTP server path is not a directory");
+            }
+            Ok((session, root))
+        },
+    )
+    .await?;
     Ok(SftpRemote {
         session,
         ssh,
@@ -205,11 +228,14 @@ pub async fn connect(
 }
 impl SftpRemote {
     pub async fn close(self) {
-        let _ = self.session.close().await;
-        let _ = self
-            .ssh
-            .disconnect(russh::Disconnect::ByApplication, "Auram finished", "en")
-            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = self.session.close().await;
+            let _ = self
+                .ssh
+                .disconnect(russh::Disconnect::ByApplication, "Auram finished", "en")
+                .await;
+        })
+        .await;
     }
     fn path(&self, p: &str) -> Result<String> {
         safe_path(p)?;
@@ -234,6 +260,86 @@ impl SftpRemote {
         }
         Ok(full)
     }
+}
+/// Metadata and activation use the primary connection. Independent SSH/SFTP
+/// transports carry up to eight file uploads, rather than one shared channel.
+pub struct SftpPool {
+    remotes: Vec<SftpRemote>,
+    slots: Mutex<Vec<usize>>,
+    available: tokio::sync::Semaphore,
+}
+struct UploadSlot<'a> {
+    pool: &'a SftpPool,
+    index: usize,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+impl Drop for UploadSlot<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(self.index);
+    }
+}
+impl SftpPool {
+    pub fn connection_count(&self) -> usize {
+        self.remotes.len()
+    }
+    pub async fn close(self) {
+        futures_util::future::join_all(self.remotes.into_iter().map(SftpRemote::close)).await;
+    }
+}
+pub async fn connect_pool(
+    settings: &ConnectionSettings,
+    secret: &Secret,
+    job: &Job,
+) -> Result<SftpPool> {
+    use futures_util::StreamExt;
+    job.progress(
+        "sftp-connect",
+        "Opening up to eight SSH/SFTP connections",
+        0,
+        0,
+    );
+    let primary = connect(settings, secret, job).await?;
+    let additional = futures_util::stream::iter(0..7)
+        .map(|_| connect(settings, secret, job))
+        .buffer_unordered(7)
+        .collect::<Vec<_>>()
+        .await;
+    let mut remotes = vec![primary];
+    for result in additional {
+        match result {
+            Ok(remote) => remotes.push(remote),
+            Err(error) if error.downcast_ref::<HostKeyNeeded>().is_some() => {
+                futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
+                return Err(error);
+            }
+            // Some providers cap simultaneous SSH sessions. Use connections
+            // that actually succeeded, rather than guessing their limits.
+            Err(_) => {}
+        }
+    }
+    if let Err(error) = job.check() {
+        futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
+        return Err(error);
+    }
+    job.progress(
+        "sftp-connect",
+        format!(
+            "{} SFTP connections ready for parallel uploads",
+            remotes.len()
+        ),
+        1,
+        1,
+    );
+    let count = remotes.len();
+    Ok(SftpPool {
+        remotes,
+        slots: Mutex::new((0..count).collect()),
+        available: tokio::sync::Semaphore::new(count),
+    })
 }
 #[derive(Clone, Debug)]
 pub struct Attrs {
@@ -337,7 +443,13 @@ impl Remote for SftpRemote {
         let mut task = job.task(label, label, Some(size));
         let result = async {
             let mut source = tokio::fs::File::open(local).await?;
-            let mut file = self.session.create(self.guarded(path).await?).await?;
+            let mut file = wait(
+                job,
+                &format!("opening upload {label}"),
+                Duration::from_secs(30),
+                async { Ok(self.session.create(self.guarded(path).await?).await?) },
+            )
+            .await?;
             let mut buffer = vec![0u8; 65536];
             let mut sent = 0;
             loop {
@@ -346,12 +458,30 @@ impl Remote for SftpRemote {
                 if n == 0 {
                     break;
                 }
-                file.write_all(&buffer[..n]).await?;
+                wait(
+                    job,
+                    &format!("uploading {label}"),
+                    Duration::from_secs(30),
+                    async {
+                        file.write_all(&buffer[..n]).await?;
+                        Ok(())
+                    },
+                )
+                .await?;
                 sent += n as u64;
                 task.upload(sent, Some(size), n as u64);
             }
-            file.flush().await?;
-            file.shutdown().await?;
+            wait(
+                job,
+                &format!("finishing upload {label}"),
+                Duration::from_secs(30),
+                async {
+                    file.flush().await?;
+                    file.shutdown().await?;
+                    Ok(())
+                },
+            )
+            .await?;
             task.state(TaskState::Verifying, 0);
             if self
                 .stat(path)
@@ -395,6 +525,55 @@ impl Remote for SftpRemote {
     async fn rmdir(&self, path: &str) -> Result<()> {
         self.session.remove_dir(self.guarded(path).await?).await?;
         Ok(())
+    }
+}
+
+impl Remote for SftpPool {
+    async fn stat(&self, p: &str) -> Result<Option<Attrs>> {
+        self.remotes[0].stat(p).await
+    }
+    async fn list(&self, p: &str) -> Result<Vec<(String, Attrs)>> {
+        self.remotes[0].list(p).await
+    }
+    async fn read(&self, p: &str, n: u64) -> Result<Vec<u8>> {
+        self.remotes[0].read(p, n).await
+    }
+    async fn hash(&self, p: &str) -> Result<String> {
+        self.remotes[0].hash(p).await
+    }
+    async fn upload(&self, local: &Path, p: &str, label: &str, job: &Job) -> Result<()> {
+        let permit = tokio::select! {
+            biased;
+            _=job.cancel.cancelled()=>bail!("SFTP upload cancelled"),
+            permit=self.available.acquire()=>permit.context("SFTP upload pool closed")?,
+        };
+        let index = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .context("SFTP connection slot unavailable")?;
+        let slot = UploadSlot {
+            pool: self,
+            index,
+            _permit: permit,
+        };
+        self.remotes[slot.index].upload(local, p, label, job).await
+    }
+    async fn write(&self, p: &str, b: &[u8]) -> Result<()> {
+        self.remotes[0].write(p, b).await
+    }
+    async fn mkdir(&self, p: &str) -> Result<()> {
+        self.remotes[0].mkdir(p).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.remotes[0].rename(from, to).await
+    }
+    async fn remove(&self, p: &str) -> Result<()> {
+        self.remotes[0].remove(p).await
+    }
+    async fn rmdir(&self, p: &str) -> Result<()> {
+        self.remotes[0].rmdir(p).await
     }
 }
 

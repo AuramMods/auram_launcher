@@ -22,6 +22,10 @@ pub(crate) struct DiskRemote {
     mutations: AtomicUsize,
     fault: Mutex<Option<(usize, bool, bool)>>,
     offline: AtomicBool,
+    pub requests: Mutex<Vec<(String, String)>>,
+    slow_uploads: AtomicBool,
+    active_uploads: AtomicUsize,
+    peak_uploads: AtomicUsize,
 }
 impl DiskRemote {
     pub fn new() -> Self {
@@ -30,6 +34,10 @@ impl DiskRemote {
             mutations: AtomicUsize::new(0),
             fault: Mutex::new(None),
             offline: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+            slow_uploads: AtomicBool::new(false),
+            active_uploads: AtomicUsize::new(0),
+            peak_uploads: AtomicUsize::new(0),
         }
     }
     fn path(&self, p: &str) -> Result<PathBuf> {
@@ -79,6 +87,10 @@ impl DiskRemote {
 }
 impl Remote for DiskRemote {
     async fn stat(&self, p: &str) -> Result<Option<Attrs>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(("stat".into(), p.into()));
         match fs::symlink_metadata(self.path(p)?) {
             Ok(m) => Ok(Some(Attrs {
                 size: m.len(),
@@ -90,6 +102,10 @@ impl Remote for DiskRemote {
         }
     }
     async fn list(&self, p: &str) -> Result<Vec<(String, Attrs)>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(("list".into(), p.into()));
         fs::read_dir(self.path(p)?)?
             .map(|entry| {
                 let entry = entry?;
@@ -106,6 +122,10 @@ impl Remote for DiskRemote {
             .collect::<Result<Vec<_>>>()
     }
     async fn read(&self, p: &str, limit: u64) -> Result<Vec<u8>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(("read".into(), p.into()));
         let b = fs::read(self.path(p)?)?;
         if b.len() as u64 > limit {
             bail!("Fixture file too large");
@@ -113,11 +133,21 @@ impl Remote for DiskRemote {
         Ok(b)
     }
     async fn hash(&self, p: &str) -> Result<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(("hash".into(), p.into()));
         Ok(blob(&fs::read(self.path(p)?)?))
     }
     async fn upload(&self, local: &Path, p: &str, label: &str, job: &Job) -> Result<()> {
         job.check()?;
         let b = fs::read(local)?;
+        if self.slow_uploads.load(Ordering::SeqCst) {
+            let active = self.active_uploads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_uploads.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.active_uploads.fetch_sub(1, Ordering::SeqCst);
+        }
         let mut task = job.task(label, label, Some(b.len() as u64));
         self.mutate(|| Ok(fs::write(self.path(p)?, &b)?))?;
         task.upload(b.len() as u64, Some(b.len() as u64), b.len() as u64);
@@ -215,7 +245,7 @@ fn baseline(remote: &DiskRemote, manifest: &Manifest, name: &str) {
 }
 
 #[tokio::test]
-async fn full_deploy_reuses_disabled_jars_and_never_syncs_server_owned_files() {
+async fn unversioned_deploy_replaces_only_four_directories_without_hashing() {
     let (_t, packs) = packs();
     let remote = DiskRemote::new();
     payload(
@@ -238,13 +268,27 @@ async fn full_deploy_reuses_disabled_jars_and_never_syncs_server_owned_files() {
     let job = Job::default();
     let plan = inspect(&packs, &remote, &job).await.unwrap();
     assert!(plan.remote_version.is_none());
-    assert_eq!(plan.reused, 1);
-    assert_eq!(plan.uploads, 3);
+    assert_eq!(plan.reused, 0);
+    assert_eq!(plan.uploads, 4);
+    assert_eq!(plan.replacements, 4);
+    assert!(remote
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(op, p)| op != "hash" && (op != "list" || p == "mods")));
     assert_eq!(plan.removals, 0);
     apply(&packs, &remote, plan, &job).await.unwrap();
     assert_eq!(remote.get("mods/client.jar.client").unwrap(), b"client");
     assert!(remote.get("mods/client.jar").is_none());
-    assert_eq!(remote.get("mods/custom.jar").unwrap(), b"custom");
+    assert!(remote.get("mods/custom.jar").is_none());
+    assert!(
+        walkdir::WalkDir::new(remote.root.path().join(".auram-deploy/transactions"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .any(|e| fs::read(e.path()).unwrap() == b"custom")
+    );
     assert_eq!(remote.get("server.properties").unwrap(), b"private");
     assert_eq!(remote.get("world/level.dat").unwrap(), b"world");
     assert!(remote.get("defaultconfigs/a").is_none());
@@ -259,7 +303,7 @@ async fn full_deploy_reuses_disabled_jars_and_never_syncs_server_owned_files() {
 }
 
 #[tokio::test]
-async fn update_preserves_aliases_renames_identical_blobs_and_retains_user_configuration() {
+async fn missing_changelist_route_replaces_custom_configuration_and_retains_backups() {
     let (_t, packs) = packs();
     let remote = DiskRemote::new();
     let old = payload(
@@ -297,22 +341,24 @@ async fn update_preserves_aliases_renames_identical_blobs_and_retains_user_confi
     );
     let job = Job::default();
     let plan = inspect(&packs, &remote, &job).await.unwrap();
-    assert_eq!(plan.renames, 1);
-    assert_eq!(plan.removals, 1);
-    assert_eq!(plan.uploads, 2);
-    assert_eq!(plan.reused, 1);
+    assert_eq!(plan.renames, 0);
+    assert_eq!(plan.removals, 0);
+    assert_eq!(plan.uploads, 4);
+    assert_eq!(plan.reused, 0);
+    assert_eq!(plan.replacements, 4);
+    assert!(plan
+        .notes
+        .iter()
+        .any(|note| note.contains("No usable changelist route")));
     apply(&packs, &remote, plan, &job).await.unwrap();
     assert_eq!(remote.get("mods/a.jar.client").unwrap(), b"bbbb");
     assert!(remote.get("mods/a.jar").is_none());
-    assert_eq!(remote.get("mods/renamed-new.jar.client").unwrap(), b"same");
+    assert_eq!(remote.get("mods/renamed-new.jar").unwrap(), b"same");
     assert!(remote.get("mods/renamed-old.jar.client").is_none());
     assert!(remote.get("mods/obsolete.jar.client").is_none());
-    assert_eq!(
-        remote.get("config/custom.toml").unwrap(),
-        b"custom local value"
-    );
+    assert_eq!(remote.get("config/custom.toml").unwrap(), b"defaults");
     assert_eq!(remote.get("config/changed.toml").unwrap(), b"after!");
-    assert_eq!(remote.get("scripts/obsolete.zs").unwrap(), b"local edit");
+    assert!(remote.get("scripts/obsolete.zs").is_none());
     let backups = walkdir::WalkDir::new(remote.root.path().join(".auram-deploy/transactions"))
         .into_iter()
         .filter_map(Result::ok)
@@ -439,6 +485,86 @@ fn paths_and_ownership_cannot_escape_the_four_payload_roots() {
 }
 
 #[tokio::test]
+async fn same_version_reads_only_version_and_lock_without_listing_or_hashing() {
+    let (_temp, packs) = packs();
+    let remote = DiskRemote::new();
+    let manifest = payload(&packs, "145", &[("config/a.toml", b"default")]);
+    baseline(&remote, &manifest, "145");
+    remote.put("config/a.toml", b"custom");
+    let plan = inspect(&packs, &remote, &Job::default()).await.unwrap();
+    assert_eq!(
+        plan.uploads + plan.removals + plan.renames + plan.replacements,
+        0
+    );
+    assert_eq!(plan.reused, 1);
+    let requests = remote.requests.lock().unwrap();
+    assert!(requests.iter().all(|(op, path)| op != "list"
+        && op != "hash"
+        && (path == "auram.json" || path == ".auram-deploy/lock")));
+    assert_eq!(remote.get("config/a.toml").unwrap(), b"custom");
+}
+
+#[tokio::test]
+async fn directory_replacement_schedules_eight_uploads_and_clears_empty_roots() {
+    let (_temp, packs) = packs();
+    let remote = DiskRemote::new();
+    let names = (0..20)
+        .map(|i| format!("config/nested/{i}.toml"))
+        .collect::<Vec<_>>();
+    let files = names
+        .iter()
+        .map(|name| (name.as_str(), b"config".as_slice()))
+        .collect::<Vec<_>>();
+    payload(&packs, "new", &files);
+    remote.put("scripts/old.zs", b"old");
+    remote.put("kubejs/old.js", b"old");
+    remote.slow_uploads.store(true, Ordering::SeqCst);
+    let plan = inspect(&packs, &remote, &Job::default()).await.unwrap();
+    apply(&packs, &remote, plan, &Job::default()).await.unwrap();
+    assert_eq!(remote.peak_uploads.load(Ordering::SeqCst), 8);
+    assert!(remote.get("scripts/old.zs").is_none());
+    assert!(remote.get("kubejs/old.js").is_none());
+    assert!(remote.root.path().join("mods").is_dir());
+    for name in names {
+        assert_eq!(remote.get(&name).unwrap(), b"config");
+    }
+}
+
+#[tokio::test]
+async fn stalled_sftp_requests_timeout_with_context_and_cancel_promptly() {
+    use std::time::Duration;
+    let job = Job::default();
+    let error = connection::wait(
+        &job,
+        "listing mods",
+        Duration::from_millis(10),
+        std::future::pending::<Result<()>>(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("listing mods"));
+    assert!(error.to_string().contains("timed out"));
+    let cancel = job.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+    });
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        connection::wait(
+            &job,
+            "reading auram.json",
+            Duration::from_secs(30),
+            std::future::pending::<Result<()>>(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+}
+
+#[tokio::test]
 async fn remote_version_accepts_pack_numbers_and_unrecognized_metadata_is_unversioned() {
     let remote = DiskRemote::new();
     assert!(read_version(&remote).await.unwrap().is_none());
@@ -461,7 +587,7 @@ async fn remote_version_accepts_pack_numbers_and_unrecognized_metadata_is_unvers
 
 #[cfg(unix)]
 #[tokio::test]
-async fn remote_symlinks_are_never_followed_or_replaced() {
+async fn directory_replacement_retains_nested_symlinks_without_following_them() {
     let (_t, packs, remote, plan) = transaction_fixture().await;
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("secret"), b"protected").unwrap();
@@ -470,7 +596,13 @@ async fn remote_symlinks_are_never_followed_or_replaced() {
         remote.root.path().join("mods/new.jar"),
     )
     .unwrap();
-    assert!(apply(&packs, &remote, plan, &Job::default()).await.is_err());
+    apply(&packs, &remote, plan, &Job::default()).await.unwrap();
+    assert!(
+        !fs::symlink_metadata(remote.root.path().join("mods/new.jar"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read(outside.path().join("secret")).unwrap(),
         b"protected"

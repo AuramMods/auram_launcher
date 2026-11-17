@@ -63,7 +63,14 @@ impl Packs {
             .source()
             .delta(&base, target, &Selection::Server, job)
             .await?;
-        Ok((base, changes, count))
+        // Translate the old distribution through its own server inclusion rules.
+        // This also makes removed/remapped server paths available to the SFTP
+        // planner when the remote only has auram.json, without reading mod jars.
+        let config: crate::server::ServerConfig = serde_json::from_slice(
+            &tokio::fs::read(self.file(&base, "server_config.conf", job).await?).await?,
+        )
+        .context("Read the previous pack's server configuration")?;
+        Ok((config.manifest(&base)?, changes, count))
     }
     pub fn new(layout: Layout, net: Downloader) -> Self {
         Self {

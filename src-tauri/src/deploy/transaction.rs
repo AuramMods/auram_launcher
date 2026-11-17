@@ -2,7 +2,7 @@ use super::{
     connection::{parents, Remote},
     payload_path,
     plan::{Action, ActionKind, DeploymentPlan},
-    safe_path,
+    safe_path, ROOTS,
 };
 use crate::{jobs::Job, pack::Packs};
 use anyhow::{bail, Context, Result};
@@ -33,7 +33,7 @@ async fn exists(remote: &impl Remote, path: &str) -> Result<bool> {
     Ok(remote.stat(path).await?.is_some())
 }
 fn validate(journal: &Journal) -> Result<()> {
-    if journal.schema != 1
+    if ![1, 2].contains(&journal.schema)
         || journal.id.len() != 32
         || !journal.id.bytes().all(|c| c.is_ascii_hexdigit())
         || journal.actions.len() > 100002
@@ -43,7 +43,18 @@ fn validate(journal: &Journal) -> Result<()> {
     let mut names = BTreeSet::new();
     for action in &journal.actions {
         safe_path(&action.path)?;
-        if !(payload_path(&action.path)
+        let directory = matches!(action.kind, ActionKind::ReplaceDirectory);
+        if directory
+            && (journal.schema != 2
+                || !ROOTS.contains(&action.path.as_str())
+                || action.from.is_some()
+                || action.file.is_some()
+                || action.payload.is_some())
+        {
+            bail!("Invalid directory replacement");
+        }
+        if !(directory
+            || payload_path(&action.path)
             || ["auram.json", ".auram-deploy.json"].contains(&action.path.as_str()))
             || !names.insert(action.path.clone())
         {
@@ -57,6 +68,15 @@ fn validate(journal: &Journal) -> Result<()> {
         }
         if matches!(action.kind, ActionKind::Rename) && action.from.is_none() {
             bail!("Missing rename source");
+        }
+    }
+    for action in &journal.actions {
+        if matches!(action.kind, ActionKind::ReplaceDirectory)
+            && names
+                .iter()
+                .any(|p| p.starts_with(&format!("{}/", action.path)))
+        {
+            bail!("Overlapping directory replacement");
         }
     }
     for path in &journal.originals {
@@ -110,8 +130,10 @@ pub async fn recover(remote: &impl Remote, job: &Job) -> Result<()> {
         } else {
             let original = backup(&journal.id, index);
             let has_backup = exists(remote, &original).await?;
-            let installed = matches!(action.kind, ActionKind::Upload)
-                && !exists(remote, &stage(&journal.id, index)).await?;
+            let installed = matches!(
+                action.kind,
+                ActionKind::Upload | ActionKind::ReplaceDirectory
+            ) && !exists(remote, &stage(&journal.id, index)).await?;
             if has_backup || (!journal.originals.contains(&action.path) && installed) {
                 if exists(remote, &action.path).await? {
                     // Preserve even writes made by a running server during an interruption.
@@ -153,11 +175,11 @@ pub async fn apply(
     // Retire obsolete owned paths first; never recursively replace a directory.
     plan.actions.sort_by_key(|a| {
         (
-            usize::from(!a.path.starts_with("mods/")),
+            usize::from(a.path != "mods" && !a.path.starts_with("mods/")),
             match a.kind {
                 ActionKind::Remove => 0,
                 ActionKind::Rename => 1,
-                ActionKind::Upload => 2,
+                ActionKind::Upload | ActionKind::ReplaceDirectory => 2,
             },
         )
     });
@@ -174,14 +196,15 @@ pub async fn apply(
     }
     for action in &plan.actions {
         if let Some(meta) = remote.stat(&action.path).await? {
-            if meta.directory || meta.symlink {
+            if meta.symlink || meta.directory != matches!(action.kind, ActionKind::ReplaceDirectory)
+            {
                 bail!("Remote directory or symlink blocks file {}", action.path);
             }
             originals.insert(action.path.clone());
         }
     }
     let journal = Journal {
-        schema: 1,
+        schema: if plan.replacements > 0 { 2 } else { 1 },
         id: id.clone(),
         actions: plan.actions.clone(),
         originals,
@@ -204,53 +227,55 @@ pub async fn apply(
     }
     let result = async {
         job.phase("sftp-upload", "Upload files", true);
-        job.plan_downloads(
-            "SFTP uploads",
-            &plan
-                .actions
-                .iter()
-                .filter_map(|a| {
-                    a.file
-                        .as_ref()
-                        .filter(|_| matches!(a.kind, ActionKind::Upload))
-                        .map(|f| (a.path.clone(), a.path.clone(), Some(f.size)))
-                })
-                .collect::<Vec<_>>(),
-        );
-        parents(remote, &stage(&id, 0)).await?;
-        futures_util::stream::iter(
-            plan.actions
-                .clone()
-                .into_iter()
-                .enumerate()
-                .filter(|(_, action)| matches!(action.kind, ActionKind::Upload)),
-        )
-        .map(|(index, action)| {
-            let id=&id;let marker=&marker;let ownership=&ownership;let payload_manifest=&plan.payload;
+        // Whole-directory replacement uploads into a separate tree. The live
+        // four directories are not moved until every staged upload is ready.
+        let staging_root=format!("{}/stage",data_root(&id));
+        parents(remote,&stage(&id,0)).await?;
+        let mut directories=BTreeSet::new();
+        let mut uploads=Vec::new();
+        for (index,action) in plan.actions.iter().enumerate() {
+            let target=stage(&id,index);
+            if matches!(action.kind,ActionKind::ReplaceDirectory) {
+                directories.insert(target.clone());
+                for (path,file) in &plan.payload.files {
+                    if !path.starts_with(&format!("{}/",action.path)) {continue;}
+                    let destination=&plan.baseline.files[&super::canonical(path)].path;
+                    let relative=destination.strip_prefix(&format!("{}/",action.path)).context("Replacement file outside its directory")?;
+                    uploads.push((format!("{target}/{relative}"),Some(path.clone()),Some(file.clone()),destination.clone()));
+                }
+            } else if matches!(action.kind,ActionKind::Upload) {
+                uploads.push((target,action.payload.clone(),action.file.clone(),action.path.clone()));
+            }
+        }
+        job.plan_downloads("SFTP uploads",&uploads.iter().filter_map(|(_,payload,file,label)|
+            file.as_ref().filter(|_|payload.is_some()).map(|f|(label.clone(),label.clone(),Some(f.size)))
+        ).collect::<Vec<_>>());
+        for (target,_,_,_) in &uploads {
+            let mut parent=target.rsplit_once('/').unwrap().0;
+            while parent!=staging_root {
+                directories.insert(parent.to_string());
+                parent=parent.rsplit_once('/').context("Invalid staging directory")?.0;
+            }
+        }
+        let mut by_depth=std::collections::BTreeMap::<usize,Vec<String>>::new();
+        for directory in directories {by_depth.entry(directory.split('/').count()).or_default().push(directory);}
+        for directories in by_depth.into_values() {
+            futures_util::stream::iter(directories).map(|directory|async move {job.check()?;remote.mkdir(&directory).await})
+                .buffer_unordered(8).try_collect::<Vec<_>>().await?;
+        }
+        futures_util::stream::iter(uploads).map(|(target,payload,_,label)| {
+            let marker=&marker;let ownership=&ownership;let payload_manifest=&plan.payload;
             async move {
-            job.check()?;
-            let target = stage(id, index);
-            if let Some(payload) = &action.payload {
-                let local = packs.file(payload_manifest, payload, job).await?;
-                remote.upload(&local, &target, &action.path, job).await?;
-            } else {
-                remote
-                    .write(
-                        &target,
-                        if action.path == "auram.json" {
-                            marker
-                        } else {
-                            ownership
-                        },
-                    )
-                    .await?;
+                job.check()?;
+                if let Some(payload)=payload {
+                    let local=packs.file(payload_manifest,&payload,job).await?;
+                    remote.upload(&local,&target,&label,job).await?;
+                } else {
+                    remote.write(&target,if label=="auram.json" {marker}else{ownership}).await?;
+                }
+                Ok::<_,anyhow::Error>(())
             }
-            Ok::<_, anyhow::Error>(())
-            }
-        })
-        .buffer_unordered(4)
-        .try_collect::<Vec<_>>()
-        .await?;
+        }).buffer_unordered(8).try_collect::<Vec<_>>().await?;
         job.check()?;
         for action in &journal.actions {
             let present=exists(remote,&action.path).await?;
@@ -285,7 +310,7 @@ pub async fn apply(
                     parents(remote, &old).await?;
                     remote.rename(&action.path, &old).await?;
                 }
-                if matches!(action.kind, ActionKind::Upload) {
+                if matches!(action.kind, ActionKind::Upload | ActionKind::ReplaceDirectory) {
                     remote.rename(&stage(&id, index), &action.path).await?;
                 }
             }

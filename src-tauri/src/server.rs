@@ -56,7 +56,7 @@ impl ServerConfig {
         self.whitelist.iter().any(|p| name.starts_with(p))
             || !self.client_mods.iter().any(|p| name.starts_with(p))
     }
-    fn manifest(&self, full: &Manifest) -> Result<Manifest> {
+    pub(crate) fn manifest(&self, full: &Manifest) -> Result<Manifest> {
         let mut desired = Manifest {
             schema: 1,
             policy: 0,

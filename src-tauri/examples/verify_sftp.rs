@@ -81,7 +81,10 @@ async fn main() -> Result<()> {
     remote.mkdir(&directory).await?;
     remote.close().await;
     settings.directory = format!("/upload/{directory}");
-    let remote = connection::connect(&settings, &secret, &job).await?;
+    let remote = connection::connect_pool(&settings, &secret, &job).await?;
+    if remote.connection_count() != 8 {
+        bail!("Expected eight actual SFTP connections");
+    }
     // SFTP v3 must not overwrite the nonempty deployment lock directory.
     for path in ["lock-a/a", "lock-b/b"] {
         connection::parents(&remote, path).await?;
@@ -141,7 +144,7 @@ async fn main() -> Result<()> {
         remote.write(path, bytes).await?;
     }
     let plan = deploy::inspect(&packs, &remote, &job).await?;
-    if plan.reused != 2 || plan.uploads != 3 {
+    if plan.replacements != 4 || plan.uploads != 5 {
         bail!("Unexpected initial plan");
     }
     deploy::apply(&packs, &remote, plan, &job).await?;
@@ -159,12 +162,12 @@ async fn main() -> Result<()> {
         ],
     )?;
     let plan = deploy::inspect(&packs, &remote, &job).await?;
-    if plan.uploads != 3 || plan.renames != 1 {
+    if plan.uploads != 6 || plan.replacements != 4 {
         bail!("Unexpected update plan");
     }
     deploy::apply(&packs, &remote, plan, &job).await?;
     if remote.hash("mods/client.jar.client").await? != blob(b"CLIENT")
-        || remote.hash("mods/rename-new.jar.client").await? != blob(b"same")
+        || remote.hash("mods/rename-new.jar").await? != blob(b"same")
         || remote.hash("mods/large.jar").await? != blob(&bytes)
     {
         bail!("Live SFTP upload content mismatch");
@@ -223,6 +226,6 @@ async fn main() -> Result<()> {
         .await;
         println!("PASS: encrypted private-key authentication");
     }
-    println!("PASS: actual OpenSSH SFTP, host-key pinning/rejection, password authentication/rejection, scoped full/update deploys, disabled jar aliases, rename reuse, streaming upload hashes, nonempty lock exclusion, preserved worlds/properties, version commit and idempotent repeat");
+    println!("PASS: actual OpenSSH SFTP, host-key pinning/rejection, password authentication/rejection, scoped full/update deploys, disabled jar aliases, eight separate connections, full directory replacement, streaming upload hashes, nonempty lock exclusion, preserved worlds/properties, version commit and idempotent repeat");
     Ok(())
 }

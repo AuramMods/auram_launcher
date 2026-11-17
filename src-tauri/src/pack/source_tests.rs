@@ -388,7 +388,8 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/mods/old.jar", "same"),
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "before"),
-            ("server_config.conf", "server rules"),
+            ("minecraft/scripts/obsolete.zs", "old script"),
+            ("server_config.conf", "{}"),
         ]),
         None,
         Some(vec![]),
@@ -399,11 +400,12 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/mods/middle.jar", "same"),
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "middle"),
-            ("server_config.conf", "server rules"),
+            ("server_config.conf", "{}"),
         ]),
         Some(&base),
         Some(vec![
             "-minecraft/mods/old.jar".into(),
+            "-minecraft/scripts/obsolete.zs".into(),
             "+minecraft/mods/middle.jar".into(),
             "+minecraft/config/changed.toml".into(),
         ]),
@@ -414,7 +416,7 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/mods/new.jar", "same"),
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "after"),
-            ("server_config.conf", "new server rules"),
+            ("server_config.conf", "{\"clientMods\":[]}"),
         ]),
         Some(&middle),
         Some(vec![
@@ -464,6 +466,8 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
     remote.put("config/stable.toml", b"custom server setting");
     remote.put("config/changed.toml", b"before");
     remote.put("server.properties", b"private");
+    remote.put("mods/custom.jar", b"custom");
+    remote.put("scripts/obsolete.zs", b"locally edited old script");
     let mut payload = deploy::tests::payload(
         &f.packs,
         "145",
@@ -495,6 +499,12 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
     assert_eq!(plan.changelists, 2);
     assert_eq!(plan.renames, 1);
     assert_eq!(plan.uploads, 1);
+    assert!(remote
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(op, path)| op != "hash" && (op != "list" || path == "mods")));
     deploy::apply(&f.packs, &remote, plan, &job).await.unwrap();
     assert_eq!(remote.get("mods/new.jar.client").unwrap(), b"same");
     assert!(remote.get("mods/old.jar.client").is_none());
@@ -504,6 +514,8 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
     );
     assert_eq!(remote.get("config/changed.toml").unwrap(), b"after");
     assert_eq!(remote.get("server.properties").unwrap(), b"private");
+    assert_eq!(remote.get("mods/custom.jar").unwrap(), b"custom");
+    assert!(remote.get("scripts/obsolete.zs").is_none());
     assert!(
         f.payloads().iter().all(|p| !p.ends_with(".jar")),
         "Intermediate or unchanged mod bytes were downloaded"
@@ -516,12 +528,19 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
     legacy.put("mods/old.jar.client", b"same");
     legacy.put("config/stable.toml", b"custom server setting");
     legacy.put("config/changed.toml", b"before");
+    legacy.put("scripts/obsolete.zs", b"locally edited old script");
     let job = Job::default();
     let plan = deploy::inspect(&f.packs, &legacy, &job).await.unwrap();
     assert_eq!(plan.strategy, "changelists");
     assert_eq!(plan.renames, 1);
     assert_eq!(plan.uploads, 1);
-    assert_eq!(plan.removals, 0);
+    assert_eq!(plan.removals, 1);
+    assert!(legacy
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(op, path)| op != "hash" && (op != "list" || path == "mods")));
     deploy::apply(&f.packs, &legacy, plan, &job).await.unwrap();
     assert_eq!(legacy.get("mods/new.jar.client").unwrap(), b"same");
     assert!(legacy.get("mods/old.jar.client").is_none());

@@ -480,7 +480,7 @@ async fn check_sftp(
             "Inspecting SFTP server",
             &[
                 PhaseSpec("sftp-connect", "Connect", false),
-                PhaseSpec("sftp-plan", "Compare server", false),
+                PhaseSpec("sftp-plan", "Plan server update", false),
             ],
             Arc::new(move |p| {
                 let _ = emit.emit("progress", p);
@@ -516,7 +516,13 @@ async fn check_sftp(
         };
         settings.save(&core.layout, None)?;
         let result = async {
-            let remote_version = deploy::read_version(&remote).await?;
+            let remote_version = deploy::connection::wait(
+                job,
+                "reading auram.json",
+                std::time::Duration::from_secs(30),
+                deploy::read_version(&remote),
+            )
+            .await?;
             let payload: Option<crate::pack::Manifest> =
                 storage::read_optional(&core.layout.state("server-deploy-payload.json"))?;
             let plan = if payload.is_some() {
@@ -562,7 +568,7 @@ async fn deploy_sftp(
             &[
                 PhaseSpec("sftp-connect", "Connect", false),
                 PhaseSpec("sftp-recover", "Recover", false),
-                PhaseSpec("sftp-plan", "Compare server", false),
+                PhaseSpec("sftp-plan", "Plan server update", false),
                 PhaseSpec("sftp-upload", "Upload files", true),
                 PhaseSpec("sftp-apply", "Activate update", false),
             ],
@@ -574,7 +580,7 @@ async fn deploy_sftp(
     let job = &lease.job;
     let result=async {
         let settings=ConnectionSettings::load(&core.layout)?;
-        let remote=deploy::connection::connect(&settings,&settings.secret(&core.layout)?,job).await?;
+        let remote=deploy::connection::connect_pool(&settings,&settings.secret(&core.layout)?,job).await?;
         let result=async {
             if recover_only {deploy::recover(&remote,job).await?;return Ok("Previous remote installation recovered. Inspect the server to prepare another deployment.".into());}
             let plan=deploy::inspect(&core.packs,&remote,job).await?;

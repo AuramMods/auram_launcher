@@ -16,6 +16,7 @@ pub enum ActionKind {
     Upload,
     Remove,
     Rename,
+    ReplaceDirectory,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +38,7 @@ pub struct DeploymentPlan {
     pub removals: usize,
     pub renames: usize,
     pub reused: usize,
+    pub replacements: usize,
     pub bytes: u64,
     pub recovery_required: bool,
     pub notes: Vec<String>,
@@ -74,72 +76,282 @@ pub fn validate_baseline(baseline: &Baseline) -> Result<()> {
     }
     Ok(())
 }
-pub async fn inventory(
+// List only mod directories needed to preserve enabled/disabled names. Never
+// walk config/script trees or fetch remote file bodies during inspection.
+async fn mod_entries(
     remote: &impl Remote,
+    required: &BTreeSet<String>,
     job: &Job,
 ) -> Result<BTreeMap<String, (String, Attrs)>> {
-    let mut queue = super::ROOTS
+    let directories = required
         .iter()
-        .map(|r| r.to_string())
-        .collect::<Vec<_>>();
-    let mut found = BTreeMap::new();
-    while let Some(path) = queue.pop() {
-        job.check()?;
-        let Some(meta) = remote.stat(&path).await? else {
-            continue;
-        };
-        if meta.symlink || !meta.directory {
-            bail!("Remote payload folder is not a regular directory: {path}");
-        }
-        for (name, attrs) in remote.list(&path).await? {
-            if name.contains('/') || name == "." || name == ".." {
-                bail!("Invalid SFTP directory entry");
+        .filter(|p| p.starts_with("mods/"))
+        .map(|p| p.rsplit_once('/').unwrap().0.to_string())
+        .collect::<BTreeSet<_>>();
+    let lists = futures_util::stream::iter(directories)
+        .map(|directory| async move {
+            let mut task = job.task(&format!("sftp-list:{directory}"), &directory, None);
+            task.state(crate::jobs::TaskState::Running, 0);
+            let result = super::connection::wait(
+                job,
+                &format!("listing {directory}"),
+                std::time::Duration::from_secs(30),
+                async {
+                    match remote.stat(&directory).await? {
+                        None => Ok(Vec::new()),
+                        Some(meta) if meta.directory && !meta.symlink => {
+                            remote.list(&directory).await
+                        }
+                        Some(_) => {
+                            bail!("Remote mod folder is not a regular directory: {directory}")
+                        }
+                    }
+                },
+            )
+            .await;
+            match &result {
+                Ok(_) => task.complete(false),
+                Err(error) => task.fail(&format!("{error:#}")),
             }
-            let path = format!("{path}/{name}");
+            Ok::<_, anyhow::Error>((directory, result?))
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut found = BTreeMap::new();
+    for (directory, entries) in lists {
+        for (name, attrs) in entries {
+            let path = format!("{directory}/{name}");
             safe_path(&path)?;
-            if attrs.symlink {
+            let key = canonical(&path);
+            if !required.contains(&key) {
                 continue;
             }
-            if attrs.directory {
-                if path.split('/').count() > 64 {
-                    bail!("Remote payload directory nesting is too deep");
-                }
-                queue.push(path);
-            } else if found
-                .insert(canonical(&path), (path.clone(), attrs))
-                .is_some()
-            {
-                bail!("Both .jar and .jar.client exist for {path}; remove the duplicate before deploying");
+            if attrs.directory || attrs.symlink {
+                bail!("A remote directory or symlink blocks {path}");
             }
-            if found.len() + queue.len() > 100000 {
-                bail!("Remote payload inventory is too large");
+            if found.insert(key, (path.clone(), attrs)).is_some() {
+                bail!("Both .jar and .jar.client exist for {path}; remove the duplicate before deploying");
             }
         }
     }
     Ok(found)
 }
+fn desired(payload: &Manifest) -> Result<BTreeMap<String, OwnedFile>> {
+    let mut files = BTreeMap::new();
+    for (path, file) in &payload.files {
+        if !payload_path(path) {
+            continue;
+        }
+        safe_path(path)?;
+        if files
+            .insert(
+                canonical(path),
+                OwnedFile {
+                    path: path.clone(),
+                    file: file.clone(),
+                },
+            )
+            .is_some()
+        {
+            bail!("Built payload has duplicate enabled/disabled jars");
+        }
+    }
+    Ok(files)
+}
+async fn replacement(plan: &mut DeploymentPlan, remote: &impl Remote, job: &Job) -> Result<()> {
+    let required = plan
+        .baseline
+        .files
+        .keys()
+        .filter(|p| p.starts_with("mods/"))
+        .cloned()
+        .collect();
+    let aliases = mod_entries(remote, &required, job).await?;
+    for (key, owned) in &mut plan.baseline.files {
+        if let Some((path, _)) = aliases.get(key) {
+            owned.path = path.clone();
+        }
+    }
+    plan.strategy = "full replacement".into();
+    plan.replacements = super::ROOTS.len();
+    plan.uploads = plan.baseline.files.len();
+    plan.bytes = plan.baseline.files.values().map(|f| f.file.size).sum();
+    plan.actions = super::ROOTS
+        .iter()
+        .map(|root| Action {
+            kind: ActionKind::ReplaceDirectory,
+            path: (*root).into(),
+            from: None,
+            file: None,
+            payload: None,
+        })
+        .collect();
+    plan.notes.push("Original payload directories will be retained under .auram-deploy/transactions/. No remote payload file bodies were read during inspection.".into());
+    Ok(())
+}
+
+// The validated release identity is the baseline. Only changed distribution
+// paths are examined; local edits on untouched paths do not need a remote read.
+async fn patch(
+    plan: &mut DeploymentPlan,
+    remote: &impl Remote,
+    previous: Option<&Baseline>,
+    base: &Manifest,
+    job: &Job,
+) -> Result<()> {
+    let old = previous.map(|b| b.files.clone()).unwrap_or_else(|| {
+        base.files
+            .iter()
+            .filter_map(|(source, file)| {
+                let path = source.strip_prefix("minecraft/").unwrap_or(source);
+                if !payload_path(path) {
+                    return None;
+                }
+                Some((
+                    canonical(path),
+                    OwnedFile {
+                        path: path.into(),
+                        file: file.clone(),
+                    },
+                ))
+            })
+            .collect()
+    });
+    let obsolete = old
+        .iter()
+        .filter(|(key, _)| !plan.baseline.files.contains_key(*key))
+        .map(|(key, owned)| (key.clone(), owned.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let incoming = plan
+        .baseline
+        .files
+        .iter()
+        .filter(|(key, target)| {
+            old.get(*key)
+                .is_none_or(|before| before.file.sha != target.file.sha)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<BTreeMap<_, _>>();
+    plan.reused = plan.baseline.files.len() - incoming.len();
+    let required = incoming
+        .keys()
+        .chain(obsolete.keys())
+        .filter(|p| p.starts_with("mods/"))
+        .cloned()
+        .collect();
+    let aliases = mod_entries(remote, &required, job).await?;
+    let mut consumed = BTreeSet::new();
+    for (index, (key, target)) in incoming.iter().enumerate() {
+        job.check()?;
+        job.progress(
+            "sftp-plan",
+            "Planning changed server files from validated changelists",
+            index as u64,
+            incoming.len() as u64,
+        );
+        let mut destination = aliases
+            .get(key)
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| target.path.clone());
+        if key.starts_with("mods/") && !aliases.contains_key(key) {
+            if let Some((old_key, (from, _))) = obsolete
+                .iter()
+                .filter(|(old_key, owned)| {
+                    !consumed.contains(*old_key) && owned.file.sha == target.file.sha
+                })
+                .filter_map(|(old_key, _)| aliases.get(old_key).map(|entry| (old_key, entry)))
+                .find(|(_, (_, attrs))| attrs.size == target.file.size)
+            {
+                if from.ends_with(".jar.client") && !destination.ends_with(".client") {
+                    destination.push_str(".client");
+                }
+                plan.actions.push(Action {
+                    kind: ActionKind::Rename,
+                    path: destination.clone(),
+                    from: Some(from.clone()),
+                    file: Some(target.file.clone()),
+                    payload: Some(target.path.clone()),
+                });
+                plan.baseline.files.get_mut(key).unwrap().path = destination;
+                consumed.insert(old_key.clone());
+                plan.renames += 1;
+                continue;
+            }
+        }
+        plan.actions.push(Action {
+            kind: ActionKind::Upload,
+            path: destination.clone(),
+            from: None,
+            file: Some(target.file.clone()),
+            payload: Some(target.path.clone()),
+        });
+        plan.baseline.files.get_mut(key).unwrap().path = destination;
+        plan.uploads += 1;
+        plan.bytes += target.file.size;
+    }
+    for (key, owned) in obsolete {
+        if consumed.contains(&key) {
+            continue;
+        }
+        let path = if key.starts_with("mods/") {
+            let Some((path, _)) = aliases.get(&key) else {
+                continue;
+            };
+            path.clone()
+        } else {
+            owned.path
+        };
+        plan.actions.push(Action {
+            kind: ActionKind::Remove,
+            path,
+            from: None,
+            file: Some(owned.file),
+            payload: None,
+        });
+        plan.removals += 1;
+    }
+    Ok(())
+}
+
 pub async fn inspect(packs: &Packs, remote: &impl Remote, job: &Job) -> Result<DeploymentPlan> {
-    job.phase("sftp-plan", "Compare server", false);
+    job.phase("sftp-plan", "Plan server update", false);
+    job.progress("sftp-plan", "Reading the remote Auram version", 0, 0);
     let (payload, target_version) = super::built_payload(packs)?;
-    let remote_version = super::read_version(remote).await?;
-    let recovery_required = remote.stat(".auram-deploy/lock").await?.is_some();
+    let remote_version = super::connection::wait(
+        job,
+        "reading auram.json",
+        std::time::Duration::from_secs(30),
+        super::read_version(remote),
+    )
+    .await?;
+    let recovery_required = super::connection::wait(
+        job,
+        "checking the deployment journal",
+        std::time::Duration::from_secs(30),
+        remote.stat(".auram-deploy/lock"),
+    )
+    .await?
+    .is_some();
+    let files = desired(&payload)?;
     let mut plan = DeploymentPlan {
         remote_version: remote_version.clone(),
         target_version: target_version.clone(),
-        strategy: "full reconciliation".into(),
+        strategy: "changelists".into(),
         changelists: 0,
         uploads: 0,
         removals: 0,
         renames: 0,
         reused: 0,
+        replacements: 0,
         bytes: 0,
         recovery_required,
         notes: vec![],
         actions: vec![],
         baseline: Baseline {
             schema: 1,
-            version: target_version,
-            files: BTreeMap::new(),
+            version: target_version.clone(),
+            files,
         },
         payload,
     };
@@ -147,290 +359,69 @@ pub async fn inspect(packs: &Packs, remote: &impl Remote, job: &Job) -> Result<D
         plan.notes.push("An interrupted or active deployment owns the remote lock. Recover it before preparing another deployment.".into());
         return Ok(plan);
     }
-    let previous = match optional_json::<Baseline>(remote, ".auram-deploy.json").await {
-        Ok(value) => value,
-        Err(error) => {
-            plan.notes.push(format!("Remote ownership metadata could not be used ({error}); untracked files will be retained."));
-            None
+    if let Some(version) = &remote_version {
+        if !version.forge.is_empty() && version.forge != target_version.forge {
+            plan.notes.push(format!("The target requires Forge {}. SFTP deploys pack files only; update the remote Forge runtime separately.",target_version.forge));
         }
-    };
-    let previous = if let Some(baseline) = previous {
-        if validate_baseline(&baseline).is_ok()
-            && remote_version.as_ref().is_some_and(|v| {
-                v.version == baseline.version.version && v.commit == baseline.version.commit
-            })
+        if version.version == target_version.version
+            && (version.commit.is_empty() || version.commit == target_version.commit)
         {
-            Some(baseline)
-        } else {
-            plan.notes.push(
-                "Remote version and ownership metadata disagree; unknown files will be preserved."
-                    .into(),
-            );
-            None
+            plan.reused = plan.baseline.files.len();
+            plan.notes.push("The server version already matches the built pack. No remote payload files were read.".into());
+            return Ok(plan);
         }
-    } else {
-        None
-    };
-    let hints = if let Some(version) = &remote_version {
-        match packs
-            .server_changelists(&version.version, &version.commit, &plan.payload.tag, job)
-            .await
+        job.progress(
+            "sftp-plan",
+            "Resolving the server version and validated changelist route",
+            0,
+            0,
+        );
+        match super::connection::wait(
+            job,
+            "resolving the changelist route",
+            std::time::Duration::from_secs(180),
+            packs.server_changelists(&version.version, &version.commit, &plan.payload.tag, job),
+        )
+        .await
         {
-            Ok((base, changes, count)) => {
-                plan.strategy = "changelists".into();
+            Ok((base, _changes, count)) => {
                 plan.changelists = count;
-                Some((base, changes))
+                let previous = match super::connection::wait(
+                    job,
+                    "reading deployment ownership",
+                    std::time::Duration::from_secs(30),
+                    optional_json::<Baseline>(remote, ".auram-deploy.json"),
+                )
+                .await
+                {
+                    Ok(value) => value.filter(|b| {
+                        validate_baseline(b).is_ok()
+                            && b.version.version == version.version
+                            && (version.commit.is_empty() || b.version.commit == version.commit)
+                    }),
+                    Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+                        plan.notes.push("Invalid ownership metadata ignored; applying the validated version route.".into());
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+                patch(&mut plan, remote, previous.as_ref(), &base, job).await?;
+                return Ok(plan);
             }
             Err(error) => {
                 job.check()?;
-                plan.notes.push(format!(
-                    "Changelist fallback: {error}. Comparing the complete selected server payload."
-                ));
-                None
+                plan.notes.push(format!("No usable changelist route: {error:#}. Preparing a full replacement of the four payload directories."));
             }
         }
     } else {
-        None
-    };
-    if remote_version
-        .as_ref()
-        .is_some_and(|v| !v.forge.is_empty() && v.forge != plan.target_version.forge)
-    {
-        plan.notes.push(format!("The target requires Forge {}. SFTP deploys pack files only; update the remote Forge runtime separately.",plan.target_version.forge));
+        plan.notes.push("No recognized remote auram.json version. Preparing a full replacement of the four payload directories.".into());
     }
-    job.progress("sftp", "Inspecting mods, scripts, config and kubejs", 0, 0);
-    let files = inventory(remote, job).await?;
-    let mut desired = BTreeMap::new();
-    for (path, file) in &plan.payload.files {
-        if !payload_path(path) {
-            continue;
-        }
-        safe_path(path)?;
-        if desired
-            .insert(canonical(path), (path.clone(), file.clone()))
-            .is_some()
-        {
-            bail!("Built payload has duplicate enabled/disabled jars");
-        }
-    }
-    let mut consumed = BTreeSet::new();
-    let hash_requests = desired
-        .iter()
-        .filter_map(|(key, (path, file))| {
-            if key.starts_with("mods/") && key.ends_with(".jar") {
-                return None;
-            }
-            let (remote_path, _) = files.get(key)?;
-            let source = file.source.as_deref().unwrap_or(path);
-            let known = previous
-                .as_ref()
-                .and_then(|b| b.files.get(key))
-                .is_some_and(|old| old.file.sha == file.sha)
-                || hints.as_ref().is_some_and(|(base, changes)| {
-                    !changes.contains(source)
-                        && base.files.get(source).is_some_and(|f| f.sha == file.sha)
-                });
-            (!known).then(|| (remote_path.clone(), remote_path.clone()))
-        })
-        .collect::<Vec<_>>();
-    let hashes=futures_util::stream::iter(hash_requests).map(|(key,path)|async move {
-        job.check()?;
-        let hash=tokio::select!{_=job.cancel.cancelled()=>bail!("Inspection cancelled"),value=remote.hash(&path)=>value?};
-        Ok::<_,anyhow::Error>((key,hash))
-    }).buffer_unordered(8).try_collect::<BTreeMap<_,_>>().await?;
-    let prior_files = if let Some(previous) = &previous {
-        previous
-            .files
-            .iter()
-            .map(|(key, owned)| (key.clone(), owned.file.clone()))
-            .collect::<BTreeMap<_, _>>()
-    } else if let Some((base, changes)) = &hints {
-        base.files
-            .iter()
-            .filter_map(|(source, file)| {
-                let path = source
-                    .strip_prefix("minecraft/")
-                    .filter(|p| payload_path(p))?;
-                if changes.contains(source) {
-                    Some((canonical(path), file.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-    for (index, (key, (path, file))) in desired.iter().enumerate() {
-        job.check()?;
-        job.progress(
-            "sftp",
-            "Comparing the selected server payload",
-            index as u64,
-            desired.len() as u64,
-        );
-        let existing = files.get(key);
-        let destination = existing
-            .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| path.clone());
-        let before = previous.as_ref().and_then(|b| b.files.get(key));
-        let source = file.source.as_deref().unwrap_or(path);
-        let unchanged_in_chain = hints.as_ref().is_some_and(|(base, changes)| {
-            !changes.contains(source) && base.files.get(source).is_some_and(|f| f.sha == file.sha)
-        });
-        let same_baseline = before.is_some_and(|old| old.file.sha == file.sha);
-        let jar = key.starts_with("mods/") && key.ends_with(".jar");
-        let matches = if let Some((remote_path, attrs)) = existing {
-            if jar {
-                let known = before.map(|b| b.file.sha.as_str()).or_else(|| {
-                    hints
-                        .as_ref()
-                        .and_then(|(base, _)| base.files.get(source).map(|f| f.sha.as_str()))
-                });
-                attrs.size == file.size && known.is_none_or(|hash| hash == file.sha)
-            } else if same_baseline || unchanged_in_chain {
-                true
-            } else {
-                hashes
-                    .get(remote_path)
-                    .is_some_and(|hash| hash == &file.sha)
-            }
-        } else {
-            false
-        };
-        if matches {
-            plan.reused += 1;
-        } else {
-            let mut rename = None;
-            if existing.is_none() {
-                for (old_key, old_file) in &prior_files {
-                    if !desired.contains_key(old_key)
-                        && !consumed.contains(old_key)
-                        && old_file.sha == file.sha
-                    {
-                        if let Some((remote_path, attrs)) = files.get(old_key) {
-                            if attrs.size == file.size
-                                && ((jar && previous.is_some())
-                                    || remote.hash(remote_path).await? == file.sha)
-                            {
-                                rename = Some((old_key.clone(), remote_path.clone()));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((old_key, from)) = rename {
-                let destination = if from.ends_with(".jar.client") && !path.ends_with(".client") {
-                    format!("{path}.client")
-                } else {
-                    path.clone()
-                };
-                consumed.insert(old_key);
-                plan.actions.push(Action {
-                    kind: ActionKind::Rename,
-                    path: destination.clone(),
-                    from: Some(from),
-                    file: Some(file.clone()),
-                    payload: Some(path.clone()),
-                });
-                plan.baseline.files.insert(
-                    key.clone(),
-                    OwnedFile {
-                        path: destination,
-                        file: file.clone(),
-                    },
-                );
-                plan.renames += 1;
-                continue;
-            }
-            plan.actions.push(Action {
-                kind: ActionKind::Upload,
-                path: destination.clone(),
-                from: None,
-                file: Some(file.clone()),
-                payload: Some(path.clone()),
-            });
-            plan.uploads += 1;
-            plan.bytes += file.size;
-        }
-        plan.baseline.files.insert(
-            key.clone(),
-            OwnedFile {
-                path: destination,
-                file: file.clone(),
-            },
-        );
-    }
-    let mut obsolete = BTreeMap::new();
-    if let Some(previous) = &previous {
-        for (key, file) in &previous.files {
-            if !desired.contains_key(key) && !consumed.contains(key) {
-                obsolete.insert(key.clone(), (file.file.clone(), true));
-            }
-        }
-    }
-    // Legacy servers have no ownership file. Changelists may establish deleted
-    // distribution paths, but their actual remote bytes must match the old blob.
-    if previous.is_none() {
-        if let Some((base, changes)) = &hints {
-            for source in changes {
-                if let Some(path) = source
-                    .strip_prefix("minecraft/")
-                    .filter(|p| payload_path(p))
-                {
-                    let key = canonical(path);
-                    if !desired.contains_key(&key) && !consumed.contains(&key) {
-                        if let Some(file) = base.files.get(source) {
-                            obsolete.insert(key, (file.clone(), false));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (key, (old, owned)) in obsolete {
-        if let Some((path, _)) = files.get(&key) {
-            let config = !key.starts_with("mods/");
-            if (!owned || config) && remote.hash(path).await? != old.sha {
-                plan.notes
-                    .push(format!("Preserved locally modified obsolete file: {path}"));
-                continue;
-            }
-            plan.actions.push(Action {
-                kind: ActionKind::Remove,
-                path: path.clone(),
-                from: None,
-                file: Some(old),
-                payload: None,
-            });
-            plan.removals += 1;
-        }
-    }
-    let untracked = files
-        .iter()
-        .filter(|(key, _)| {
-            key.starts_with("mods/")
-                && !desired.contains_key(*key)
-                && !plan.actions.iter().any(|action| {
-                    &canonical(&action.path) == *key
-                        || action.from.as_ref().is_some_and(|p| &canonical(p) == *key)
-                })
-        })
-        .map(|(_, (path, _))| path.clone())
-        .collect::<Vec<_>>();
-    if !untracked.is_empty() {
-        plan.notes.push(format!(
-            "Preserving {} untracked mod file(s): {}{}",
-            untracked.len(),
-            untracked
-                .iter()
-                .take(8)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            if untracked.len() > 8 { " …" } else { "" }
-        ));
-    }
+    job.progress(
+        "sftp-plan",
+        "Preparing fresh mods, scripts, config and kubejs directories; no file hashing",
+        0,
+        0,
+    );
+    replacement(&mut plan, remote, job).await?;
     Ok(plan)
 }
