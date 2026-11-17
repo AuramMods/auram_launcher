@@ -1,5 +1,6 @@
 use super::{
-    connection::{parents, Remote},
+    activation,
+    connection::{parents, Mutation, Remote},
     payload_path,
     plan::{Action, ActionKind, DeploymentPlan},
     safe_path, MAX_CONNECTIONS, ROOTS,
@@ -90,6 +91,69 @@ async fn unlock(remote: &impl Remote, journal: &Journal) -> Result<()> {
     let receipt = format!("{}/receipt", data_root(&journal.id));
     parents(remote, &receipt).await?;
     remote.rename(".auram-deploy/lock", &receipt).await?;
+    Ok(())
+}
+async fn activate(remote: &impl Remote, journal: &Journal, job: &Job) -> Result<()> {
+    job.phase("sftp-apply", "Activate update", true);
+    {
+        // Cancellation is deferred during activation, as in local pack updates.
+        let progress = crate::local_work::Progress::new(
+            job,
+            "Activating server files in parallel; retaining backups",
+            journal.actions.len(),
+        );
+        // The private backup parent is shared; prepare it once, not per file.
+        parents(remote, &backup(&journal.id, 0)).await?;
+        for wave in activation::waves(&journal.actions) {
+            activation::parents(
+                remote,
+                journal.actions[wave.clone()].iter().map(|a| a.path.clone()),
+            )
+            .await?;
+            let operations = wave.map(|index| {
+                let action = &journal.actions[index];
+                let id = &journal.id;
+                let originals = &journal.originals;
+                let progress = &progress;
+                async move {
+                    let mut mutations = vec![Mutation::Write {
+                        path: started(index),
+                        bytes: b"started".to_vec(),
+                    }];
+                    if matches!(action.kind, ActionKind::Rename) {
+                        mutations.push(Mutation::Rename {
+                            from: action.from.clone().context("Rename source missing")?,
+                            to: action.path.clone(),
+                        });
+                    } else {
+                        if originals.contains(&action.path) {
+                            mutations.push(Mutation::Rename {
+                                from: action.path.clone(),
+                                to: backup(id, index),
+                            });
+                        }
+                        if matches!(
+                            action.kind,
+                            ActionKind::Upload | ActionKind::ReplaceDirectory
+                        ) {
+                            mutations.push(Mutation::Rename {
+                                from: stage(id, index),
+                                to: action.path.clone(),
+                            });
+                        }
+                    }
+                    // One lease for the marker → backup → promotion sequence.
+                    // An uncertain live mutation is recovered, never replayed.
+                    remote.mutate_batch(&mutations).await?;
+                    progress.complete();
+                    Ok::<_, anyhow::Error>(())
+                }
+            });
+            // Drain admitted operations even on error, before rollback begins.
+            // Ownership and auram.json have separate, final serial waves.
+            activation::settle(operations).await?;
+        }
+    }
     Ok(())
 }
 pub async fn recover(remote: &impl Remote, job: &Job) -> Result<()> {
@@ -186,16 +250,7 @@ pub async fn apply(
     let id = format!("{:032x}", rand::random::<u128>());
     let mut originals = BTreeSet::new();
     // Retire obsolete owned paths first; never recursively replace a directory.
-    plan.actions.sort_by_key(|a| {
-        (
-            usize::from(a.path != "mods" && !a.path.starts_with("mods/")),
-            match a.kind {
-                ActionKind::Remove => 0,
-                ActionKind::Rename => 1,
-                ActionKind::Upload | ActionKind::ReplaceDirectory => 2,
-            },
-        )
-    });
+    plan.actions.sort_by_key(activation::order);
     let marker = serde_json::to_vec_pretty(&plan.target_version)?;
     let ownership = serde_json::to_vec_pretty(&plan.baseline)?;
     for path in [".auram-deploy.json", "auram.json"] {
@@ -340,40 +395,7 @@ pub async fn apply(
                 }
             }).buffer_unordered(MAX_CONNECTIONS).try_collect::<Vec<_>>().await?;
         }
-        job.phase("sftp-apply", "Activate update", true);
-        // Cancellation is deferred during activation, as in local pack updates.
-        for (index, action) in plan.actions.iter().enumerate() {
-            job.progress(
-                "sftp-apply",
-                match action.kind {
-                    ActionKind::Remove => "Removing obsolete files; retaining backups",
-                    ActionKind::ReplaceDirectory => "Replacing pack directories; retaining originals as backups",
-                    _ => "Activating staged files; retaining originals",
-                },
-                index as u64,
-                plan.actions.len() as u64,
-            );
-            parents(remote, &action.path).await?;
-            remote.write(&started(index), b"started").await?;
-            if matches!(action.kind, ActionKind::Rename) {
-                remote
-                    .rename(
-                        action.from.as_ref().context("Rename source missing")?,
-                        &action.path,
-                    )
-                    .await?;
-            } else {
-                if journal.originals.contains(&action.path) {
-                    let old = backup(&id, index);
-                    parents(remote, &old).await?;
-                    remote.rename(&action.path, &old).await?;
-                }
-                if matches!(action.kind, ActionKind::Upload | ActionKind::ReplaceDirectory) {
-                    remote.rename(&stage(&id, index), &action.path).await?;
-                }
-            }
-            job.progress("sftp-apply", "Activating staged files; retaining originals", (index+1) as u64, plan.actions.len() as u64);
-        }
+        activate(remote, &journal, job).await?;
         job.detail("sftp-apply", "Finalizing the deployment journal");
         remote
             .write(".auram-deploy/lock/complete", b"complete")

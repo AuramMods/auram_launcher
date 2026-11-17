@@ -543,6 +543,23 @@ pub struct Attrs {
     pub directory: bool,
     pub symlink: bool,
 }
+/// One file's durable marker, backup and activation share a connection lease.
+pub enum Mutation {
+    Write { path: String, bytes: Vec<u8> },
+    Rename { from: String, to: String },
+}
+pub async fn execute_mutations(
+    remote: &(impl Remote + ?Sized),
+    mutations: &[Mutation],
+) -> Result<()> {
+    for mutation in mutations {
+        match mutation {
+            Mutation::Write { path, bytes } => remote.write(path, bytes).await?,
+            Mutation::Rename { from, to } => remote.rename(from, to).await?,
+        }
+    }
+    Ok(())
+}
 pub trait Remote: Send + Sync {
     fn stat(&self, path: &str) -> impl Future<Output = Result<Option<Attrs>>> + Send;
     fn list(&self, path: &str) -> impl Future<Output = Result<Vec<(String, Attrs)>>> + Send;
@@ -560,6 +577,9 @@ pub trait Remote: Send + Sync {
     fn rename(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> + Send;
     fn remove(&self, path: &str) -> impl Future<Output = Result<()>> + Send;
     fn rmdir(&self, path: &str) -> impl Future<Output = Result<()>> + Send;
+    fn mutate_batch(&self, mutations: &[Mutation]) -> impl Future<Output = Result<()>> + Send {
+        execute_mutations(self, mutations)
+    }
 }
 impl Remote for SftpRemote {
     async fn stat(&self, path: &str) -> Result<Option<Attrs>> {
@@ -783,7 +803,14 @@ impl Remote for SftpPool {
         self.control()?.write(p, b).await
     }
     async fn mkdir(&self, p: &str) -> Result<()> {
-        self.control()?.mkdir(p).await
+        self.slots
+            .once(
+                &self.read_job,
+                |index| self.remotes[index].mkdir(p),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.control()?.rename(from, to).await
@@ -793,6 +820,16 @@ impl Remote for SftpPool {
     }
     async fn rmdir(&self, p: &str) -> Result<()> {
         self.control()?.rmdir(p).await
+    }
+    async fn mutate_batch(&self, mutations: &[Mutation]) -> Result<()> {
+        self.slots
+            .once(
+                &self.read_job,
+                |index| self.remotes[index].mutate_batch(mutations),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
 }
 

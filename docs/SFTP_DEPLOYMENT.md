@@ -39,13 +39,15 @@ Destination checks and staging-directory creation run in bounded parallel batche
 
 TCP_NODELAY is enabled. Ancestor safety checks use one server-side canonical-path resolution per parent, with leaf symlink/type checks, instead of issuing an LSTAT for every ancestor on every file. Nonexistent parents retain the checked-prefix fallback; permission errors and symlink/alias paths remain errors. Paths are checked afresh rather than cached. The final upload size/type check reuses the validated name. Cached local pack blobs are checksum-verified once per lookup instead of twice. File close acknowledgements, remote size/type checks, and fsync behavior are retained.
 
-Activation retains originals before replacing/removing changed files or swapping the four fully staged directories. Each mutation has a persistent start marker, allowing recovery even when a request succeeded but its acknowledgement was lost. Ownership is written near the end and `auram.json` is installed last. Cancellation is deferred during activation/restoration. Successful or rolled-back journals are atomically moved out of the active lock into retained transaction receipts, avoiding an empty-lock cleanup window.
+Activation uses up to twenty accepted connections for independent file removals, backups and staged-file renames, as well as uploads. Each file's durable start marker, backup and promotion execute in order on one exclusively leased connection. Shared parent directories are prepared once per batch instead of rechecking them for every file. Mod/remove/rename/upload ordering is retained; overlapping destinations, rename sources and case variants are serialized. Ownership and then `auram.json` are separate final barriers after every payload action succeeds.
+
+Activation retains originals before replacing/removing changed files or swapping the four fully staged directories. Each mutation has a persistent start marker, allowing recovery even when a request succeeded but its acknowledgement was lost. Live mutations are never automatically replayed. On an activation error, no further files are admitted, all in-flight actions settle, and only then does rollback begin; failed transports are retired so recovery can use surviving connections. Cancellation is deferred during activation/restoration. Successful or rolled-back journals are atomically moved out of the active lock into retained transaction receipts, avoiding an empty-lock cleanup window.
 
 After a disconnected/interrupted deployment, reconnect, inspect, and choose **Recover deployment** only after the other launcher has stopped. Completed transactions are finalized; incomplete transactions restore the old installation. Backups and journals remain under `.auram-deploy/transactions/`. Recovery preserves files written while a deployment was interrupted rather than silently discarding them. A recovery failure leaves its journal and originals available for another attempt. Remote paths and ancestors are validated; symlinks, unsafe names and directory/file conflicts at action destinations are rejected. Full directory swaps retain nested contents and symlinks without following them; root/ancestor symlinks are refused.
 
 ## Local verification
 
-`cargo test --manifest-path src-tauri/Cargo.toml --lib` includes deterministic filesystem/HTTP fixtures for scoped deployment, aliases, same-size changed jars, renamed blobs, untouched configuration preservation, zero-body metadata-only inspection, twenty concurrent uploads, skipped changelists, cancellation/timeouts, lock exclusion, unsafe paths, symlinks, and failures before/after every remote mutation. Recovery is restartable and idempotent in those interruption cases.
+`cargo test --manifest-path src-tauri/Cargo.toml --lib` includes deterministic filesystem/HTTP fixtures for scoped deployment, aliases, same-size changed jars, renamed blobs, untouched configuration preservation, zero-body metadata-only inspection, twenty concurrent uploads and activations, ordered metadata publication, draining peers before rollback, skipped changelists, cancellation/timeouts, lock exclusion, unsafe paths, symlinks, and failures before/after every remote mutation. Recovery is restartable and idempotent in those interruption cases.
 
 A disposable loopback OpenSSH container exercises the real transport:
 
@@ -78,5 +80,14 @@ AURAM_SFTP_TEST_PORT=1427 cargo run --manifest-path src-tauri/Cargo.toml \
 ```
 
 To simulate a limit imposed during transfer, start without a limit file and add `AURAM_SFTP_BENCH_LIMIT_FILE="$PWD/.qa/sftp-limit"` to that benchmark command. After establishing twenty connections, the harness writes a limit of three; the proxy drops excess existing transports. Verify the JSON result reports twenty initial connections, three remaining connections and matching uploaded bodies. For an initial connection cap, write `3` to the limit file before starting the benchmark without `AURAM_SFTP_BENCH_LIMIT_FILE`. This fixture does not connect to production servers.
+
+`bench_sftp_activation` measures incremental obsolete-file activation separately from staging and verifies every retained backup, the final version and untouched world/properties files:
+
+```sh
+AURAM_SFTP_TEST_PORT=1427 cargo run --manifest-path src-tauri/Cargo.toml \
+  --locked --no-default-features --example bench_sftp_activation -- 64
+```
+
+With the same loopback OpenSSH fixture, twenty connections and 10 ms added latency per proxy direction, 64 tiny removals took **29.25 s before / 2.12 s after** for activation; complete deployment took **30.57 s / 3.46 s**. These are fixture measurements, not a guarantee for a hosting provider.
 
 On the development Mac, 128 tiny files across sixteen nested configuration folders with 10 ms added per proxy direction took 13.82 seconds before this change (8 connections) and 4.09 seconds afterward (20 connections), with all uploaded bytes checked. First upload began after 3.24 seconds versus 1.38 seconds. The same fixture completed with verified bodies after a live 20-to-3 connection reduction. These are controlled fixture measurements, not a throughput guarantee for a hosting provider.

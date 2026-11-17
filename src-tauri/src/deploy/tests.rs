@@ -26,6 +26,12 @@ pub(crate) struct DiskRemote {
     slow_uploads: AtomicBool,
     active_uploads: AtomicUsize,
     peak_uploads: AtomicUsize,
+    slow_activation: AtomicBool,
+    active_activation: AtomicUsize,
+    peak_activation: AtomicUsize,
+    activation_order: Mutex<Vec<String>>,
+    fail_activation: Mutex<Option<String>>,
+    recovery_overlap: AtomicBool,
 }
 impl DiskRemote {
     pub fn new() -> Self {
@@ -38,6 +44,12 @@ impl DiskRemote {
             slow_uploads: AtomicBool::new(false),
             active_uploads: AtomicUsize::new(0),
             peak_uploads: AtomicUsize::new(0),
+            slow_activation: AtomicBool::new(false),
+            active_activation: AtomicUsize::new(0),
+            peak_activation: AtomicUsize::new(0),
+            activation_order: Mutex::new(Vec::new()),
+            fail_activation: Mutex::new(None),
+            recovery_overlap: AtomicBool::new(false),
         }
     }
     fn path(&self, p: &str) -> Result<PathBuf> {
@@ -87,6 +99,9 @@ impl DiskRemote {
 }
 impl Remote for DiskRemote {
     async fn stat(&self, p: &str) -> Result<Option<Attrs>> {
+        if p == ".auram-deploy/lock" && self.active_activation.load(Ordering::SeqCst) > 0 {
+            self.recovery_overlap.store(true, Ordering::SeqCst);
+        }
         self.requests
             .lock()
             .unwrap()
@@ -168,6 +183,46 @@ impl Remote for DiskRemote {
     }
     async fn rmdir(&self, p: &str) -> Result<()> {
         self.mutate(|| Ok(fs::remove_dir(self.path(p)?)?))
+    }
+    async fn mutate_batch(&self, mutations: &[connection::Mutation]) -> Result<()> {
+        if !self.slow_activation.load(Ordering::SeqCst) {
+            return connection::execute_mutations(self, mutations).await;
+        }
+        let target = match mutations.last().unwrap() {
+            connection::Mutation::Rename { from, to } => {
+                if to.starts_with(".auram-deploy/") {
+                    from
+                } else {
+                    to
+                }
+            }
+            connection::Mutation::Write { path, .. } => path,
+        };
+        let active = self.active_activation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_activation.fetch_max(active, Ordering::SeqCst);
+        if ["auram.json", ".auram-deploy.json"].contains(&target.as_str()) {
+            assert_eq!(active, 1, "Metadata must wait for all payload mutations");
+        }
+        let fail = {
+            let mut failure = self.fail_activation.lock().unwrap();
+            if failure.as_deref() == Some(target) {
+                failure.take();
+                true
+            } else {
+                false
+            }
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(if fail { 1 } else { 10 })).await;
+        let result = connection::execute_mutations(self, mutations).await;
+        if result.is_ok() {
+            self.activation_order.lock().unwrap().push(target.clone());
+        }
+        self.active_activation.fetch_sub(1, Ordering::SeqCst);
+        result?;
+        if fail {
+            bail!("Lost activation acknowledgement");
+        }
+        Ok(())
     }
 }
 fn blob(bytes: &[u8]) -> String {
@@ -389,6 +444,131 @@ async fn transaction_fixture() -> (tempfile::TempDir, Packs, DiskRemote, Deploym
     );
     let plan = inspect(&packs, &remote, &Job::default()).await.unwrap();
     (t, packs, remote, plan)
+}
+async fn parallel_activation_fixture() -> (tempfile::TempDir, Packs, DiskRemote, DeploymentPlan) {
+    let (temp, packs) = packs();
+    let remote = DiskRemote::new();
+    let old = payload(
+        &packs,
+        "old",
+        &[("mods/old.jar", b"same"), ("config/a.toml", b"before")],
+    );
+    baseline(&remote, &old, "old");
+    remote.put("mods/old.jar", b"same");
+    remote.put("config/a.toml", b"before");
+    remote.put("world/level.dat", b"world");
+    remote.put("server.properties", b"private");
+    let new = payload(
+        &packs,
+        "new",
+        &[("mods/new.jar", b"same"), ("config/a.toml", b"after")],
+    );
+    let mut plan = inspect(&packs, &remote, &Job::default()).await.unwrap();
+    plan.actions.clear();
+    for index in 0..48 {
+        let path = format!("config/deep/{index}.toml");
+        remote.put(&path, format!("original-{index}").as_bytes());
+        plan.actions.push(plan::Action {
+            kind: plan::ActionKind::Remove,
+            path,
+            from: None,
+            file: None,
+            payload: None,
+        });
+    }
+    plan.actions.push(plan::Action {
+        kind: plan::ActionKind::Rename,
+        path: "mods/new.jar".into(),
+        from: Some("mods/old.jar".into()),
+        file: None,
+        payload: None,
+    });
+    plan.actions.push(plan::Action {
+        kind: plan::ActionKind::Upload,
+        path: "config/a.toml".into(),
+        from: None,
+        file: Some(new.files["config/a.toml"].clone()),
+        payload: Some("config/a.toml".into()),
+    });
+    plan.replacements = 0;
+    remote.slow_activation.store(true, Ordering::SeqCst);
+    (temp, packs, remote, plan)
+}
+#[tokio::test]
+async fn activation_runs_twenty_files_in_parallel_and_publishes_metadata_last() {
+    let (_temp, packs, remote, plan) = parallel_activation_fixture().await;
+    let job = Job::default();
+    apply(&packs, &remote, plan, &job).await.unwrap();
+    assert_eq!(
+        remote.peak_activation.load(Ordering::SeqCst),
+        MAX_CONNECTIONS
+    );
+    assert!(!remote.recovery_overlap.load(Ordering::SeqCst));
+    let order = remote.activation_order.lock().unwrap();
+    assert_eq!(
+        &order[order.len() - 2..],
+        &[".auram-deploy.json", "auram.json"]
+    );
+    for index in 0..48 {
+        assert!(remote.get(&format!("config/deep/{index}.toml")).is_none());
+    }
+    assert!(remote.get("mods/old.jar").is_none());
+    assert_eq!(remote.get("mods/new.jar").unwrap(), b"same");
+    assert_eq!(remote.get("config/a.toml").unwrap(), b"after");
+    assert_eq!(remote.get("world/level.dat").unwrap(), b"world");
+    assert_eq!(remote.get("server.properties").unwrap(), b"private");
+    let phase = job
+        .snapshot()
+        .phases
+        .into_iter()
+        .find(|p| p.id == "sftp-apply")
+        .unwrap();
+    assert_eq!((phase.completed, phase.total), (52, 52));
+    // The parent directory is checked per wave, not once for every file.
+    let requests = remote.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|(op, path)| op == "stat" && path == "config/deep")
+            .count()
+            < 5
+    );
+}
+#[tokio::test]
+async fn failed_parallel_activation_drains_peers_before_restoring_every_original() {
+    let (_temp, packs, remote, plan) = parallel_activation_fixture().await;
+    *remote.fail_activation.lock().unwrap() = Some("config/deep/0.toml".into());
+    let error = apply(&packs, &remote, plan, &Job::default())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Lost activation acknowledgement"));
+    assert_eq!(
+        remote.peak_activation.load(Ordering::SeqCst),
+        MAX_CONNECTIONS
+    );
+    assert_eq!(remote.active_activation.load(Ordering::SeqCst), 0);
+    assert!(!remote.recovery_overlap.load(Ordering::SeqCst));
+    // One preceding mod rename and the first twenty admitted removals only.
+    assert_eq!(
+        remote.activation_order.lock().unwrap().len(),
+        MAX_CONNECTIONS + 1
+    );
+    for index in 0..48 {
+        assert_eq!(
+            remote.get(&format!("config/deep/{index}.toml")).unwrap(),
+            format!("original-{index}").as_bytes()
+        );
+    }
+    assert_eq!(remote.get("mods/old.jar").unwrap(), b"same");
+    assert!(remote.get("mods/new.jar").is_none());
+    assert_eq!(remote.get("config/a.toml").unwrap(), b"before");
+    assert_eq!(remote.get("world/level.dat").unwrap(), b"world");
+    assert_eq!(remote.get("server.properties").unwrap(), b"private");
+    let version: ServerVersion =
+        serde_json::from_slice(&remote.get("auram.json").unwrap()).unwrap();
+    assert_eq!(version.version, "old");
+    assert!(!remote.root.path().join(".auram-deploy/lock").exists());
+    recover(&remote, &Job::default()).await.unwrap();
 }
 #[tokio::test]
 async fn every_remote_mutation_can_be_interrupted_before_or_after_acknowledgement() {

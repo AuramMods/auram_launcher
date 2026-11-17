@@ -75,6 +75,33 @@ impl Slots {
         self.changed.notify_waiters();
         removed
     }
+    /// Lease one transport for an ordered live mutation. Never replay a request
+    /// after an uncertain acknowledgement, and never cancel it mid-mutation.
+    pub async fn once<T, F, Fut, C, Close>(
+        &self,
+        job: &Job,
+        perform: F,
+        close: C,
+        classify: fn(&anyhow::Error) -> Retry,
+    ) -> Result<T>
+    where
+        F: FnOnce(usize) -> Fut,
+        Fut: Future<Output = Result<T>>,
+        C: FnOnce(usize) -> Close,
+        Close: Future<Output = ()>,
+    {
+        let slot = self.acquire(job).await?;
+        let result = perform(slot.index).await;
+        if let Err(error) = &result {
+            let retry = classify(error);
+            let index = slot.index;
+            if retry != Retry::Never && self.retire(index, retry == Retry::Limit) {
+                drop(slot);
+                close(index).await;
+            }
+        }
+        result
+    }
     pub async fn run<T, F, Fut, C, Close>(
         &self,
         job: &Job,
@@ -153,6 +180,38 @@ mod tests {
         } else {
             Retry::Never
         }
+    }
+    #[tokio::test]
+    async fn uncertain_mutation_is_not_replayed_and_failed_transport_is_retired() {
+        let slots = Slots::new(3);
+        let calls = AtomicUsize::new(0);
+        let closed = AtomicUsize::new(0);
+        let result: Result<()> = slots
+            .once(
+                &Job::default(),
+                |_| async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bail!("Lost rename acknowledgement")
+                },
+                |_| async {
+                    closed.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| Retry::Disconnected,
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert_eq!(slots.count(), 2);
+        slots
+            .once(
+                &Job::default(),
+                |_| async { Ok(()) },
+                |_| async {},
+                classify,
+            )
+            .await
+            .unwrap();
     }
     #[tokio::test]
     async fn server_limits_retire_slots_and_finish_all_waiting_uploads() {
