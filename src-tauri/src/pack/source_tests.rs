@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 struct Responses {
     bodies: BTreeMap<String, Vec<u8>>,
     requests: Vec<String>,
+    delay: std::time::Duration,
 }
 struct Fixture {
     state: Arc<Mutex<Responses>>,
@@ -59,13 +60,20 @@ impl Fixture {
             State(state): State<Arc<Mutex<Responses>>>,
             OriginalUri(uri): OriginalUri,
         ) -> impl IntoResponse {
-            let mut state = state.lock().unwrap();
-            let path = uri.path_and_query().unwrap().as_str().to_string();
-            state.requests.push(path.clone());
-            match state.bodies.get(&path) {
-                Some(body) => (StatusCode::OK, body.clone()),
-                None => (StatusCode::NOT_FOUND, Vec::new()),
+            let (status, body, delay) = {
+                let mut state = state.lock().unwrap();
+                let path = uri.path_and_query().unwrap().as_str().to_string();
+                state.requests.push(path.clone());
+                let (status, body) = match state.bodies.get(&path) {
+                    Some(body) => (StatusCode::OK, body.clone()),
+                    None => (StatusCode::NOT_FOUND, Vec::new()),
+                };
+                (status, body, state.delay)
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
+            (status, body)
         }
         let router = Router::new().fallback(get(serve)).with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1191,4 +1199,169 @@ async fn published_build145_chains_and_jar_rename_identities() {
         println!("Verified unchanged blob for {old} → {new}: {}", after.sha);
     }
     println!("Live 139 → 145: 3 changelists, {} selected paths, metadata bodies {} bytes, zero jar-body downloads",paths.len(),packs.net.transferred_bytes());
+}
+
+#[tokio::test]
+async fn startup_preparation_updates_real_files_and_retains_worlds_and_shared_caches() {
+    use crate::startup::PackState;
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/a.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    let world = f.packs.layout.game().join("saves/my-world/level.dat");
+    let asset = f.packs.layout.runtime().join("assets/objects/shared");
+    storage::atomic_write(&world, b"world").unwrap();
+    storage::atomic_write(&asset, b"asset").unwrap();
+    let target = f.snapshot(
+        "145",
+        files(&[("minecraft/mods/b.jar", "new")]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/a.jar".into(),
+            "+minecraft/mods/b.jar".into(),
+        ]),
+    );
+    f.latest(&target);
+    let result = f.packs.prepare_installed(&Job::default()).await.unwrap();
+    assert_eq!(result.state, PackState::Ready);
+    assert_eq!(result.version.as_deref(), Some("145"));
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, target.sha);
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("mods/b.jar")).unwrap(),
+        b"new"
+    );
+    assert!(!f.packs.layout.game().join("mods/a.jar").exists());
+    assert_eq!(fs::read(world).unwrap(), b"world");
+    assert_eq!(fs::read(asset).unwrap(), b"asset");
+    f.clear_requests();
+    assert_eq!(
+        f.packs
+            .prepare_installed(&Job::default())
+            .await
+            .unwrap()
+            .state,
+        PackState::Ready
+    );
+    assert!(f.payloads().iter().all(|path| !path.ends_with(".jar")));
+}
+
+#[tokio::test]
+async fn startup_uses_installed_pack_after_an_actual_connection_failure() {
+    use crate::startup::PackState;
+    let mut f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/a.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    f.packs.repository.raw = format!("http://{address}/raw/");
+    f.packs.repository.api = format!("http://{address}/api");
+    let result = f.packs.prepare_installed(&Job::default()).await.unwrap();
+    assert_eq!(result.state, PackState::Offline);
+    assert!(result.allows_launch());
+    assert!(result.detail.is_some());
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, base.sha);
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("mods/a.jar")).unwrap(),
+        b"old"
+    );
+}
+
+#[tokio::test]
+async fn startup_bounds_the_actual_metadata_request_and_does_not_probe_connectivity() {
+    use crate::startup::PackState;
+    let f = Fixture::new().await;
+    let base = f.snapshot("139", files(&[]), None, Some(vec![]));
+    f.install(&base).await;
+    f.latest(&base);
+    f.clear_requests();
+    f.state.lock().unwrap().delay = std::time::Duration::from_millis(200);
+    let result = f
+        .packs
+        .prepare_installed_with_timeout(&Job::default(), std::time::Duration::from_millis(40))
+        .await
+        .unwrap();
+    assert_eq!(result.state, PackState::Offline);
+    assert!(f
+        .requests()
+        .iter()
+        .any(|path| path == "/raw/main/auram.json"));
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, base.sha);
+}
+
+#[tokio::test]
+async fn startup_does_not_treat_invalid_metadata_or_corrupt_update_bytes_as_offline() {
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/a.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    f.response("/raw/main/auram.json", json!({"version":"invalid"}));
+    assert!(f.packs.prepare_installed(&Job::default()).await.is_err());
+    let target = f.snapshot(
+        "145",
+        files(&[("minecraft/mods/a.jar", "new")]),
+        Some(&base),
+        Some(vec!["+minecraft/mods/a.jar".into()]),
+    );
+    f.latest(&target);
+    f.state.lock().unwrap().bodies.insert(
+        format!("/raw/{}/minecraft/mods/a.jar", target.sha),
+        b"bad".to_vec(),
+    );
+    let error = f
+        .packs
+        .prepare_installed(&Job::default())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("integrity"));
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, base.sha);
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("mods/a.jar")).unwrap(),
+        b"old"
+    );
+}
+
+#[tokio::test]
+async fn startup_cancellation_keeps_the_previous_pack_and_does_not_grant_offline_launch() {
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/a.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    let job = Job::default();
+    job.cancel.cancel();
+    assert!(f
+        .packs
+        .prepare_installed(&job)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled"));
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, base.sha);
+}
+
+#[tokio::test]
+async fn startup_with_no_installation_leaves_initial_install_explicit() {
+    use crate::startup::PackState;
+    let f = Fixture::new().await;
+    let result = f.packs.prepare_installed(&Job::default()).await.unwrap();
+    assert_eq!(result.state, PackState::NotInstalled);
+    assert!(!result.allows_launch());
+    assert!(f.requests().is_empty());
 }

@@ -350,6 +350,21 @@ impl std::fmt::Display for RetryAfter {
 }
 impl std::error::Error for RetryAfter {}
 
+/// Classify failures of actual requests, never infer connectivity from a probe.
+pub(crate) fn unavailable(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<RetryAfter>().is_some() {
+        return true;
+    }
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_connect()
+            || error.is_timeout()
+            || error.is_body()
+            || error.status().is_some_and(|status| {
+                status.is_server_error() || [403, 408, 429].contains(&status.as_u16())
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

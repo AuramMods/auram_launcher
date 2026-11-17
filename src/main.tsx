@@ -11,6 +11,7 @@ import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
 import { SidebarAccount } from '@/components/sidebar-account';
 import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
+import { createStartupTask, type PackPreparation } from '@/lib/startup';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -22,8 +23,8 @@ import './style.css';
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
 type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
-type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
+type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
   const [status,setStatus]=React.useState<Status|null>(null);
@@ -37,23 +38,49 @@ function App() {
   const [codeCopied,setCodeCopied]=React.useState(false);
   const [advanced,setAdvanced]=React.useState(false);
   const [updateStatus,setUpdateStatus]=React.useState('');
+  const [packPreparation,setPackPreparation]=React.useState<PackPreparation>({state:'pending',version:null,message:null,detail:null});
   const lastProgress=React.useRef<Pick<JobProgress,'jobId'|'revision'>|null>(null);
   const receiveProgress=React.useCallback((next:JobProgress)=>{if(isNewerProgress(next,lastProgress.current)){lastProgress.current=next;setProgress(next);}},[]);
   const refresh=React.useCallback(async()=>{const next=await invoke<Status>('get_status');setStatus(next);setSettings(previous=>previous??next.settings);if(next.progress)receiveProgress(next.progress);return next;},[receiveProgress]);
+  const acceptPreparation=React.useCallback((next:PackPreparation)=>{
+    setPackPreparation(next);
+    if(next.state==='failed')setError(next.message??'Pack preparation failed. Retry the update.');
+    else if(next.state==='offline')setNotice(next.message??'Pack updates unavailable. The installed version can be launched.');
+  },[]);
+  const startSession=React.useMemo(()=>createStartupTask({
+    initialize:refresh,
+    updateLauncher:()=>invoke<string>('update_launcher',{manual:false}),
+    preparePack:()=>invoke<PackPreparation>('prepare_pack_update',{retry:false}),
+    launcherStatus:setUpdateStatus,
+  }),[refresh]);
   React.useEffect(()=>{
     let disposed=false;
-    refresh().then(()=>invoke<string>('update_launcher',{manual:false}).then(setUpdateStatus).catch(e=>setUpdateStatus(String(e)))).catch(e=>setError(String(e)));
     const subscription=listen<JobProgress>('progress',event=>{if(!disposed)receiveProgress(event.payload);});
     const challengeSubscription=listen<{code:string;verificationUri:string;expiresAt:number}>('device-challenge',event=>{if(!disposed){setCodeCopied(false);setChallenge(event.payload);}});
+    startSession().then(async prepared=>{
+      if(disposed)return;
+      await refresh();if(!disposed)acceptPreparation(prepared);
+    }).catch(error=>{if(!disposed){const message=String(error);setError(message);setPackPreparation({state:'failed',version:null,message,detail:null});}});
     const interval=setInterval(()=>{refresh().catch(()=>{});},1500);
     return ()=>{disposed=true;clearInterval(interval);void subscription.then(unlisten=>unlisten());void challengeSubscription.then(unlisten=>unlisten());};
-  },[refresh,receiveProgress]);
-  const busy=active||!!status?.busy||progress?.state==='running'||progress?.state==='cancelling';
+  },[refresh,receiveProgress,startSession,acceptPreparation]);
+  const preparingPack=packPreparation.state==='pending'||packPreparation.state==='running';
+  const packUpdateFailed=packPreparation.state==='failed';
+  const busy=active||preparingPack||!!status?.busy||progress?.state==='running'||progress?.state==='cancelling';
+  async function retryPackUpdate() {
+    setError('');setNotice('');setProgress(null);
+    setPackPreparation(previous=>({...previous,state:'running',message:null}));
+    try {
+      await invoke('retry_initialize');await refresh();
+      const prepared=await invoke<PackPreparation>('prepare_pack_update',{retry:true});
+      await refresh();acceptPreparation(prepared);
+    } catch(error) {const message=String(error);setError(message);setPackPreparation({state:'failed',version:null,message,detail:null});}
+  }
   async function run(operation:Operation) {
     setActive(true);setError('');setNotice('');setProgress(null);
-    try {await invoke('run_operation',{operation});await refresh();setNotice((operation==='launch'||operation==='launchInstalled')?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':operation==='forceReinstall'?'Auram was freshly reinstalled.':'All set.');}
+    try {await invoke('run_operation',{operation});await refresh();setNotice(operation==='launch'?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':operation==='forceReinstall'?'Auram was freshly reinstalled.':'All set.');}
     catch(e){setError(String(e));}
-    finally {setActive(false);setChallenge(null);await refresh().catch(()=>{});}
+    finally {setActive(false);setChallenge(null);const next=await refresh().catch(()=>null);if(next&&(operation==='install'||operation==='forceReinstall'))acceptPreparation(next.packUpdate);}
   }
   async function action(name:string,args?:Record<string,unknown>) {try {setError('');await invoke(name,args);await refresh();}catch(e){setError(String(e));}}
   async function save() {if(settings){await action('save_settings',{settings});setNotice('Settings saved.');}}
@@ -70,7 +97,7 @@ function App() {
     </aside>
     <div className={`workspace ${busy?'is-working':''}`}>
       <main>
-        {error&&<Alert variant="destructive" className="mb-5"><CircleAlert/><AlertTitle>Something needs attention</AlertTitle><AlertDescription><p className="break-words">{error}</p><div className="flex gap-2 mt-3"><Button size="sm" variant="outline" onClick={()=>{setError('');void action('retry_initialize');}}>Retry</Button><Button size="sm" variant="ghost" onClick={()=>void action('open_folder',{folder:'logs'})}>Open logs</Button><Button size="sm" variant="ghost" onClick={()=>setError('')}>Dismiss</Button></div></AlertDescription></Alert>}
+        {error&&<Alert variant="destructive" className="mb-5"><CircleAlert/><AlertTitle>Something needs attention</AlertTitle><AlertDescription><p className="break-words">{error}</p><div className="flex gap-2 mt-3"><Button size="sm" variant="outline" onClick={()=>{setError('');if(packUpdateFailed)void retryPackUpdate();else void action('retry_initialize');}}>Retry</Button><Button size="sm" variant="ghost" onClick={()=>void action('open_folder',{folder:'logs'})}>Open logs</Button><Button size="sm" variant="ghost" onClick={()=>setError('')}>Dismiss</Button></div></AlertDescription></Alert>}
         {notice&&!error&&<div className="notice" role="status"><Check size={15}/>{notice}<button aria-label="Dismiss notification" onClick={()=>setNotice('')}><X size={14}/></button></div>}
         {status?.accountError&&<Alert className="mb-4"><ShieldCheck/><AlertTitle>Credential storage unavailable</AlertTitle><AlertDescription>{status.accountError}</AlertDescription></Alert>}
         {tab==='play'&&<>
@@ -78,10 +105,10 @@ function App() {
           <section className="pack-panel" aria-labelledby="pack-title">
             <div className="pack-top"><div className="pack-symbol"><img src={emblem} alt="Auram emblem"/></div><Badge variant="outline" className="text-zinc-400 border-zinc-800"><span className="status-dot on"/> {installed?'INSTALLED':'READY TO INSTALL'}</Badge></div>
             <div className="pack-heading"><span className="eyebrow">THE AURAM MODPACK</span><h2 id="pack-title">Make something<br/>extraordinary.</h2><p>Your world. Your way. Everything you need, kept up to date.</p></div>
-            <div className="pack-footer"><div className="pack-facts"><div><span>MINECRAFT</span><strong>1.20.1</strong></div><div><span>MOD LOADER</span><strong>Forge</strong></div><div><span>PACK VERSION</span><strong>{status?.pack?.name??'—'}</strong></div></div><Button size="lg" className="play-button" disabled={busy||running||!status} onClick={()=>void run(!installed?'install':!status?.account?'signIn':'launch')}>{busy?<LoaderCircle className="animate-spin"/>:running?<Check/>:!installed?<ArrowDownToLine/>:<Play fill="currentColor"/>}{running?'Game running':!installed?'Install Auram':!status?.account?'Sign in to play':'Launch Auram'}{!busy&&!running&&<ArrowRight/>}</Button></div>
+            <div className="pack-footer"><div className="pack-facts"><div><span>MINECRAFT</span><strong>1.20.1</strong></div><div><span>MOD LOADER</span><strong>Forge</strong></div><div><span>PACK VERSION</span><strong>{status?.pack?.name??'—'}</strong></div></div><Button size="lg" className="play-button" disabled={busy||running||!status} onClick={()=>{if(installed&&packUpdateFailed)void retryPackUpdate();else void run(!installed?'install':!status?.account?'signIn':'launch');}}>{busy?<LoaderCircle className="animate-spin"/>:running?<Check/>:!installed?<ArrowDownToLine/>:<Play fill="currentColor"/>}{running?'Game running':preparingPack?'Updating Auram…':installed&&packUpdateFailed?'Retry pack update':!installed?'Install Auram':!status?.account?'Sign in to play':'Launch Auram'}{!busy&&!running&&<ArrowRight/>}</Button></div>
           </section>
           <div className="installation-card">
-            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{installed&&<Button variant="ghost" className="justify-between" disabled={busy||running} onClick={()=>void run('launchInstalled')}><span className="flex items-center gap-2"><Play/>Play installed version</span><ChevronRight/></Button>}{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}<Button variant="destructive" className="justify-between mt-2" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}><span className="flex items-center gap-2"><Trash2/>Force reinstall</span><ChevronRight/></Button><p className="text-xs text-muted-foreground">Force reinstall deletes local worlds and all client pack files.</p></CardContent></Card>
+            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}<Button variant="destructive" className="justify-between mt-2" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}><span className="flex items-center gap-2"><Trash2/>Force reinstall</span><ChevronRight/></Button><p className="text-xs text-muted-foreground">Force reinstall deletes local worlds and all client pack files.</p></CardContent></Card>
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}

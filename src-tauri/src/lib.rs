@@ -10,6 +10,7 @@ pub mod local_work;
 pub mod pack;
 pub mod runtime;
 pub mod server;
+pub mod startup;
 pub mod storage;
 #[cfg(feature = "desktop")]
 pub use desktop::run;

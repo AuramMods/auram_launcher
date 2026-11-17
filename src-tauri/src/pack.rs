@@ -190,6 +190,71 @@ impl Packs {
         Ok(result)
     }
     pub async fn update(&self, repair: bool, job: &Job) -> Result<Manifest> {
+        match self.update_required(repair, job, None).await {
+            Ok(manifest) => Ok(manifest),
+            Err(error) if !repair && crate::download::unavailable(&error) => {
+                job.check()?;
+                if let Some(installed) = self.installed()? {
+                    job.progress(
+                        "pack",
+                        format!("Using installed pack; update service unavailable: {error}"),
+                        0,
+                        0,
+                    );
+                    Ok(installed)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+    pub async fn prepare_installed(&self, job: &Job) -> Result<crate::startup::PackPreparation> {
+        self.prepare_installed_with_timeout(job, std::time::Duration::from_secs(20))
+            .await
+    }
+    async fn prepare_installed_with_timeout(
+        &self,
+        job: &Job,
+        timeout: std::time::Duration,
+    ) -> Result<crate::startup::PackPreparation> {
+        use crate::startup::{PackPreparation, PackState};
+        if self.installed()?.is_none() {
+            return Ok(PackPreparation {
+                state: PackState::NotInstalled,
+                ..PackPreparation::default()
+            });
+        }
+        match self.update_required(false, job, Some(timeout)).await {
+            Ok(manifest) => Ok(PackPreparation::ready(&manifest.tag.name)),
+            Err(error)
+                if crate::download::unavailable(&error)
+                    || error
+                        .downcast_ref::<tokio::time::error::Elapsed>()
+                        .is_some() =>
+            {
+                job.check()?;
+                // A failed request must not leave a previous apply journal in the
+                // way of the installed/offline path. Restoration uses real state.
+                let layout = self.layout.clone();
+                crate::local_work::blocking(move || {
+                    storage::recover(&layout.client(), &layout.state("client-transaction"))
+                })
+                .await?;
+                let installed = self
+                    .installed()?
+                    .context("No installed pack is available for offline launch")?;
+                Ok(PackPreparation::offline(&installed.tag.name, &error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    async fn update_required(
+        &self,
+        repair: bool,
+        job: &Job,
+        discovery_timeout: Option<std::time::Duration>,
+    ) -> Result<Manifest> {
         let layout = self.layout.clone();
         tokio::task::spawn_blocking(move || layout.resume_client_reset()).await??;
         job.phase("pack-plan", "Read pack", false);
@@ -203,23 +268,12 @@ impl Packs {
                 .context("Install the pack before repairing it")?
                 .tag
                 .clone()
+        } else if let Some(timeout) = discovery_timeout {
+            tokio::time::timeout(timeout, self.source().discover(job))
+                .await
+                .context("Pack update service did not respond in time")??
         } else {
-            match self.source().discover(job).await {
-                Ok(tag) => tag,
-                Err(error) => {
-                    job.check()?;
-                    if let Some(installed) = old {
-                        job.progress(
-                            "pack",
-                            format!("Using installed pack; update check unavailable: {error}"),
-                            0,
-                            0,
-                        );
-                        return Ok(installed);
-                    }
-                    return Err(error);
-                }
-            }
+            self.source().discover(job).await?
         };
         let (desired, changed) = self
             .source()

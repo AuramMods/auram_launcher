@@ -27,6 +27,7 @@ pub struct Core {
     pub jobs: Jobs,
     pub game: Game,
     pub settings: Mutex<Settings>,
+    pub pack_startup: crate::startup::PackStartup,
 }
 impl Core {
     fn new() -> Result<Self> {
@@ -56,6 +57,7 @@ impl Core {
             jobs: Jobs::default(),
             game: Game::default(),
             settings: Mutex::new(settings),
+            pack_startup: crate::startup::PackStartup::default(),
         })
     }
     fn settings(&self) -> Settings {
@@ -85,6 +87,7 @@ pub struct Status {
     account_error: Option<String>,
     settings: Settings,
     memory: crate::launch_options::AutomaticMemory,
+    pack_update: crate::startup::PackPreparation,
     busy: bool,
     progress: Option<Progress>,
     game: GameStatus,
@@ -110,6 +113,7 @@ fn status(core: &Core) -> Result<Status> {
         account_error,
         settings: core.settings(),
         memory: crate::launch_options::automatic_memory().clone(),
+        pack_update: core.pack_startup.status(),
         busy: core.jobs.busy(),
         progress: core.jobs.progress(),
         game: core.game.status(),
@@ -144,7 +148,6 @@ enum Operation {
     ForceReinstall,
     Repair,
     Launch,
-    LaunchInstalled,
     SignIn,
     SignOut,
     BuildServer,
@@ -185,13 +188,8 @@ impl Operation {
                     phases,
                 )
             }
-            Self::Launch | Self::LaunchInstalled => {
-                let mut phases = if matches!(self, Self::Launch) {
-                    pack()
-                } else {
-                    vec![]
-                };
-                phases.extend(runtime());
+            Self::Launch => {
+                let mut phases = runtime();
                 phases.extend([
                     PhaseSpec("account", "Account", false),
                     PhaseSpec("launch", "Launch", false),
@@ -219,6 +217,45 @@ impl Operation {
         }
     }
 }
+async fn prepare_pack(
+    core: &Core,
+    app: &tauri::AppHandle,
+    retry: bool,
+) -> crate::startup::PackPreparation {
+    core.pack_startup
+        .prepare(retry, || async {
+            if core.game.status().running {
+                bail!("Close Minecraft before updating its installation");
+            }
+            let app = app.clone();
+            let lease = core.jobs.begin(
+                "Updating Auram",
+                &[
+                    PhaseSpec("pack-plan", "Check pack", false),
+                    PhaseSpec("pack-files", "Pack files", true),
+                    PhaseSpec("pack-apply", "Apply files", false),
+                ],
+                Arc::new(move |progress| {
+                    let _ = app.emit("progress", progress);
+                }),
+            )?;
+            let result = core.packs.prepare_installed(&lease.job).await;
+            lease
+                .job
+                .finish(result.as_ref().err().map(|error| format!("{error:#}")));
+            result
+        })
+        .await
+}
+#[tauri::command]
+async fn prepare_pack_update(
+    retry: bool,
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Backend>,
+) -> Result<crate::startup::PackPreparation, String> {
+    let core = backend.core()?;
+    Ok(prepare_pack(&core, &app, retry).await)
+}
 #[tauri::command]
 async fn run_operation(
     operation: Operation,
@@ -226,6 +263,14 @@ async fn run_operation(
     backend: tauri::State<'_, Backend>,
 ) -> Result<(), String> {
     let core = backend.core()?;
+    if matches!(operation, Operation::Launch) {
+        let prepared = prepare_pack(&core, &app, false).await;
+        if !prepared.allows_launch() {
+            return Err(prepared
+                .message
+                .unwrap_or_else(|| "Install Auram before launching.".into()));
+        }
+    }
     let challenge_app = app.clone();
     let emit = Arc::new(move |progress: Progress| {
         let _ = app.emit("progress", progress);
@@ -244,7 +289,6 @@ async fn run_operation(
                     | Operation::ForceReinstall
                     | Operation::Repair
                     | Operation::Launch
-                    | Operation::LaunchInstalled
                     | Operation::BuildServer
                     | Operation::ImportLegacy
             )
@@ -257,7 +301,6 @@ async fn run_operation(
             Operation::Install
                 | Operation::Repair
                 | Operation::Launch
-                | Operation::LaunchInstalled
                 | Operation::BuildServer
                 | Operation::ImportLegacy
         ) {
@@ -294,10 +337,7 @@ async fn run_operation(
                     .ensure(Versions::read(&core.layout.client())?, job)
                     .await?;
             }
-            Operation::Launch | Operation::LaunchInstalled => {
-                if matches!(operation, Operation::Launch) {
-                    core.packs.update(false, job).await?;
-                }
+            Operation::Launch => {
                 let ready = core
                     .runtime
                     .ensure(Versions::read(&core.layout.client())?, job)
@@ -348,6 +388,20 @@ async fn run_operation(
         Ok(())
     }
     .await;
+    if matches!(operation, Operation::Install | Operation::ForceReinstall) {
+        if let Ok(Some(installed)) = core.packs.installed() {
+            let prepared = match &result {
+                Ok(()) => crate::startup::PackPreparation::ready(&installed.tag.name),
+                Err(error) if crate::download::unavailable(error) => {
+                    crate::startup::PackPreparation::offline(&installed.tag.name, error)
+                }
+                Err(error) => crate::startup::PackPreparation::failed(format!(
+                    "Pack preparation failed: {error:#}"
+                )),
+            };
+            core.pack_startup.record(prepared);
+        }
+    }
     job.finish(result.as_ref().err().map(|e| format!("{e:#}")));
     result.map_err(|e| format!("{e:#}"))
 }
@@ -623,6 +677,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::updater::update_launcher,
             get_status,
+            prepare_pack_update,
             retry_initialize,
             run_operation,
             cancel_operation,
