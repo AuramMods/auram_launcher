@@ -1,6 +1,7 @@
 use crate::{
     download::{Checksum, Download, Downloader},
     jobs::Job,
+    local_work,
     storage::{self, Layout},
 };
 use anyhow::{bail, Context, Result};
@@ -46,6 +47,18 @@ pub struct Packs {
     pub net: Downloader,
     repository: Repository,
 }
+type FileChange = (String, Option<PathBuf>);
+struct Reconciliation {
+    manifest: Manifest,
+    downloads: Vec<Download>,
+    changes: Vec<FileChange>,
+}
+#[derive(Default)]
+struct InspectedFile {
+    baseline: Option<(String, PackFile)>,
+    download: Option<Download>,
+    change: Option<FileChange>,
+}
 impl Packs {
     pub async fn server_changelists(
         &self,
@@ -66,8 +79,8 @@ impl Packs {
         // Translate the old distribution through its own server inclusion rules.
         // This also makes removed/remapped server paths available to the SFTP
         // planner when the remote only has auram.json, without reading mod jars.
-        let config: crate::server::ServerConfig = serde_json::from_slice(
-            &tokio::fs::read(self.file(&base, "server_config.conf", job).await?).await?,
+        let config: crate::server::ServerConfig = toml::from_str(
+            &tokio::fs::read_to_string(self.file(&base, "server_config.conf", job).await?).await?,
         )
         .context("Read the previous pack's server configuration")?;
         Ok((config.manifest(&base)?, changes, count))
@@ -265,126 +278,34 @@ impl Packs {
         server: bool,
         touched: Option<&BTreeSet<String>>,
     ) -> Result<Manifest> {
-        source::validate_inventory(desired)?;
-        storage::recover(root, transaction)?;
-        let mut next = desired.clone();
-        next.files.clear();
-        let mut downloads = Vec::new();
-        let mut changes = Vec::new();
-        let backup = self.layout.root.join("backups").join(format!(
-            "{}-{}",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-            rand::random::<u32>()
-        ));
-        for (index, (relative, file)) in desired.files.iter().enumerate() {
-            job.check()?;
-            job.progress(
-                "pack",
-                if server {
-                    "Inspecting managed server files"
-                } else {
-                    "Inspecting managed pack files"
-                },
-                index as u64,
-                desired.files.len() as u64,
-            );
-            let target = storage::safe_join(root, relative)?;
-            let previous = old.and_then(|m| m.files.get(relative)).or_else(|| {
-                // On a case-insensitive filesystem a case-only rename is still owned.
-                old?.files.iter().find_map(|(path, file)| {
-                    if path != relative
-                        && source::normalized_path(path) == source::normalized_path(relative)
-                        && storage::safe_join(root, path).ok().is_some_and(|owned| {
-                            same_file::is_same_file(&target, owned).unwrap_or(false)
-                        })
-                    {
-                        Some(file)
-                    } else {
-                        None
-                    }
-                })
-            });
-            if touched.is_some_and(|paths| !paths.contains(relative)) {
-                if let Some(previous) = previous {
-                    next.files.insert(relative.clone(), previous.clone());
-                }
-                continue;
-            }
-            let replaces_directory = target.is_dir()
-                && old.is_some_and(|m| {
-                    m.files
-                        .keys()
-                        .any(|path| path.starts_with(&format!("{relative}/")))
-                });
-            if target.exists() && !replaces_directory {
-                let valid = Checksum::GitBlob(file.sha.clone()).verify(&target)?;
-                let case_rename =
-                    previous.is_some() && old.is_some_and(|m| !m.files.contains_key(relative));
-                if valid && source::mode_matches(&target, &file.mode)? && !case_rename {
-                    next.files.insert(relative.clone(), file.clone());
-                    continue;
-                }
-                let modified_server_config = server
-                    && ["config/", "defaultconfigs/"]
-                        .iter()
-                        .any(|prefix| relative.starts_with(prefix))
-                    && previous.is_none_or(|file| {
-                        !Checksum::GitBlob(file.sha.clone())
-                            .verify(&target)
-                            .unwrap_or(false)
-                    });
-                if modified_server_config
-                    || mutable(relative, server)
-                    || (previous.is_none() && old.is_some())
-                {
-                    if let Some(previous) = previous {
-                        next.files.insert(relative.clone(), previous.clone());
-                    }
-                    continue;
-                }
-                if previous.is_none_or(|previous| {
-                    !Checksum::GitBlob(previous.sha.clone())
-                        .verify(&target)
-                        .unwrap_or(false)
-                }) {
-                    storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
-                }
-            }
-            let download = self.download(desired, relative, file)?;
-            // A rename can reuse a verified old managed file even after the blob cache was evicted.
-            if !Downloader::valid(&download).await? {
-                self.reuse_owned(root, old, &download, job)?;
-            }
-            downloads.push(download);
-            changes.push((relative.clone(), Some(self.blob_path(file))));
-            next.files.insert(relative.clone(), file.clone());
-        }
-        if let Some(old) = old {
-            for (relative, file) in &old.files {
-                if desired.files.contains_key(relative) || mutable(relative, server) {
-                    continue;
-                }
-                if touched.is_some_and(|paths| !paths.contains(relative)) {
-                    next.files.insert(relative.clone(), file.clone());
-                    continue;
-                }
-                let target = storage::safe_join(root, relative)?;
-                if target.exists() {
-                    if server
-                        && ["config/", "defaultconfigs/"]
-                            .iter()
-                            .any(|prefix| relative.starts_with(prefix))
-                        && !Checksum::GitBlob(file.sha.clone()).verify(&target)?
-                    {
-                        continue;
-                    }
-                    if !Checksum::GitBlob(file.sha.clone()).verify(&target)? {
-                        storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
-                    }
-                    changes.push((relative.clone(), None));
-                }
-            }
-        }
+        job.phase(
+            if server { "server-files" } else { "pack-files" },
+            if server { "Server files" } else { "Pack files" },
+            true,
+        );
+        let packs = self.clone();
+        let inspect_root = root.to_path_buf();
+        let inspect_transaction = transaction.to_path_buf();
+        let inspect_old = old.cloned();
+        let inspect_desired = desired.clone();
+        let inspect_job = job.clone();
+        let inspect_touched = touched.cloned();
+        let Reconciliation {
+            manifest: next,
+            downloads,
+            changes,
+        } = local_work::blocking(move || {
+            packs.inspect_plan(
+                &inspect_root,
+                &inspect_transaction,
+                inspect_old.as_ref(),
+                &inspect_desired,
+                &inspect_job,
+                server,
+                inspect_touched.as_ref(),
+            )
+        })
+        .await?;
         job.phase(
             if server { "server-files" } else { "pack-files" },
             if server { "Server files" } else { "Pack files" },
@@ -405,30 +326,220 @@ impl Packs {
         job.progress("pack", "Staging verified files", 0, changes.len() as u64);
         // Apply executable bits to private staging copies, keeping cached blobs immutable.
         let staging = self.layout.state("pack-apply-staging");
-        if staging.exists() {
-            fs::remove_dir_all(&staging)?;
-        }
-        for (path, source) in &mut changes {
-            job.check()?;
-            if let Some(blob) = source {
-                if let Some(file) = desired.files.get(path) {
-                    let staged = storage::safe_join(&staging, path)?;
-                    storage::atomic_copy(blob, &staged)?;
-                    source::set_mode(&staged, &file.mode)?;
-                    *blob = staged;
-                }
+        let staged_desired = desired.clone();
+        let staged_job = job.clone();
+        let mut changes = local_work::blocking(move || {
+            if staging.exists() {
+                fs::remove_dir_all(&staging)?;
             }
-        }
+            let progress =
+                local_work::Progress::new(&staged_job, "Staging verified files", changes.len());
+            local_work::map(&changes, |(path, source)| {
+                staged_job.check()?;
+                let source = if let Some(blob) = source {
+                    if let Some(file) = staged_desired.files.get(path) {
+                        let staged = storage::safe_join(&staging, path)?;
+                        storage::atomic_copy(blob, &staged)?;
+                        source::set_mode(&staged, &file.mode)?;
+                        Some(staged)
+                    } else {
+                        Some(blob.clone())
+                    }
+                } else {
+                    None
+                };
+                progress.complete();
+                Ok((path.clone(), source))
+            })
+        })
+        .await?;
         job.check()?;
         job.progress("pack", "Applying verified files", 0, changes.len() as u64);
         let state = self.layout.state("pending-manifest.json");
-        storage::write_json(&state, &next)?;
-        changes.push((".auram-manifest.json".into(), Some(state)));
-        // Cancellation is deferred during the short journaled apply/rollback phase.
-        storage::transact(root, transaction, &changes)?;
+        let apply_next = next.clone();
+        let apply_root = root.to_path_buf();
+        let apply_transaction = transaction.to_path_buf();
+        // Cancellation is deferred during the ordered journaled apply/rollback phase.
+        local_work::blocking(move || {
+            storage::write_json(&state, &apply_next)?;
+            changes.push((".auram-manifest.json".into(), Some(state)));
+            storage::transact(&apply_root, &apply_transaction, &changes)
+        })
+        .await?;
         job.progress("pack", format!("Pack {} ready", desired.tag.name), 1, 1);
         job.complete_phase();
         Ok(next)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_plan(
+        &self,
+        root: &Path,
+        transaction: &Path,
+        old: Option<&Manifest>,
+        desired: &Manifest,
+        job: &Job,
+        server: bool,
+        touched: Option<&BTreeSet<String>>,
+    ) -> Result<Reconciliation> {
+        source::validate_inventory(desired)?;
+        storage::recover(root, transaction)?;
+        let mut next = desired.clone();
+        next.files.clear();
+        let mut downloads = Vec::new();
+        let mut changes = Vec::new();
+        let backup = self.layout.root.join("backups").join(format!(
+            "{}-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            rand::random::<u32>()
+        ));
+        let obsolete = old
+            .map(|old| {
+                old.files
+                    .iter()
+                    .filter(|(path, _)| {
+                        !desired.files.contains_key(*path) && !mutable(path, server)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let progress = local_work::Progress::new(
+            job,
+            if server {
+                "Inspecting managed server files"
+            } else {
+                "Inspecting managed pack files"
+            },
+            desired.files.len() + obsolete.len(),
+        );
+        let inspected = local_work::map(
+            &desired.files.iter().collect::<Vec<_>>(),
+            |&(relative, file)| {
+                let result = (|| -> Result<InspectedFile> {
+                    job.check()?;
+                    let mut part = InspectedFile::default();
+                    let target = storage::safe_join(root, relative)?;
+                    let previous = old.and_then(|m| m.files.get(relative)).or_else(|| {
+                        // On a case-insensitive filesystem a case-only rename is still owned.
+                        old?.files.iter().find_map(|(path, file)| {
+                            if path != relative
+                                && source::normalized_path(path)
+                                    == source::normalized_path(relative)
+                                && storage::safe_join(root, path).ok().is_some_and(|owned| {
+                                    same_file::is_same_file(&target, owned).unwrap_or(false)
+                                })
+                            {
+                                Some(file)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    if touched.is_some_and(|paths| !paths.contains(relative)) {
+                        if let Some(previous) = previous {
+                            part.baseline = Some((relative.clone(), previous.clone()));
+                        }
+                        return Ok(part);
+                    }
+                    let replaces_directory = target.is_dir()
+                        && old.is_some_and(|m| {
+                            m.files
+                                .keys()
+                                .any(|path| path.starts_with(&format!("{relative}/")))
+                        });
+                    if target.exists() && !replaces_directory {
+                        let valid = Checksum::GitBlob(file.sha.clone()).verify(&target)?;
+                        let case_rename = previous.is_some()
+                            && old.is_some_and(|m| !m.files.contains_key(relative));
+                        if valid && source::mode_matches(&target, &file.mode)? && !case_rename {
+                            part.baseline = Some((relative.clone(), file.clone()));
+                            return Ok(part);
+                        }
+                        let previous_valid = previous.is_some_and(|previous| {
+                            if previous.sha == file.sha {
+                                valid
+                            } else {
+                                Checksum::GitBlob(previous.sha.clone())
+                                    .verify(&target)
+                                    .unwrap_or(false)
+                            }
+                        });
+                        let modified_server_config = server
+                            && ["config/", "defaultconfigs/"]
+                                .iter()
+                                .any(|prefix| relative.starts_with(prefix))
+                            && !previous_valid;
+                        if modified_server_config
+                            || mutable(relative, server)
+                            || (previous.is_none() && old.is_some())
+                        {
+                            if let Some(previous) = previous {
+                                part.baseline = Some((relative.clone(), previous.clone()));
+                            }
+                            return Ok(part);
+                        }
+                        if !previous_valid {
+                            storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
+                        }
+                    }
+                    let download = self.download(desired, relative, file)?;
+                    // A rename can reuse a verified old managed file even after the blob cache was evicted.
+                    if !Downloader::valid_local(&download)? {
+                        self.reuse_owned(root, old, &download, job)?;
+                    }
+                    part.download = Some(download);
+                    part.change = Some((relative.clone(), Some(self.blob_path(file))));
+                    part.baseline = Some((relative.clone(), file.clone()));
+                    Ok(part)
+                })();
+                if result.is_ok() {
+                    progress.complete();
+                }
+                result
+            },
+        )?;
+        for part in inspected {
+            if let Some((path, file)) = part.baseline {
+                next.files.insert(path, file);
+            }
+            downloads.extend(part.download);
+            changes.extend(part.change);
+        }
+        let removed = local_work::map(&obsolete, |&(relative, file)| {
+            job.check()?;
+            let mut part = InspectedFile::default();
+            if touched.is_some_and(|paths| !paths.contains(relative)) {
+                part.baseline = Some((relative.clone(), file.clone()));
+            } else {
+                let target = storage::safe_join(root, relative)?;
+                if target.exists() {
+                    let valid = Checksum::GitBlob(file.sha.clone()).verify(&target)?;
+                    let preserve = server
+                        && ["config/", "defaultconfigs/"]
+                            .iter()
+                            .any(|prefix| relative.starts_with(prefix))
+                        && !valid;
+                    if !preserve {
+                        if !valid {
+                            storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
+                        }
+                        part.change = Some((relative.clone(), None));
+                    }
+                }
+            }
+            progress.complete();
+            Ok(part)
+        })?;
+        for part in removed {
+            if let Some((path, file)) = part.baseline {
+                next.files.insert(path, file);
+            }
+            changes.extend(part.change);
+        }
+        Ok(Reconciliation {
+            manifest: next,
+            downloads,
+            changes,
+        })
     }
 }
 fn version(raw: &str) -> Option<semver::Version> {
@@ -569,6 +680,73 @@ mod tests {
         assert_eq!(
             fs::read(layout.runtime().join("assets/objects/unchanged")).unwrap(),
             b"asset"
+        );
+    }
+    #[tokio::test]
+    async fn failed_or_cancelled_parallel_inspection_never_activates_partial_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
+        let original = file(b"original");
+        let updated = file(b"updated");
+        storage::atomic_write(&packs.blob_path(&updated), b"updated").unwrap();
+        storage::atomic_write(&layout.server().join("mods/a.jar"), b"original").unwrap();
+        storage::atomic_write(&layout.server().join("mods/b.jar/user-file"), b"keep").unwrap();
+        let old = Manifest {
+            schema: 1,
+            policy: 0,
+            tag: PackTag {
+                name: "old".into(),
+                sha: "old".into(),
+            },
+            files: BTreeMap::from([("mods/a.jar".into(), original)]),
+        };
+        storage::write_json(&layout.server().join(".auram-manifest.json"), &old).unwrap();
+        let marker = fs::read(layout.server().join(".auram-manifest.json")).unwrap();
+        let desired = Manifest {
+            files: BTreeMap::from([
+                ("mods/a.jar".into(), updated.clone()),
+                ("mods/b.jar".into(), updated),
+            ]),
+            ..old.clone()
+        };
+        assert!(packs
+            .reconcile(
+                &layout.server(),
+                &layout.state("server-tx"),
+                Some(&old),
+                &desired,
+                &Job::default(),
+                true
+            )
+            .await
+            .is_err());
+        let cancelled = Job::default();
+        cancelled.cancel.cancel();
+        assert!(packs
+            .reconcile(
+                &layout.server(),
+                &layout.state("server-tx"),
+                Some(&old),
+                &desired,
+                &cancelled,
+                true
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert_eq!(
+            fs::read(layout.server().join("mods/a.jar")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(layout.server().join("mods/b.jar/user-file")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            fs::read(layout.server().join(".auram-manifest.json")).unwrap(),
+            marker
         );
     }
     #[tokio::test]

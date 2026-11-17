@@ -389,7 +389,7 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "before"),
             ("minecraft/scripts/obsolete.zs", "old script"),
-            ("server_config.conf", "{}"),
+            ("server_config.conf", ""),
         ]),
         None,
         Some(vec![]),
@@ -400,7 +400,7 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/mods/middle.jar", "same"),
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "middle"),
-            ("server_config.conf", "{}"),
+            ("server_config.conf", ""),
         ]),
         Some(&base),
         Some(vec![
@@ -416,7 +416,7 @@ async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_r
             ("minecraft/mods/new.jar", "same"),
             ("minecraft/config/stable.toml", "defaults"),
             ("minecraft/config/changed.toml", "after"),
-            ("server_config.conf", "{\"clientMods\":[]}"),
+            ("server_config.conf", "clientMods = []"),
         ]),
         Some(&middle),
         Some(vec![

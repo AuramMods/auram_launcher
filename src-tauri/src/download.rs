@@ -114,20 +114,20 @@ impl Downloader {
         }
         Ok(serde_json::from_slice(&data)?)
     }
+    pub(crate) fn valid_local(download: &Download) -> Result<bool> {
+        let meta = match fs::metadata(&download.target) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if download.size.is_some_and(|size| meta.len() != size) {
+            return Ok(false);
+        }
+        download.checksum.verify(&download.target)
+    }
     pub async fn valid(download: &Download) -> Result<bool> {
-        let value = download.clone();
-        tokio::task::spawn_blocking(move || {
-            let meta = match fs::metadata(&value.target) {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(e) => return Err(e.into()),
-            };
-            if value.size.is_some_and(|size| meta.len() != size) {
-                return Ok(false);
-            }
-            value.checksum.verify(&value.target)
-        })
-        .await?
+        let download = download.clone();
+        tokio::task::spawn_blocking(move || Self::valid_local(&download)).await?
     }
     pub async fn many(&self, downloads: Vec<Download>, job: &Job) -> Result<()> {
         self.many_named(downloads, job, "Files").await

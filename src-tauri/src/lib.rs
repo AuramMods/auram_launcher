@@ -6,6 +6,7 @@ pub mod download;
 pub mod game;
 pub mod jobs;
 pub mod launch_options;
+pub mod local_work;
 pub mod pack;
 pub mod runtime;
 pub mod server;

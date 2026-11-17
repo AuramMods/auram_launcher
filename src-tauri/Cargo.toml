@@ -27,6 +27,7 @@ futures-util = "0.3"
 hex = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 rand = "0.9"
+rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,6 +60,19 @@ libloading = "0.8"
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+
+# Keep pnpm dev's integrity checks representative of packaged performance.
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
 
 [profile.release]
 strip = false

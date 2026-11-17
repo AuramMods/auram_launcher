@@ -1,3 +1,4 @@
+use crate::local_work;
 use crate::{
     jobs::Job,
     pack::{Manifest, PackFile, Packs},
@@ -176,8 +177,8 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     )?)
     .context("Invalid server_config.conf")?;
     let mut desired = config.manifest(&full)?;
-    filter_sided_mods(packs, &full, &config, &mut desired, job).await?;
-    resolve_dependencies(packs, &full, &mut desired, job).await?;
+    let metadata = filter_sided_mods(packs, &full, &config, &mut desired, job).await?;
+    resolve_dependencies(packs, &full, &mut desired, metadata, job).await?;
     let payload = desired.clone();
     let versions = Versions::read(&packs.layout.client())?;
     let java = runtime.java(job).await?;
@@ -191,7 +192,7 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
         runtime.platform.key()
     ));
     let snapshot = cache.join(".verified.json");
-    if !snapshot.exists() || !runtime::verify_snapshot(&cache, &snapshot)? {
+    if !snapshot.exists() || !runtime::checked_snapshot(&cache, &snapshot, job).await? {
         let staging = cache.with_extension("staging");
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
@@ -212,7 +213,7 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
             &[],
         )
         .await?;
-        runtime::snapshot_tree(&staging, &staging.join(".verified.json"), &[])?;
+        runtime::record_snapshot(&staging, &staging.join(".verified.json"), &[], job).await?;
         if cache.exists() {
             fs::remove_dir_all(&cache)?;
         }
@@ -220,27 +221,51 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
         fs::rename(staging, &cache)?;
     }
     write_start_scripts(&cache, &java, &versions)?;
-    runtime::snapshot_tree(&cache, &snapshot, &[])?;
-    for entry in walkdir::WalkDir::new(&cache).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
+    runtime::record_snapshot(&cache, &snapshot, &[], job).await?;
+    let import_packs = packs.clone();
+    let import_cache = cache.clone();
+    let import_job = job.clone();
+    let imported = local_work::blocking(move || {
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(&import_cache).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&import_cache)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == ".verified.json"
+                || relative.ends_with(".log")
+                || relative.ends_with("installer.jar")
+            {
+                continue;
+            }
+            files.push((relative, entry.into_path()));
         }
-        let relative = entry
-            .path()
-            .strip_prefix(&cache)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if relative == ".verified.json"
-            || relative.ends_with(".log")
-            || relative.ends_with("installer.jar")
-        {
-            continue;
-        }
-        let file = local_file(entry.path())?;
-        storage::atomic_copy(entry.path(), &packs.blob_path(&file))?;
-        desired.files.insert(relative, file);
-    }
+        let progress = local_work::Progress::new(
+            &import_job,
+            "Preparing shared server runtime files",
+            files.len(),
+        );
+        local_work::map(&files, |(relative, path)| {
+            import_job.check()?;
+            let file = local_file(path)?;
+            let blob = import_packs.blob_path(&file);
+            let valid = blob.is_file()
+                && fs::metadata(&blob)?.len() == file.size
+                && crate::download::Checksum::GitBlob(file.sha.clone()).verify(&blob)?;
+            if !valid {
+                storage::atomic_copy(path, &blob)?;
+            }
+            progress.complete();
+            Ok((relative.clone(), file))
+        })
+    })
+    .await?;
+    desired.files.extend(imported);
     let version = ServerVersion {
         schema: 1,
         version: installed.tag.name.clone(),
@@ -389,13 +414,46 @@ fn parse_mod_metadata(text: &str) -> Result<ModMetadata> {
     }
     Ok(result)
 }
+async fn load_mod_metadata(
+    packs: &Packs,
+    desired: &Manifest,
+    cache: &mut BTreeMap<String, ModMetadata>,
+    job: &Job,
+) -> Result<()> {
+    let files = desired
+        .files
+        .iter()
+        .filter(|(path, file)| {
+            path.starts_with("mods/") && path.ends_with(".jar") && !cache.contains_key(&file.sha)
+        })
+        .map(|(_, file)| (file.sha.clone(), packs.blob_path(file)))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Ok(());
+    }
+    let job = job.clone();
+    let results = local_work::blocking(move || {
+        let progress = local_work::Progress::new(&job, "Reading server mod metadata", files.len());
+        local_work::map(&files, |(sha, path)| {
+            job.check()?;
+            let metadata = mod_metadata(path)?;
+            progress.complete();
+            Ok((sha.clone(), metadata))
+        })
+    })
+    .await?;
+    cache.extend(results);
+    Ok(())
+}
 async fn filter_sided_mods(
     packs: &Packs,
     full: &Manifest,
     config: &ServerConfig,
     desired: &mut Manifest,
     job: &Job,
-) -> Result<()> {
+) -> Result<BTreeMap<String, ModMetadata>> {
     let mut client_ids = std::collections::BTreeSet::<String>::new();
     for path in [
         "minecraft/config/mods_optimizer/mods-database.json",
@@ -431,6 +489,8 @@ async fn filter_sided_mods(
         .map(|(path, file)| packs.download(desired, path, file))
         .collect::<Result<Vec<_>>>()?;
     packs.net.many(downloads, job).await?;
+    let mut metadata_cache = BTreeMap::new();
+    load_mod_metadata(packs, desired, &mut metadata_cache, job).await?;
     let mut exclude = Vec::new();
     for (path, file) in &desired.files {
         if !path.starts_with("mods/") || !path.ends_with(".jar") {
@@ -444,7 +504,7 @@ async fn filter_sided_mods(
         {
             continue;
         }
-        let metadata = mod_metadata(&packs.blob_path(file))?;
+        let metadata = &metadata_cache[&file.sha];
         // This client transformation service links Forge's display window before sided metadata exists.
         let early_display = name
             .to_ascii_lowercase()
@@ -459,34 +519,37 @@ async fn filter_sided_mods(
     for path in exclude {
         desired.files.remove(&path);
     }
-    Ok(())
+    Ok(metadata_cache)
 }
 
 async fn resolve_dependencies(
     packs: &Packs,
     full: &Manifest,
     desired: &mut Manifest,
+    mut metadata: BTreeMap<String, ModMetadata>,
     job: &Job,
 ) -> Result<()> {
-    let mut metadata = BTreeMap::<String, ModMetadata>::new();
     let mut attempted = std::collections::BTreeSet::new();
     loop {
         let downloads = desired
             .files
             .iter()
-            .filter(|(path, _)| path.starts_with("mods/") && path.ends_with(".jar"))
+            .filter(|(path, file)| {
+                path.starts_with("mods/")
+                    && path.ends_with(".jar")
+                    && !metadata.contains_key(&file.sha)
+            })
             .map(|(path, file)| packs.download(desired, path, file))
             .collect::<Result<Vec<_>>>()?;
         packs.net.many(downloads, job).await?;
+        load_mod_metadata(packs, desired, &mut metadata, job).await?;
         let mut included = std::collections::BTreeSet::new();
         let mut required = std::collections::BTreeSet::new();
         for (path, file) in &desired.files {
             if !path.starts_with("mods/") || !path.ends_with(".jar") {
                 continue;
             }
-            let value = metadata
-                .entry(file.sha.clone())
-                .or_insert(mod_metadata(&packs.blob_path(file))?);
+            let value = &metadata[&file.sha];
             included.extend(value.ids.iter().cloned());
             required.extend(value.required.iter().cloned());
         }
@@ -524,7 +587,10 @@ async fn resolve_dependencies(
                 job.check()?;
                 if !metadata.contains_key(&file.sha) {
                     let path = packs.file(full, source, job).await?;
-                    metadata.insert(file.sha.clone(), mod_metadata(&path)?);
+                    metadata.insert(
+                        file.sha.clone(),
+                        local_work::blocking(move || mod_metadata(&path)).await?,
+                    );
                 }
                 if metadata[&file.sha].ids.contains(&id) {
                     let mut value = file.clone();
@@ -594,6 +660,52 @@ pub fn accept_eula(server: &Path, accepted: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn verified_mod_metadata_is_reused_between_passes_and_duplicate_blobs() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let layout = crate::storage::Layout::new(temp.path().into()).unwrap();
+        let packs = Packs::new(
+            layout.clone(),
+            crate::download::Downloader::new(&layout).unwrap(),
+        );
+        let path = temp.path().join("fixture.jar");
+        let mut jar = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        jar.start_file(
+            "META-INF/mods.toml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        jar.write_all(b"[[mods]]\nmodId = 'fixture'\n").unwrap();
+        jar.finish().unwrap();
+        let file = local_file(&path).unwrap();
+        let blob = packs.blob_path(&file);
+        storage::atomic_copy(&path, &blob).unwrap();
+        let desired = Manifest {
+            schema: 1,
+            policy: 0,
+            tag: crate::pack::PackTag {
+                name: "fixture".into(),
+                sha: "fixture".into(),
+            },
+            files: BTreeMap::from([
+                ("mods/a.jar".into(), file.clone()),
+                ("mods/b.jar".into(), file.clone()),
+            ]),
+        };
+        let mut cache = BTreeMap::new();
+        load_mod_metadata(&packs, &desired, &mut cache, &Job::default())
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&file.sha].ids, vec!["fixture"]);
+        // Cached metadata remains usable without re-opening a previously read jar.
+        fs::remove_file(blob).unwrap();
+        load_mod_metadata(&packs, &desired, &mut cache, &Job::default())
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+    }
     #[test]
     fn excludes_client_mods_and_keeps_whitelist_exceptions() {
         let config = ServerConfig {

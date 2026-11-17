@@ -1,3 +1,4 @@
+use crate::local_work;
 use crate::{
     auth::Credentials,
     download::{Checksum, Download, Downloader},
@@ -125,7 +126,7 @@ impl Runtime {
         let package = &all[self.platform.key()];
         let java_root = self.layout.root.join("cache/java").join(&package.sha256);
         let snapshot = java_root.join(".verified.json");
-        if snapshot.exists() && verify_snapshot(&java_root, &snapshot)? {
+        if snapshot.exists() && checked_snapshot(&java_root, &snapshot, job).await? {
             job.complete_phase();
             return find_java(&java_root);
         }
@@ -168,7 +169,7 @@ impl Runtime {
             &[],
         )
         .await?;
-        snapshot_tree(&staging, &staging.join(".verified.json"), &[])?;
+        record_snapshot(&staging, &staging.join(".verified.json"), &[], job).await?;
         if java_root.exists() {
             fs::remove_dir_all(&java_root)?;
         }
@@ -280,10 +281,13 @@ impl Runtime {
         ));
         let forge_valid = forge_json.exists()
             && forge_snapshot.exists()
-            && verify_snapshot(&runtime, &forge_snapshot)?;
+            && checked_snapshot(&runtime, &forge_snapshot, job).await?;
         if !forge_valid {
             if forge_snapshot.exists() {
-                remove_invalid_snapshot_files(&runtime, &forge_snapshot)?;
+                let root = runtime.clone();
+                let snapshot = forge_snapshot.clone();
+                local_work::blocking(move || remove_invalid_snapshot_files(&root, &snapshot))
+                    .await?;
             }
             let installer = self.installer(&versions, job).await?;
             storage::write_json(
@@ -308,7 +312,7 @@ impl Runtime {
             if !forge_json.is_file() {
                 bail!("Forge installer did not generate version metadata; see forge-client.log");
             }
-            snapshot_tree(&runtime, &forge_snapshot, &["libraries/", "versions/"])?;
+            record_snapshot(&runtime, &forge_snapshot, &["libraries/", "versions/"], job).await?;
         }
         let forge = compat::client_metadata(storage::read_json(&forge_json)?, self.platform)?;
         self.net
@@ -725,7 +729,15 @@ fn find_java(root: &Path) -> Result<PathBuf> {
     bail!("Java executable not found in {}", root.display())
 }
 pub fn snapshot_tree(root: &Path, snapshot: &Path, prefixes: &[&str]) -> Result<()> {
-    let mut hashes = BTreeMap::new();
+    snapshot_tree_inner(root, snapshot, prefixes, None)
+}
+fn snapshot_tree_inner(
+    root: &Path,
+    snapshot: &Path,
+    prefixes: &[&str],
+    job: Option<&Job>,
+) -> Result<()> {
+    let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() || entry.path() == snapshot {
@@ -739,9 +751,43 @@ pub fn snapshot_tree(root: &Path, snapshot: &Path, prefixes: &[&str]) -> Result<
         if !prefixes.is_empty() && !prefixes.iter().any(|prefix| relative.starts_with(prefix)) {
             continue;
         }
-        hashes.insert(relative, file_sha256(entry.path())?);
+        files.push((relative, entry.into_path()));
     }
+    let progress = job
+        .map(|job| local_work::Progress::new(job, "Recording verified runtime files", files.len()));
+    let hashes = local_work::map(&files, |(relative, path)| {
+        if let Some(job) = job {
+            job.check()?;
+        }
+        let hash = file_sha256(path)?;
+        if let Some(progress) = &progress {
+            progress.complete();
+        }
+        Ok((relative.clone(), hash))
+    })?
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
     storage::write_json(snapshot, &hashes)
+}
+pub(crate) async fn record_snapshot(
+    root: &Path,
+    snapshot: &Path,
+    prefixes: &[&str],
+    job: &Job,
+) -> Result<()> {
+    let root = root.to_path_buf();
+    let snapshot = snapshot.to_path_buf();
+    let prefixes = prefixes.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    let job = job.clone();
+    local_work::blocking(move || {
+        snapshot_tree_inner(
+            &root,
+            &snapshot,
+            &prefixes.iter().map(String::as_str).collect::<Vec<_>>(),
+            Some(&job),
+        )
+    })
+    .await
 }
 fn file_sha256(path: &Path) -> Result<String> {
     let mut hash = sha2::Sha256::new();
@@ -757,17 +803,35 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hash.finalize()))
 }
 pub fn verify_snapshot(root: &Path, snapshot: &Path) -> Result<bool> {
+    verify_snapshot_inner(root, snapshot, None)
+}
+fn verify_snapshot_inner(root: &Path, snapshot: &Path, job: Option<&Job>) -> Result<bool> {
     let hashes: BTreeMap<String, String> = storage::read_json(snapshot)?;
     if hashes.is_empty() {
         return Ok(false);
     }
-    for (relative, hash) in hashes {
-        let path = storage::safe_join(root, &relative)?;
-        if !path.is_file() || !Checksum::Sha256(hash).verify(&path)? {
-            return Ok(false);
+    let files = hashes.into_iter().collect::<Vec<_>>();
+    let progress = job
+        .map(|job| local_work::Progress::new(job, "Verifying cached runtime files", files.len()));
+    Ok(local_work::map(&files, |(relative, hash)| {
+        if let Some(job) = job {
+            job.check()?;
         }
-    }
-    Ok(true)
+        let path = storage::safe_join(root, relative)?;
+        let valid = path.is_file() && Checksum::Sha256(hash.clone()).verify(&path)?;
+        if let Some(progress) = &progress {
+            progress.complete();
+        }
+        Ok(valid)
+    })?
+    .into_iter()
+    .all(|valid| valid))
+}
+pub(crate) async fn checked_snapshot(root: &Path, snapshot: &Path, job: &Job) -> Result<bool> {
+    let root = root.to_path_buf();
+    let snapshot = snapshot.to_path_buf();
+    let job = job.clone();
+    local_work::blocking(move || verify_snapshot_inner(&root, &snapshot, Some(&job))).await
 }
 fn remove_invalid_snapshot_files(root: &Path, snapshot: &Path) -> Result<()> {
     let hashes: BTreeMap<String, String> = storage::read_json(snapshot)?;
@@ -874,6 +938,36 @@ pub(crate) async fn copy_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn parallel_snapshots_detect_damage_missing_files_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for i in 0..64 {
+            storage::atomic_write(
+                &root.join(format!("Libraries with spaces 世界/{i}.jar")),
+                format!("file {i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        let snapshot = root.join("snapshot.json");
+        let job = Job::default();
+        record_snapshot(root, &snapshot, &[], &job).await.unwrap();
+        let first = std::fs::read(&snapshot).unwrap();
+        record_snapshot(root, &snapshot, &[], &job).await.unwrap();
+        assert_eq!(std::fs::read(&snapshot).unwrap(), first);
+        assert!(checked_snapshot(root, &snapshot, &job).await.unwrap());
+        storage::atomic_write(&root.join("Libraries with spaces 世界/0.jar"), b"damage").unwrap();
+        assert!(!checked_snapshot(root, &snapshot, &job).await.unwrap());
+        storage::atomic_write(&root.join("Libraries with spaces 世界/0.jar"), b"file 0").unwrap();
+        std::fs::remove_file(root.join("Libraries with spaces 世界/1.jar")).unwrap();
+        assert!(!checked_snapshot(root, &snapshot, &job).await.unwrap());
+        job.cancel.cancel();
+        assert!(checked_snapshot(root, &snapshot, &job)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+    }
     #[test]
     fn native_coordinates_match_java_architecture() {
         let lib = json!({"name":"org.lwjgl:lwjgl:3.3.1:natives-macos"});
