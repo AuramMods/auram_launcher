@@ -17,6 +17,8 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod compat;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     MacArm,
@@ -253,6 +255,7 @@ impl Runtime {
             &base_dir.join(format!("{}.json", versions.minecraft)),
             &vanilla,
         )?;
+        let vanilla = compat::client_metadata(vanilla, self.platform)?;
         self.net
             .get(
                 &artifact(
@@ -307,7 +310,7 @@ impl Runtime {
             }
             snapshot_tree(&runtime, &forge_snapshot, &["libraries/", "versions/"])?;
         }
-        let forge: Value = storage::read_json(&forge_json)?;
+        let forge = compat::client_metadata(storage::read_json(&forge_json)?, self.platform)?;
         self.net
             .many_named(
                 library_downloads(&forge, &runtime.join("libraries"), self.platform)?,
@@ -485,13 +488,7 @@ impl Runtime {
         {
             output.push("-XstartOnFirstThread".into());
         }
-        output.extend([
-            format!("-Xmx{}M", settings.memory_mib),
-            "-Xms512M".into(),
-            "-XX:+UseG1GC".into(),
-            "-Dfml.readTimeout=120".into(),
-            "-Dfml.loginTimeout=120".into(),
-        ]);
+        output.extend(crate::launch_options::jvm_arguments(settings.memory_mib)?);
         output.push(
             ready.forge["mainClass"]
                 .as_str()

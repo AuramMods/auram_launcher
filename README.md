@@ -38,6 +38,10 @@ Production data lives at `~/Library/Application Support/AuramLauncher` on macOS 
 
 Minecraft stays running when its launcher window closes. The launcher remains in the background while collecting redacted logs; reopening the application shows the existing window. Java failures and early game exits are reported with a log location.
 
+The memory slider selects Auram's original G1 tuning profiles: low memory through 9 GiB, high memory above 9 GiB. The selected value always controls the maximum heap. Initial allocation is capped at that value, up to 9 GiB for the low profile or 12 GiB for the high profile. The settings preview changes with the slider; save preferences to apply it to the next launch. Both profiles retain the original pre-touch, reference processing, explicit-GC, and Forge timeout settings.
+
+macOS uses native ARM64 Azul Zulu Java 17.0.21, the same vendor/runtime family as the old launcher's 17.0.18, and retains `-XstartOnFirstThread`. Minecraft 1.20.1's JNA 5.12.1 can abort inside `dispatch.c` when macOS produces a long library-loading error ([upstream fix](https://github.com/java-native-access/jna/pull/1456)). On macOS the launcher uses the matched JNA/JNA-platform 5.13.0 libraries and checksums from [Mojang's 1.20.2 metadata](https://piston-meta.mojang.com/v1/packages/2b1c2be7cf1d1137b77716962b71e147b614c50c/1.20.2.json), including Forge's merge-module references. Only those two libraries change; Minecraft remains 1.20.1. Upstream metadata and existing runtime cache files are retained.
+
 ## Servers
 
 Install a client pack first, then choose **Build server**. The builder uses that exact pack commit and `server_config.conf` inclusion, exclusion, whitelist, and template settings. It installs matching Forge server files, restores mandatory server-side dependencies mistakenly excluded by filename rules, and omits author-specific worlds/access lists. Rebuilding preserves world and user settings.
@@ -75,6 +79,8 @@ Updater signing is independent of OS distribution signing. The initial pipeline 
 `cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example inspect_pack` resolves and verifies real pack metadata.
 
 `cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_runtime -- --client` provisions and verifies Java, Forge, and Mojang resources under a temporary test directory. Repeating it reports transferred download bytes, allowing cache reuse to be verified.
+
+On Apple Silicon, `cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_macos_compat` runs a headless native regression against the actual managed Java and client libraries: JNA long-error handling, OSHI CPU/memory queries, Unicode/space paths, and both JVM tuning profiles at 1, 9, 9.5, and 20 GiB. It uses isolated temporary runtime data, requires no account, and does not launch Minecraft or exercise gameplay. Set `AURAM_VERIFY_RUNTIME_DIR` to select a separate verification cache.
 
 `cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_server` builds the real pack server in that same isolated directory. It does not accept the EULA or start a server automatically.
 

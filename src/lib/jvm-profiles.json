@@ -1,0 +1,40 @@
+{
+  "highMemoryAboveMib": 9216,
+  "low": {
+    "label": "Low memory",
+    "initialMemoryMib": 9216,
+    "flags": [
+      "-XX:+UseG1GC",
+      "-XX:+ParallelRefProcEnabled",
+      "-XX:+DisableExplicitGC",
+      "-XX:+AlwaysPreTouch",
+      "-XX:MaxGCPauseMillis=50",
+      "-XX:InitiatingHeapOccupancyPercent=15",
+      "-XX:G1HeapWastePercent=5",
+      "-XX:G1MixedGCCountTarget=4",
+      "-XX:G1ReservePercent=10",
+      "-Dfml.readTimeout=120",
+      "-Dfml.loginTimeout=120"
+    ]
+  },
+  "high": {
+    "label": "High memory",
+    "initialMemoryMib": 12288,
+    "flags": [
+      "-XX:+UseG1GC",
+      "-XX:+UnlockExperimentalVMOptions",
+      "-XX:+ParallelRefProcEnabled",
+      "-XX:+DisableExplicitGC",
+      "-XX:+AlwaysPreTouch",
+      "-XX:MaxGCPauseMillis=16",
+      "-XX:InitiatingHeapOccupancyPercent=15",
+      "-XX:G1HeapWastePercent=8",
+      "-XX:G1MixedGCCountTarget=8",
+      "-XX:G1MixedGCLiveThresholdPercent=85",
+      "-XX:G1RSetUpdatingPauseTimePercent=5",
+      "-XX:G1ReservePercent=15",
+      "-Dfml.readTimeout=120",
+      "-Dfml.loginTimeout=120"
+    ]
+  }
+}

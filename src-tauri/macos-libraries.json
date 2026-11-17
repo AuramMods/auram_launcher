@@ -1,0 +1,24 @@
+[
+  {
+    "name": "net.java.dev.jna:jna:5.13.0",
+    "downloads": {
+      "artifact": {
+        "path": "net/java/dev/jna/jna/5.13.0/jna-5.13.0.jar",
+        "sha1": "1200e7ebeedbe0d10062093f32925a912020e747",
+        "size": 1879325,
+        "url": "https://libraries.minecraft.net/net/java/dev/jna/jna/5.13.0/jna-5.13.0.jar"
+      }
+    }
+  },
+  {
+    "name": "net.java.dev.jna:jna-platform:5.13.0",
+    "downloads": {
+      "artifact": {
+        "path": "net/java/dev/jna/jna-platform/5.13.0/jna-platform-5.13.0.jar",
+        "sha1": "88e9a306715e9379f3122415ef4ae759a352640d",
+        "size": 1363209,
+        "url": "https://libraries.minecraft.net/net/java/dev/jna/jna-platform/5.13.0/jna-platform-5.13.0.jar"
+      }
+    }
+  }
+]
