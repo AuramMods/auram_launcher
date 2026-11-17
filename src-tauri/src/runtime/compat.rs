@@ -173,7 +173,10 @@ mod tests {
                 ..Settings::default()
             };
             let args = runtime.arguments(&ready, &session, &settings).unwrap();
-            let classpath = &args[args.iter().position(|a| a == "-cp").unwrap() + 1];
+            // The test exercises both target policies on either host. PathBuf
+            // still serializes using the host's directory separator.
+            let classpath =
+                args[args.iter().position(|a| a == "-cp").unwrap() + 1].replace('\\', "/");
             let version = if platform == Platform::MacArm {
                 "5.13.0"
             } else {
