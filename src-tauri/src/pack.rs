@@ -21,6 +21,8 @@ pub struct PackTag {
 pub struct PackFile {
     pub sha: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -127,6 +129,7 @@ impl Packs {
                     PackFile {
                         sha: e.sha,
                         size: e.size.unwrap_or(0),
+                        source: None,
                     },
                 )
             })
@@ -147,7 +150,7 @@ impl Packs {
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Invalid raw URL"))?
             .extend(["AuramMods", "Auram", &manifest.tag.sha])
-            .extend(path.split('/'));
+            .extend(file.source.as_deref().unwrap_or(path).split('/'));
         Ok(Download {
             url: url.into(),
             target: self.blob_path(file),
@@ -377,6 +380,7 @@ mod tests {
         PackFile {
             sha: hex::encode(hash.finalize()),
             size: bytes.len() as u64,
+            source: None,
         }
     }
     #[test]

@@ -3,10 +3,45 @@
   "productName": "Auram",
   "version": "0.0.0",
   "identifier": "art.arcane.auram.auramLauncher",
-  "build": {"beforeDevCommand": "pnpm frontend:dev", "devUrl": "http://127.0.0.1:1420", "beforeBuildCommand": "pnpm frontend:build", "frontendDist": "../dist"},
-  "app": {
-    "windows": [{"title": "Auram", "width": 1100, "height": 760, "minWidth": 850, "minHeight": 650, "backgroundColor": "#100d18"}],
-    "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost"}
+  "build": {
+    "beforeDevCommand": "pnpm frontend:dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm frontend:build",
+    "frontendDist": "../dist"
   },
-  "bundle": {"active": true, "targets": "all", "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"], "macOS": {"minimumSystemVersion": "12.0", "signingIdentity": "-"}, "windows": {"nsis": {"installMode": "currentUser"}}}
+  "app": {
+    "windows": [
+      {
+        "title": "Auram",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 850,
+        "minHeight": 650,
+        "backgroundColor": "#000000"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
 }

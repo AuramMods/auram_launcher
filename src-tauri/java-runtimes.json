@@ -1,0 +1,12 @@
+{
+  "macos-arm64": {
+    "url": "https://cdn.azul.com/zulu/bin/zulu17.70.113-ca-jdk17.0.21.0.3-macosx_aarch64.zip",
+    "sha256": "7b224520b3d3340cf21832a504d49e3045b4a175203bbeab0946cff326f3fef5",
+    "size": 195986521
+  },
+  "windows-x64": {
+    "url": "https://cdn.azul.com/zulu/bin/zulu17.70.113-ca-jdk17.0.21.0.3-win_x64.zip",
+    "sha256": "612efab667042036ad2e4da138cf690680e3cb99b5731c3b27ca00ffb0128230",
+    "size": 196335393
+  }
+}
