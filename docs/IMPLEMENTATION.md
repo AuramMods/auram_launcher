@@ -10,7 +10,7 @@ The Flutter/Dart implementation and bundled ZIP were replaced with Tauri 2, a Ru
 - The existing Microsoft registration supports device sign-in with offline access. The user explicitly chose to retain this registration rather than change Entra. Sign-in displays a code; **Copy Code** copies it and opens Microsoft in one action. Refresh credentials remain in native credential storage and renew silently. Optional PKCE callback mode is available for appropriately configured registrations.
 - Managed Java 17, official Forge installers, platform-specific native libraries, Java argument files, and redacted process output handle game/runtime setup.
 - Server builds use pack inclusion/exclusion settings and mod sidedness metadata, restore required common libraries excluded by filename rules, preserve user configuration/worlds, and generate scripts preferring managed Java 17.
-- Commit-count versions, a non-forced release branch update, signed startup updates, local ARM64 Mac packaging, and Windows GitHub Actions builds implement distribution. Updater private keys stay outside Git and in repository Actions secrets.
+- Commit-count versions, a non-forced release branch update, signed startup updates, macOS ARM64 and Windows x64 GitHub Actions packaging with one verified publishing job implement distribution. Updater private keys stay outside Git and in repository Actions secrets.
 - SFTP deployment uses versioned server builds and validated pack changelists, scoped payload comparison, secure saved credentials, SSH host-key pinning, disabled-jar aliases, staging, retained originals, and recoverable remote transactions.
 
 ## Verification evidence
