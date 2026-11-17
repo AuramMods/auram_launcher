@@ -49,3 +49,14 @@ jdks/
 *.dat
 
 Auram-macos.zip
+
+# Tauri / frontend
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.auram-dev/
+*.part
+.env
+.env.*
+!.env.example

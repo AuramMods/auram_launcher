@@ -1,0 +1,3 @@
+import { spawnSync } from 'node:child_process';
+const result = spawnSync('pnpm', ['exec','tauri','dev'], {stdio:'inherit', env:{...process.env, AURAM_DEV:'1'}, shell:process.platform === 'win32'});
+process.exit(result.status ?? 1);

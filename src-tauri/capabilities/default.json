@@ -1,0 +1,1 @@
+{"$schema":"../gen/schemas/desktop-schema.json","identifier":"main","description":"Launcher window with narrowly scoped Rust commands","windows":["main"],"permissions":["core:default"]}
