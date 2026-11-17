@@ -34,7 +34,7 @@ function App() {
   const refresh=React.useCallback(async()=>{const next=await invoke<Status>('get_status');setStatus(next);setSettings(previous=>previous??next.settings);return next;},[]);
   React.useEffect(()=>{
     let disposed=false;
-    refresh().catch(e=>setError(String(e)));
+    refresh().then(()=>invoke<string>('update_launcher',{manual:false}).then(setUpdateStatus).catch(e=>setUpdateStatus(String(e)))).catch(e=>setError(String(e)));
     const subscription=listen<JobProgress>('progress',event=>{if(!disposed)setProgress(event.payload);});
     const interval=setInterval(()=>{refresh().catch(()=>{});},1500);
     return ()=>{disposed=true;clearInterval(interval);void subscription.then(unlisten=>unlisten());};

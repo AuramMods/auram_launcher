@@ -110,6 +110,17 @@ impl Downloader {
         .await?
     }
     pub async fn many(&self, downloads: Vec<Download>, job: &Job) -> Result<()> {
+        let mut unique = std::collections::BTreeMap::<PathBuf, Download>::new();
+        for download in downloads {
+            if let Some(existing) = unique.get(&download.target) {
+                if existing.checksum != download.checksum {
+                    bail!("Conflicting checksums for one download destination");
+                }
+            } else {
+                unique.insert(download.target.clone(), download);
+            }
+        }
+        let downloads = unique.into_values().collect::<Vec<_>>();
         let total = downloads.len() as u64;
         let counter = std::sync::atomic::AtomicU64::new(0);
         let done = &counter;

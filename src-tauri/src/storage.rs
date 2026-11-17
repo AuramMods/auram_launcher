@@ -278,9 +278,9 @@ pub fn recover(root: &Path, transaction: &Path) -> Result<()> {
         for entry in &journal.paths {
             let target = safe_join(root, &entry.relative)?;
             if entry.existed {
-                atomic_write(
+                atomic_copy(
+                    &safe_join(&transaction.join("original"), &entry.relative)?,
                     &target,
-                    &fs::read(safe_join(&transaction.join("original"), &entry.relative)?)?,
                 )?;
             } else {
                 match fs::remove_file(&target) {
@@ -311,9 +311,9 @@ pub fn transact(
         let target = safe_join(root, relative)?;
         let existed = target.try_exists()?;
         if existed {
-            atomic_write(
+            atomic_copy(
+                &target,
                 &safe_join(&transaction.join("original"), relative)?,
-                &fs::read(&target)?,
             )?;
         }
         journal.paths.push(SavedPath {

@@ -1,0 +1,12 @@
+import { readdirSync, mkdirSync, copyFileSync, readFileSync,writeFileSync } from 'node:fs';
+import { join, basename } from 'node:path';
+import { buildInfo } from './version.mjs';
+const [target,platform]=process.argv.slice(2);const info=buildInfo();
+const walk=dir=>readdirSync(dir,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?walk(join(dir,entry.name)):[join(dir,entry.name)]);
+const files=walk(`src-tauri/target/${target}/release/bundle`).filter(file=>/\.(dmg|exe|tar\.gz|sig)$/.test(file));
+const dir='.build/artifacts';mkdirSync(dir,{recursive:true});
+for(const file of files) copyFileSync(file,join(dir,basename(file)));
+const updater=files.find(file=>platform==='darwin-aarch64'?file.endsWith('.app.tar.gz'):file.endsWith('-setup.exe'));
+if(!updater)throw new Error(`Missing updater bundle for ${platform}`);
+const signature=readFileSync(`${updater}.sig`,'utf8').trim();
+writeFileSync(join(dir,`${platform}.json`),JSON.stringify({platform,build:info.build,commit:info.commit,version:info.version,url:`https://github.com/AuramMods/auram_launcher/releases/download/${info.tag}/${encodeURIComponent(basename(updater))}`,signature},null,2));

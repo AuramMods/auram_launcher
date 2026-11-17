@@ -1,0 +1,100 @@
+name: Release
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact commit to rebuild (must match release)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: auram-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      build: ${{ steps.version.outputs.build }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - id: version
+        shell: bash
+        run: |
+          node scripts/version.mjs > build-info.json
+          node -e "const fs=require('fs'); const i=JSON.parse(fs.readFileSync('build-info.json')); fs.appendFileSync(process.env.GITHUB_OUTPUT,Object.entries(i).map(([k,v])=>k+'='+v).join('\n')+'\n')"
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg,app
+            platform: darwin-aarch64
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - run: pnpm build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - run: node scripts/collect-artifacts.mjs ${{ matrix.target }} ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: .build/artifacts/*
+          if-no-files-found: error
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          path: .build/release
+          merge-multiple: true
+      - run: node scripts/publish.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}

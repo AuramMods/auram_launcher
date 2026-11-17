@@ -50,3 +50,9 @@ regex = "1"
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+
+[profile.release]
+strip = false
+
+[profile.release.build-override]
+strip = false

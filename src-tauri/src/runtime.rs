@@ -427,7 +427,7 @@ impl Runtime {
             ),
             ("natives_directory", natives.to_string_lossy().into()),
             ("launcher_name", "Auram".into()),
-            ("launcher_version", env!("CARGO_PKG_VERSION").into()),
+            ("launcher_version", env!("AURAM_BUILD_NUMBER").into()),
             ("classpath", classpath),
             ("classpath_separator", self.platform.separator().into()),
             ("library_directory", libraries.to_string_lossy().into()),

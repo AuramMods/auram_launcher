@@ -62,7 +62,7 @@ impl Backend {
             Core::new().map(Arc::new).map_err(|e| format!("{e:#}")),
         ))
     }
-    fn core(&self) -> Result<Arc<Core>, String> {
+    pub(crate) fn core(&self) -> Result<Arc<Core>, String> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -89,7 +89,7 @@ fn status(core: &Core) -> Result<Status> {
         .map(|e| format!("Credential storage: {e}"));
     let eula = std::fs::read_to_string(core.layout.server().join("eula.txt")).unwrap_or_default();
     Ok(Status {
-        build: env!("CARGO_PKG_VERSION").trim_start_matches("0.0.").into(),
+        build: env!("AURAM_BUILD_NUMBER").into(),
         pack: core.packs.installed()?.map(|m| m.tag),
         account: account.unwrap_or_default(),
         account_error,
@@ -275,6 +275,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -292,6 +293,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            crate::updater::update_launcher,
             get_status,
             retry_initialize,
             run_operation,
