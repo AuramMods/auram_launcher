@@ -70,7 +70,10 @@ pub fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
     let result = (|| {
         fs::copy(source, &temporary)?;
-        fs::File::open(&temporary)?.sync_all()?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
         fs::rename(&temporary, destination)?;
         Ok(())
     })();
@@ -106,7 +109,12 @@ pub struct Layout {
 impl Layout {
     pub fn discover() -> Result<Self> {
         let base = directories::BaseDirs::new().context("Unable to locate application data")?;
-        let root = if cfg!(debug_assertions) {
+        let root = if cfg!(feature = "qa") {
+            PathBuf::from(
+                std::env::var_os("AURAM_QA_DATA_DIR")
+                    .context("QA builds require an isolated AURAM_QA_DATA_DIR")?,
+            )
+        } else if cfg!(debug_assertions) {
             std::env::var_os("AURAM_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| base.data_local_dir().join("AuramLauncherDev"))

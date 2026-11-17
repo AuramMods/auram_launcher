@@ -36,7 +36,9 @@ pub struct NativeVault;
 impl NativeVault {
     fn entry() -> Result<keyring::Entry> {
         Ok(keyring::Entry::new(
-            if cfg!(debug_assertions) {
+            if cfg!(feature = "qa") {
+                "art.arcane.auram.qa"
+            } else if cfg!(debug_assertions) {
                 "art.arcane.auram.dev"
             } else {
                 "art.arcane.auram.launcher"

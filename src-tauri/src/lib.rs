@@ -13,3 +13,19 @@ pub use desktop::run;
 
 #[cfg(feature = "desktop")]
 mod updater;
+
+#[cfg(feature = "qa")]
+pub fn qa_event(root: &std::path::Path, event: &str, status: &str, details: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(root.join("qa.log"))
+    {
+        let _ = writeln!(
+            file,
+            "QA_EVT {}",
+            serde_json::json!({"event":event,"status":status,"details":details,"context":{"build":env!("AURAM_BUILD_NUMBER"),"commit":env!("AURAM_COMMIT")}})
+        );
+    }
+}

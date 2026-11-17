@@ -26,6 +26,13 @@ pub struct Core {
 impl Core {
     fn new() -> Result<Self> {
         let layout = Layout::discover()?;
+        #[cfg(feature = "qa")]
+        crate::qa_event(
+            &layout.root,
+            "native_boot",
+            "pass",
+            "Native application started with isolated QA data",
+        );
         storage::recover(&layout.client(), &layout.state("client-transaction"))?;
         storage::recover(&layout.server(), &layout.state("server-transaction"))?;
         let settings = storage::read_optional(&layout.state("settings.json"))?.unwrap_or_default();

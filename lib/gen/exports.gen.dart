@@ -1,1 +1,0 @@
-export 'artifacts.gen.dart';

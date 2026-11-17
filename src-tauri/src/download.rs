@@ -70,6 +70,7 @@ struct Partial {
 pub struct Downloader {
     pub client: reqwest::Client,
     partial_dir: PathBuf,
+    transferred: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Downloader {
     pub fn new(layout: &Layout) -> Result<Self> {
@@ -80,7 +81,11 @@ impl Downloader {
                 .timeout(Duration::from_secs(180))
                 .build()?,
             partial_dir: layout.root.join("downloads"),
+            transferred: Default::default(),
         })
+    }
+    pub fn transferred_bytes(&self) -> u64 {
+        self.transferred.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub async fn json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let response = self.client.get(url).send().await?.error_for_status()?;
@@ -267,6 +272,8 @@ impl Downloader {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             received += chunk.len() as u64;
+            self.transferred
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if download.size.is_some_and(|size| received > size) {
                 drop(file);
                 fs::remove_file(part)?;

@@ -31,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         println!(
+            "Verified download body bytes: {}",
+            runtime.net.transferred_bytes()
+        );
+        println!(
             "Forge {} ready: {}",
             ready.versions.forge,
             ready.java.display()
