@@ -24,6 +24,7 @@ pub struct Core {
     pub game: Game,
     pub settings: Mutex<Settings>,
     pub pack_startup: crate::startup::PackStartup,
+    pub server_inspections: crate::inspection::Inspections,
 }
 impl Core {
     fn new() -> Result<Self> {
@@ -54,6 +55,7 @@ impl Core {
             game: Game::default(),
             settings: Mutex::new(settings),
             pack_startup: crate::startup::PackStartup::default(),
+            server_inspections: crate::inspection::Inspections::default(),
         })
     }
     fn settings(&self) -> Settings {
@@ -490,6 +492,7 @@ pub fn run() {
             crate::desktop_servers::save_server_instance,
             crate::desktop_servers::remove_server_instance,
             crate::desktop_servers::inspect_server_instance,
+            crate::desktop_servers::cancel_server_inspection,
             crate::desktop_servers::deploy_server_instance,
             crate::desktop_servers::open_server_instance
         ])

@@ -138,6 +138,7 @@ async fn read_inspection(remote: &impl Remote, job: &Job) -> Result<Inspection> 
 #[tauri::command]
 pub async fn inspect_server_instance(
     id: String,
+    request_id: String,
     trust_fingerprint: Option<String>,
     app: tauri::AppHandle,
     backend: tauri::State<'_, Backend>,
@@ -158,7 +159,12 @@ pub async fn inspect_server_instance(
         )
         .map_err(|e| e.to_string())?;
     let job = &lease.job;
+    let _registration = core
+        .server_inspections
+        .register(&request_id, job.cancel.clone())
+        .map_err(|e| e.to_string())?;
     let result = async {
+        job.check()?;
         let mut registry = Registry::load(&core.layout)?;
         let mut instance = registry.get(&id)?;
         let inspection = match &mut instance.target {
@@ -210,10 +216,23 @@ pub async fn inspect_server_instance(
     }
     .await;
     if let Err(error) = &result {
-        record_failure(&core, &id, &format!("{error:#}"));
+        if !job.cancel.is_cancelled() {
+            record_failure(&core, &id, &format!("{error:#}"));
+        }
     }
     job.finish(result.as_ref().err().map(|e| format!("{e:#}")));
     result.map_err(|e| format!("Check server version: {e:#}"))
+}
+#[tauri::command]
+pub fn cancel_server_inspection(
+    request_id: String,
+    backend: tauri::State<Backend>,
+) -> Result<(), String> {
+    backend
+        .core()?
+        .server_inspections
+        .cancel(&request_id)
+        .map_err(|e| e.to_string())
 }
 fn record_failure(core: &crate::desktop::Core, id: &str, error: &str) {
     if let Ok(mut registry) = Registry::load(&core.layout) {

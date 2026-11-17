@@ -6,6 +6,7 @@ mod desktop;
 mod desktop_servers;
 pub mod download;
 pub mod game;
+pub mod inspection;
 pub mod jobs;
 pub mod launch_options;
 pub mod local_work;

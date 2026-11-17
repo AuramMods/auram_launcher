@@ -21,30 +21,45 @@ export function ServerInstances({servers,targetVersion,busy,refresh,onBusyChange
   const [detailError,setDetailError]=React.useState('');
   const request=React.useRef(0);
   const selected=React.useRef<string|null>(null);
+  const mounted=React.useRef(true);
+  const inspectionRequest=React.useRef<string|null>(null);
+  const cancelInspection=React.useCallback(()=>{
+    const requestId=inspectionRequest.current;
+    if(!requestId)return;
+    inspectionRequest.current=null;
+    void invoke('cancel_server_inspection',{requestId}).then(()=>refresh()).catch(error=>{if(mounted.current)onError(`Could not cancel server inspection: ${String(error)}`);});
+  },[refresh,onError]);
+  React.useEffect(()=>{
+    mounted.current=true;
+    return ()=>{mounted.current=false;request.current++;selected.current=null;cancelInspection();};
+  },[cancelInspection]);
   const saved=servers.find(server=>server.id===draft.id);
   const dirty=JSON.stringify(draft)!==baseline||!!password||!!passphrase;
   const disabled=busy||pending;
-  function close(value:boolean) {setOpen(value);if(!value){request.current++;selected.current=null;setPassword('');setPassphrase('');}}
+  function close(value:boolean) {setOpen(value);if(!value){request.current++;selected.current=null;cancelInspection();setPending(false);setPassword('');setPassphrase('');}}
   function edit(next:ServerDraft) {request.current++;setDraft(next);setInspection(null);setDetailError('');}
   function connection<K extends keyof SftpSettings>(key:K,value:SftpSettings[K]) {
     if(draft.target.kind==='sftp')edit({...draft,target:{kind:'sftp',connection:{...draft.target.connection,[key]:value}}});
   }
-  function working(value:boolean) {setPending(value);onBusyChange(value);}
+  function working(value:boolean) {if(mounted.current)setPending(value);onBusyChange(value);}
   async function inspect(id:string,trustFingerprint:string|null=null) {
+    cancelInspection();
     const attempt=++request.current;
-    working(true);setDetailError('');setInspection(null);
+    const requestId=Array.from(crypto.getRandomValues(new Uint32Array(4)),value=>value.toString(16)).join('-');
+    inspectionRequest.current=requestId;
+    setPending(true);setDetailError('');setInspection(null);
     try {
-      const result=await invoke<ServerInspection>('inspect_server_instance',{id,trustFingerprint});
+      const result=await invoke<ServerInspection>('inspect_server_instance',{id,requestId,trustFingerprint});
       await refresh();
-      if(attempt===request.current&&selected.current===id){
+      if(mounted.current&&attempt===request.current&&selected.current===id){
         setInspection(result);
         if(trustFingerprint&&!result.hostKey){
           const next=draft.target.kind==='sftp'?{...draft,target:{kind:'sftp' as const,connection:{...draft.target.connection,fingerprint:trustFingerprint}}}:draft;
           setDraft(next);setBaseline(JSON.stringify(next));
         }
       }
-    } catch(error) {if(attempt===request.current)setDetailError(String(error));await refresh().catch(()=>{});}
-    finally {working(false);}
+    } catch(error) {if(mounted.current&&attempt===request.current)setDetailError(String(error));await refresh().catch(()=>{});}
+    finally {if(inspectionRequest.current===requestId){inspectionRequest.current=null;if(mounted.current)setPending(false);}}
   }
   function details(server:ServerInstance) {
     if(disabled)return;
@@ -56,21 +71,24 @@ export function ServerInstances({servers,targetVersion,busy,refresh,onBusyChange
     selected.current=null;request.current++;const next=newDraft();setDraft(next);setBaseline(JSON.stringify(next));setPassword('');setPassphrase('');setInspection(null);setDetailError('');setOpen(true);
   }
   async function chooseDirectory() {
+    const attempt=request.current;
     try {
       const directory=await invoke<string|null>('choose_server_directory');
-      if(directory)setDraft(previous=>({...previous,name:previous.name==='Local server'?directory.split(/[\\/]/).filter(Boolean).at(-1)??'Local server':previous.name,target:{kind:'local',directory}}));
-    }catch(error){setDetailError(String(error));}
+      if(directory&&mounted.current&&attempt===request.current)setDraft(previous=>({...previous,name:previous.name==='Local server'?directory.split(/[\\/]/).filter(Boolean).at(-1)??'Local server':previous.name,target:{kind:'local',directory}}));
+    }catch(error){if(mounted.current&&attempt===request.current)setDetailError(String(error));}
   }
   async function save() {
+    const attempt=++request.current;
     working(true);setDetailError('');
     let instance:ServerInstance|undefined;
     try {
       instance=await invoke<ServerInstance>('save_server_instance',{input:draft,secret:password||passphrase?{password,passphrase}:null});
+      await refresh();
       const next={id:instance.id,name:instance.name,target:instance.target};
-      selected.current=instance.id;setDraft(next);setBaseline(JSON.stringify(next));setPassword('');setPassphrase('');await refresh();
-    }catch(error){setDetailError(String(error));}
+      if(mounted.current&&attempt===request.current){selected.current=instance.id;setDraft(next);setBaseline(JSON.stringify(next));setPassword('');setPassphrase('');}
+    }catch(error){if(mounted.current&&attempt===request.current)setDetailError(String(error));}
     finally{working(false);}
-    if(instance)await inspect(instance.id);
+    if(instance&&mounted.current&&attempt===request.current)await inspect(instance.id);
   }
   async function remove() {
     if(!draft.id)return;
