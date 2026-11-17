@@ -3,6 +3,11 @@
 use super::{Credentials, Vault};
 use anyhow::Result;
 
+// Account status polling also reads the vault outside Auth's refresh gate.
+// Hold the native snapshot stable until reads, rotation and cleanup finish.
+#[cfg(windows)]
+static WINDOWS_VAULT_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct NativeVault {
     service: String,
 }
@@ -32,6 +37,7 @@ impl Vault for NativeVault {
     fn load(&self) -> Result<Option<Credentials>> {
         #[cfg(windows)]
         {
+            let _guard = WINDOWS_VAULT_GATE.lock().unwrap_or_else(|e| e.into_inner());
             chunked::load(self)
         }
         #[cfg(not(windows))]
@@ -46,6 +52,7 @@ impl Vault for NativeVault {
     fn save(&self, value: &Credentials) -> Result<()> {
         #[cfg(windows)]
         {
+            let _guard = WINDOWS_VAULT_GATE.lock().unwrap_or_else(|e| e.into_inner());
             chunked::save(self, value)
         }
         #[cfg(not(windows))]
@@ -58,6 +65,7 @@ impl Vault for NativeVault {
     fn clear(&self) -> Result<()> {
         #[cfg(windows)]
         {
+            let _guard = WINDOWS_VAULT_GATE.lock().unwrap_or_else(|e| e.into_inner());
             chunked::clear(self)
         }
         #[cfg(not(windows))]

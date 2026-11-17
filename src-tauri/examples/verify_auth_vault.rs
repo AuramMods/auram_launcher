@@ -71,6 +71,38 @@ fn verify() -> Result<()> {
             }
         }
         println!("PASS native Windows legacy migration, large Unicode session roundtrip, refresh rotation and reopen");
+        std::thread::scope(|scope| {
+            let readers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        let reader = NativeVault::with_service(&service);
+                        for _ in 0..20 {
+                            let session = reader
+                                .load()?
+                                .context("Concurrent credential snapshot disappeared")?;
+                            let value = serde_json::to_value(session)?;
+                            if value != serde_json::to_value(&large)?
+                                && value != serde_json::to_value(&small)?
+                            {
+                                bail!("Concurrent credential read returned a partial session");
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..6 {
+                vault.save(&large)?;
+                vault.save(&small)?;
+            }
+            for reader in readers {
+                reader
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Credential reader thread failed"))??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        println!("PASS eight concurrent native account readers during twelve credential rotations");
         Ok(())
     })();
     let cleanup = vault.clear();
