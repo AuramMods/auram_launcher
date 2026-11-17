@@ -9,6 +9,7 @@
     "frontend:dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "frontend:build": "tsc --noEmit && vite build",
     "build": "node scripts/build.mjs",
+    "icons": "node scripts/icons.mjs",
     "tauri": "tauri",
     "check": "tsc --noEmit",
     "test": "node --test scripts/*.test.mjs",

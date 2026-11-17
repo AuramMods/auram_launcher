@@ -2,6 +2,8 @@
 
 Native Tauri 2 launcher for the Auram Minecraft 1.20.1 Forge pack. Supports Apple Silicon macOS and Windows x64. React, TypeScript, shadcn/ui, Rust, and pnpm; no Flutter/Dart installation is needed.
 
+The desktop icon keeps the original purple Auram mark on an OLED-black background. `pnpm icons` regenerates the native desktop icons from `assets/app-icon.svg`.
+
 ## Development
 
 Install Node 24, pnpm 11.15.1, Rust 1.93 or newer, and the native Tauri prerequisites: Xcode Command Line Tools on macOS; Microsoft C++ build tools and WebView2 on Windows.
