@@ -2,12 +2,13 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleAlert, FolderOpen, Gamepad2, HardDrive, LoaderCircle, LogOut, Play, RefreshCw, Server, Settings2, ShieldCheck, UserRound, Trash2, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleAlert, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, Server, Settings2, ShieldCheck, Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { JobProgressPanel } from '@/components/job-progress';
 import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
+import { SidebarAccount } from '@/components/sidebar-account';
 import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { highMemoryAboveMib, jvmProfile } from '@/lib/jvm-profile';
@@ -66,10 +67,10 @@ function App() {
       <div className="brand"><img src={emblem} alt=""/><span>AURAM<span className="brand-label">LAUNCHER</span></span></div>
       <div className="nav-label">YOUR WORKSPACE</div>
       <nav aria-label="Main navigation">{([{id:'play',label:'Play',icon:Gamepad2},{id:'server',label:'Server',icon:Server},{id:'settings',label:'Settings',icon:Settings2}] as const).map(item=><button key={item.id} className={`nav-item ${tab===item.id?'selected':''}`} onClick={()=>setTab(item.id)}><item.icon size={17}/>{item.label}{tab===item.id&&<ChevronRight size={14} className="nav-chevron"/>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="local-label"><span className={`status-dot ${running?'on':''}`}/>{running?'MINECRAFT RUNNING':'DESKTOP EDITION'}</div><span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div>
+      <div className="sidebar-bottom"><div className="sidebar-meta"><div className="local-label"><span className={`status-dot ${running?'on':''}`}/>{running?'MINECRAFT RUNNING':'DESKTOP EDITION'}</div><span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div><SidebarAccount account={status?.account??null} disabled={busy||!status} onSignIn={()=>void run('signIn')} onSignOut={()=>void run('signOut')}/></div>
     </aside>
     <div className={`workspace ${busy?'is-working':''}`}>
-      <header className="topbar"><span>{tab==='play'?'Your library':tab==='server'?'Server workspace':'Launcher preferences'}</span><div className="account-pill"><span className="account-avatar"><UserRound size={14}/></span>{status?.account?.name??'Not signed in'}</div></header>
+      <header className="topbar"><span>{tab==='play'?'Your library':tab==='server'?'Server workspace':'Launcher preferences'}</span></header>
       <main>
         {error&&<Alert variant="destructive" className="mb-5"><CircleAlert/><AlertTitle>Something needs attention</AlertTitle><AlertDescription><p className="break-words">{error}</p><div className="flex gap-2 mt-3"><Button size="sm" variant="outline" onClick={()=>{setError('');void action('retry_initialize');}}>Retry</Button><Button size="sm" variant="ghost" onClick={()=>void action('open_folder',{folder:'logs'})}>Open logs</Button><Button size="sm" variant="ghost" onClick={()=>setError('')}>Dismiss</Button></div></AlertDescription></Alert>}
         {notice&&!error&&<div className="notice" role="status"><Check size={15}/>{notice}<button aria-label="Dismiss notification" onClick={()=>setNotice('')}><X size={14}/></button></div>}
@@ -81,8 +82,7 @@ function App() {
             <div className="pack-heading"><span className="eyebrow">THE AURAM MODPACK</span><h2 id="pack-title">Make something<br/>extraordinary.</h2><p>Your world. Your way. Everything you need, kept up to date.</p></div>
             <div className="pack-footer"><div className="pack-facts"><div><span>MINECRAFT</span><strong>1.20.1</strong></div><div><span>MOD LOADER</span><strong>Forge</strong></div><div><span>PACK VERSION</span><strong>{status?.pack?.name??'—'}</strong></div></div><Button size="lg" className="play-button" disabled={busy||running||!status} onClick={()=>void run(!installed?'install':!status?.account?'signIn':'launch')}>{busy?<LoaderCircle className="animate-spin"/>:running?<Check/>:!installed?<ArrowDownToLine/>:<Play fill="currentColor"/>}{running?'Game running':!installed?'Install Auram':!status?.account?'Sign in to play':'Launch Auram'}{!busy&&!running&&<ArrowRight/>}</Button></div>
           </section>
-          <div className="detail-grid">
-            <Card><CardHeader><CardTitle className="section-title"><ShieldCheck/>Microsoft account</CardTitle><CardDescription>{status?.account?'Ready for your next session.':'Sign in once. Come back and play.'}</CardDescription></CardHeader><CardContent><div className="account-row"><div className="identity-icon"><UserRound/></div><div><strong>{status?.account?.name??'Your adventure starts here'}</strong><p>{status?.account?'Session saved securely on this device':'Use your Minecraft Java account'}</p></div></div><div className="flex gap-2 mt-5"><Button variant="secondary" disabled={busy} onClick={()=>void run('signIn')}>{status?.account?'Change account':'Sign in with Microsoft'}<ArrowRight/></Button>{status?.account&&<Button variant="ghost" size="icon" aria-label="Sign out" disabled={busy} onClick={()=>void run('signOut')}><LogOut/></Button>}</div></CardContent></Card>
+          <div className="installation-card">
             <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{installed&&<Button variant="ghost" className="justify-between" disabled={busy||running} onClick={()=>void run('launchInstalled')}><span className="flex items-center gap-2"><Play/>Play installed version</span><ChevronRight/></Button>}{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}<Button variant="destructive" className="justify-between mt-2" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}><span className="flex items-center gap-2"><Trash2/>Force reinstall</span><ChevronRight/></Button><p className="text-xs text-muted-foreground">Force reinstall deletes local worlds and all client pack files.</p></CardContent></Card>
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
