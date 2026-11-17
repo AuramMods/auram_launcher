@@ -18,7 +18,9 @@ function TaskRow({task}:{task:TaskProgress}) {
 }
 
 export function JobProgressPanel({progress,onCancel}:{progress:JobProgress|null;onCancel:()=>void}) {
-  const [expanded,setExpanded]=React.useState(true);
+  const [expandedJob,setExpandedJob]=React.useState<number|null>(null);
+  const expanded=progress!==null&&expandedJob===progress.jobId;
+  const setExpanded=(value:boolean)=>setExpandedJob(value?progress?.jobId??null:null);
   const phase=progress?.phases[progress.activePhase];
   const batch=phase?.batch;
   const settled=progress?.phases.filter(p=>p.state==='complete'||p.state==='skipped').length??0;
