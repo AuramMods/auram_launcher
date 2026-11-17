@@ -328,20 +328,17 @@ pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Resu
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub schema: u32,
+    // Derived per machine. Ignore legacy/manual JSON and never persist it again.
+    #[serde(skip, default = "crate::launch_options::automatic_memory_mib")]
     pub memory_mib: u64,
     pub microsoft_client_id: String,
     pub browser_login: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        let memory = sysinfo::System::new_all().total_memory() / 1024 / 1024;
         Self {
             schema: 1,
-            memory_mib: if memory == 0 {
-                4096
-            } else {
-                (memory / 2).clamp(2048, 8192)
-            },
+            memory_mib: crate::launch_options::automatic_memory_mib(),
             microsoft_client_id: "cf95d5d7-7830-4ad4-a70e-d54e50e80b40".into(),
             browser_login: false,
         }
@@ -505,6 +502,32 @@ fn remove_empty_parents(root: &Path, file: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_or_incoming_memory_settings_cannot_override_automatic_selection() {
+        for old_memory in [
+            serde_json::json!(1024),
+            serde_json::json!(32768),
+            serde_json::json!("ignored legacy value"),
+        ] {
+            let settings:Settings=serde_json::from_value(serde_json::json!({
+                "schema":1,"memoryMib":old_memory,"microsoftClientId":"existing-client","browserLogin":true
+            })).unwrap();
+            assert_eq!(
+                settings.memory_mib,
+                crate::launch_options::automatic_memory().maximum_mib
+            );
+            assert_eq!(settings.microsoft_client_id, "existing-client");
+            assert!(settings.browser_login);
+            let persisted = serde_json::to_value(&settings).unwrap();
+            assert!(persisted.get("memoryMib").is_none());
+            assert_eq!(
+                serde_json::from_value::<Settings>(persisted)
+                    .unwrap()
+                    .memory_mib,
+                settings.memory_mib
+            );
+        }
+    }
     #[test]
     fn client_reset_resumes_after_restart_and_cannot_replay_old_files() {
         let temp = tempfile::tempdir().unwrap();

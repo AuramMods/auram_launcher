@@ -11,8 +11,6 @@ import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
 import { SidebarAccount } from '@/components/sidebar-account';
 import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
-import { highMemoryAboveMib, jvmProfile } from '@/lib/jvm-profile';
-import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -22,8 +20,9 @@ import emblem from '../assets/icon.png';
 import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
-type Settings = {schema:number;memoryMib:number;microsoftClientId:string;browserLogin:boolean};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
+type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
+type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
@@ -61,7 +60,7 @@ function App() {
   async function updateLauncher() {setUpdateStatus('Checking for launcher updates…');try {setUpdateStatus(await invoke<string>('update_launcher',{manual:true}));}catch(e){setUpdateStatus(String(e));}}
   const installed=!!status?.pack;
   const running=!!status?.game.running;
-  const memoryProfile=jvmProfile(settings?.memoryMib??4096);
+  const memory=status?.memory;
   return <div className="shell dark">
     <aside className="sidebar">
       <div className="brand"><img src={emblem} alt=""/><span>AURAM<span className="brand-label">LAUNCHER</span></span></div>
@@ -94,7 +93,7 @@ function App() {
         </>}
         {tab==='settings'&&<>
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
-          <Card><CardHeader><CardTitle>Game memory</CardTitle><CardDescription>Leave enough memory available for your operating system.</CardDescription></CardHeader><CardContent><div className="memory-value">{((settings?.memoryMib??4096)/1024).toFixed(1)} <span>GiB</span></div><Slider aria-label="Game memory in MiB" min={1024} max={32768} step={512} value={[settings?.memoryMib??4096]} disabled={busy} onValueChange={([memoryMib])=>setSettings(current=>current?{...current,memoryMib}:current)}/><div className="slider-labels"><span>1 GiB</span><span>32 GiB</span></div><p className="mt-4 text-xs text-muted-foreground"><span className="text-violet-200">{memoryProfile.label} tuning</span> · {(memoryProfile.initialMemoryMib/1024).toFixed(1)} GiB initial allocation. High memory tuning above {highMemoryAboveMib/1024} GiB.</p><Button className="mt-5" disabled={busy||!settings} onClick={()=>void save()}>Save preferences</Button></CardContent></Card>
+          <Card><CardHeader><div className="flex items-center justify-between"><CardTitle>Game memory</CardTitle><Badge variant="outline">Automatic</Badge></div><CardDescription>Auram selects its original memory preset for your computer.</CardDescription></CardHeader><CardContent><div className="memory-value">{memory?(memory.maximumMib/1024).toFixed(1):'…'} <span>GiB</span></div>{memory?<><p className="text-xs text-muted-foreground"><span className="text-violet-200">{memory.profile} tuning</span> · {(memory.initialMib/1024).toFixed(1)} GiB initial allocation. {memory.systemMemoryMib!==null?`${(memory.systemMemoryMib/1024).toFixed(1)} GiB system memory detected.`:'System memory detection unavailable; using the low-memory preset.'}</p><p className="mt-2 text-xs text-muted-foreground">9 GiB maximum on systems with up to {memory.highSystemMemoryAboveMib/1024} GiB of RAM; 20 GiB maximum above that.</p></>:<p className="text-xs text-muted-foreground">Detecting system memory…</p>}</CardContent></Card>
           <div className="detail-grid mt-5"><Card><CardHeader><CardTitle>Files & diagnostics</CardTitle><CardDescription>Repair checks your managed files and downloads only what is missing or damaged.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>void action('open_folder',{folder:'data'})}><FolderOpen/>Data folder</Button><Button variant="outline" onClick={()=>void action('open_folder',{folder:'logs'})}>Logs</Button><Button variant="secondary" disabled={busy||running||!installed} onClick={()=>void run('repair')}><RefreshCw/>Repair installation</Button></CardContent></Card><Card><CardHeader><CardTitle>Launcher updates</CardTitle><CardDescription>New launcher builds install automatically on startup.</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={busy} onClick={()=>void updateLauncher()}><RefreshCw/>Check for updates</Button><p className="mt-3 text-xs text-muted-foreground" role="status">{updateStatus||`Installed: Build ${status?.build??'…'}`}</p></CardContent></Card></div>
           <button className="text-action mt-6" onClick={()=>setAdvanced(!advanced)}>{advanced?'Hide':'Show'} advanced authentication settings</button>{advanced&&<Card className="mt-3"><CardContent className="pt-5"><Label htmlFor="client-id">Microsoft application ID</Label><Input id="client-id" value={settings?.microsoftClientId??''} onChange={event=>setSettings(current=>current?{...current,microsoftClientId:event.target.value}:current)} className="mt-2"/><p className="text-xs text-muted-foreground mt-2">Changing the application ID requires signing in again.</p><div className="mt-4 flex items-center justify-between gap-4"><Label htmlFor="browser-login">Use a configured browser callback</Label><Switch id="browser-login" checked={settings?.browserLogin??false} onCheckedChange={browserLogin=>setSettings(current=>current?{...current,browserLogin}:current)}/></div><p className="text-xs text-muted-foreground mt-2">Enable only for an application registration with the desktop callback configured. The existing Auram registration uses the code flow with automatic session renewal.</p><Button className="mt-3" disabled={busy} onClick={()=>void save()}>Save</Button></CardContent></Card>}
         </>}

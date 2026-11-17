@@ -84,6 +84,7 @@ pub struct Status {
     account: Option<Profile>,
     account_error: Option<String>,
     settings: Settings,
+    memory: crate::launch_options::AutomaticMemory,
     busy: bool,
     progress: Option<Progress>,
     game: GameStatus,
@@ -108,6 +109,7 @@ fn status(core: &Core) -> Result<Status> {
         account: account.unwrap_or_default(),
         account_error,
         settings: core.settings(),
+        memory: crate::launch_options::automatic_memory().clone(),
         busy: core.jobs.busy(),
         progress: core.jobs.progress(),
         game: core.game.status(),
@@ -373,9 +375,6 @@ fn save_settings(settings: Settings, backend: tauri::State<Backend>) -> Result<(
     let core = backend.core()?;
     if core.jobs.busy() {
         return Err("Wait for the current operation to finish".into());
-    }
-    if !(1024..=32768).contains(&settings.memory_mib) {
-        return Err("Choose between 1 and 32 GiB of memory".into());
     }
     if settings.microsoft_client_id.trim().is_empty() {
         return Err("Microsoft application ID is required".into());

@@ -308,6 +308,15 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     Ok(())
 }
 fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<()> {
+    // Dedicated-server defaults stay independent of the client's 9/20 GiB policy.
+    let system_memory = crate::launch_options::automatic_memory()
+        .system_memory_mib
+        .unwrap_or(0);
+    let server_memory = if system_memory == 0 {
+        4096
+    } else {
+        (system_memory / 2).clamp(2048, 8192)
+    };
     let java_quote = format!("'{}'", java.to_string_lossy().replace('\'', "'\\''"));
     #[cfg(windows)]
     let windows_java = crate::java_bridge::helper(java)?;
@@ -323,11 +332,7 @@ fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<
     storage::atomic_write(&root.join("run.bat"),format!("@echo off\r\nchcp 65001 >nul\r\ncd /d \"%~dp0\"\r\nset \"JAVA={java_windows}\"\r\nset \"JAVAMODE={java_mode}\"\r\nif not exist \"%JAVA%\" set \"JAVAMODE=\"\r\nif not exist \"%JAVA%\" if defined JAVA_HOME set \"JAVA=%JAVA_HOME%\\bin\\java.exe\"\r\nif not exist \"%JAVA%\" set \"JAVA=java\"\r\n\"%JAVA%\" %JAVAMODE% @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/win_args.txt nogui %*\r\n",versions.minecraft,versions.forge).as_bytes())?;
     storage::atomic_write(
         &root.join("user_jvm_args.txt"),
-        format!(
-            "-Xms512M\n-Xmx{}M\n",
-            storage::Settings::default().memory_mib
-        )
-        .as_bytes(),
+        format!("-Xms512M\n-Xmx{}M\n", server_memory).as_bytes(),
     )?;
     storage::atomic_write(
         &root.join("eula.txt"),
