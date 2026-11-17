@@ -25,8 +25,8 @@ import './style.css';
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
 type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;servers:ServerInstance[];dataPath:string;clientPath:string};
-type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer'|'importLegacy';
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];dataPath:string;clientPath:string};
+type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
   const [status,setStatus]=React.useState<Status|null>(null);
@@ -114,7 +114,20 @@ function App() {
             <div className="pack-footer"><div className="pack-facts"><div><span>MINECRAFT</span><strong>1.20.1</strong></div><div><span>MOD LOADER</span><strong>Forge</strong></div><div><span>PACK VERSION</span><strong>{status?.pack?.name??'—'}</strong></div></div><Button size="lg" className="play-button" disabled={busy||running||(!status&&!packUpdateFailed)} onClick={()=>{if(packUpdateFailed)void retryPackUpdate();else void run(!installed?'install':!status?.account?'signIn':'launch');}}>{busy?<LoaderCircle className="animate-spin"/>:running?<Check/>:!installed?<ArrowDownToLine/>:<Play fill="currentColor"/>}{running?'Game running':preparingPack?'Updating Auram…':packUpdateFailed?(status?.pack?'Retry pack update':'Retry startup'):!installed?'Install Auram':!status?.account?'Sign in to play':'Launch Auram'}{!busy&&!running&&<ArrowRight/>}</Button></div>
           </section>
           <div className="installation-card">
-            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}<Button variant="destructive" className="justify-between mt-2" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}><span className="flex items-center gap-2"><Trash2/>Force reinstall</span><ChevronRight/></Button><p className="text-xs text-muted-foreground">Force reinstall deletes local worlds and all client pack files.</p></CardContent></Card>
+            <Card>
+              <CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader>
+              <CardContent className="installation-actions">
+                <Button variant="outline" className="installation-tile" disabled={busy||running||!installed} onClick={()=>void run('install')}>
+                  <RefreshCw className="size-5"/><span className="installation-tile-copy"><span>Check pack updates</span><small>Find the latest pack</small></span>
+                </Button>
+                <Button variant="outline" className="installation-tile" onClick={()=>void action('open_folder',{folder:'client'})}>
+                  <FolderOpen className="size-5"/><span className="installation-tile-copy"><span>Open game folder</span><small>Browse client files</small></span>
+                </Button>
+                <Button variant="outline" className="installation-tile" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}>
+                  <Trash2 className="size-5"/><span className="installation-tile-copy"><span>Force reinstall</span><small>Reinstall from scratch</small></span>
+                </Button>
+              </CardContent>
+            </Card>
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}
