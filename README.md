@@ -60,7 +60,9 @@ The command fetches remote refs, captures `origin/main`, and normally pushes tha
 
 Build `N` is the full reachable commit count, `git rev-list --count <commit>`. The UI/release title displays Build N, the tag is `build-N`, and Tauri uses `0.0.N`. GitHub checkout uses complete history. Version configuration and metadata are generated during each build.
 
-The release workflow builds macOS ARM64 DMG/updater archives and Windows x64 per-user NSIS/updater installers. A single publisher assembles signatures, checksums, `build.json`, and `latest.json`, uploads them to a draft, then publishes it. Published release assets remain immutable; failed drafts may be retried.
+Run `pnpm release` on the Apple Silicon development Mac only when publication is wanted. It builds the ARM64 DMG/updater locally from an isolated checkout of the captured remote main commit, while GitHub Actions builds Windows x64. The command waits for Windows, downloads its artifacts, and assembles/publishes both platforms locally through a draft release. Keep the command running through publication. Published assets remain immutable; retries reuse a successful Windows workflow.
+
+Local signing accepts `TAURI_SIGNING_PRIVATE_KEY`, `AURAM_UPDATER_PRIVATE_KEY_FILE`, or an ignored `.auram-release.local.json` containing `{ "updaterKeyFile": "/secure/path/updater.key" }`. Set the optional password through `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Worktrees share the local Cargo build cache; dependency resolution remains frozen. Mac builds and basic checks run locally. The optional Actions CI is Windows-only and manually dispatched.
 
 Production checks the latest GitHub release on startup, verifies the update signature, installs a newer build, and restarts. An unavailable endpoint or invalid signature leaves the installed launcher usable. **Play installed version** launches the current pack without checking GitHub for a pack update; normal Microsoft authentication requirements still apply. Automatic attempts are recorded to avoid repeated installation loops; Settings allows an explicit retry. The Flutter launcher needs a one-time manual upgrade because it never contained a self-updater.
 

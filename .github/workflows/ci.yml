@@ -1,8 +1,6 @@
 name: CI
 on:
-  push:
-    branches: [main, 'codex/**']
-  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -10,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-26, windows-2022]
+        os: [windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

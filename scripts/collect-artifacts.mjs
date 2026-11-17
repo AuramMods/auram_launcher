@@ -3,7 +3,13 @@ import { join, basename } from 'node:path';
 import { buildInfo } from './version.mjs';
 const [target,platform]=process.argv.slice(2);const info=buildInfo();
 const walk=dir=>readdirSync(dir,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?walk(join(dir,entry.name)):[join(dir,entry.name)]);
-const files=walk(`src-tauri/target/${target}/release/bundle`).filter(file=>/\.(dmg|exe|tar\.gz|sig)$/.test(file));
+const files=walk(join(process.env.CARGO_TARGET_DIR||'src-tauri/target',target,'release/bundle')).filter(file=>{
+ const name=basename(file);
+ return platform==='darwin-aarch64'
+  ? /\.app\.tar\.gz(?:\.sig)?$/.test(name)||(name.includes(`_${info.version}_`)&&name.endsWith('.dmg'))
+  : name.includes(`_${info.version}_`)&&/-setup\.exe(?:\.sig)?$/.test(name);
+});
+if(platform==='darwin-aarch64'&&!files.some(file=>file.endsWith('.dmg')))throw new Error('The local Mac build did not produce its DMG');
 const dir='.build/artifacts';mkdirSync(dir,{recursive:true});
 for(const file of files) copyFileSync(file,join(dir,basename(file)));
 const updater=files.find(file=>platform==='darwin-aarch64'?file.endsWith('.app.tar.gz'):file.endsWith('-setup.exe'));

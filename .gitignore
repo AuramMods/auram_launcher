@@ -64,3 +64,4 @@ src-tauri/gen/
 .build/
 
 .qa/
+.auram-release.local.json
