@@ -2,6 +2,8 @@ pub mod auth;
 pub mod deploy;
 #[cfg(feature = "desktop")]
 mod desktop;
+#[cfg(feature = "desktop")]
+mod desktop_servers;
 pub mod download;
 pub mod game;
 pub mod jobs;
@@ -10,6 +12,7 @@ pub mod local_work;
 pub mod pack;
 pub mod runtime;
 pub mod server;
+pub mod server_instances;
 pub mod startup;
 pub mod storage;
 #[cfg(feature = "desktop")]

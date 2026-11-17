@@ -287,6 +287,7 @@ impl Packs {
             job,
             false,
             changed.as_ref(),
+            ("pack-files", "pack-apply"),
         )
         .await
     }
@@ -318,8 +319,41 @@ impl Packs {
         job: &Job,
         server: bool,
     ) -> Result<Manifest> {
-        self.reconcile_plan(root, transaction, old, desired, job, server, None)
-            .await
+        self.reconcile_plan(
+            root,
+            transaction,
+            old,
+            desired,
+            job,
+            server,
+            None,
+            if server {
+                ("server-files", "server-apply")
+            } else {
+                ("pack-files", "pack-apply")
+            },
+        )
+        .await
+    }
+    pub async fn reconcile_server_runtime(
+        &self,
+        root: &Path,
+        transaction: &Path,
+        old: Option<&Manifest>,
+        desired: &Manifest,
+        job: &Job,
+    ) -> Result<Manifest> {
+        self.reconcile_plan(
+            root,
+            transaction,
+            old,
+            desired,
+            job,
+            true,
+            None,
+            ("destination-files", "destination-apply"),
+        )
+        .await
     }
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_plan(
@@ -331,9 +365,10 @@ impl Packs {
         job: &Job,
         server: bool,
         touched: Option<&BTreeSet<String>>,
+        phases: (&str, &str),
     ) -> Result<Manifest> {
         job.phase(
-            if server { "server-files" } else { "pack-files" },
+            phases.0,
             if server { "Server files" } else { "Pack files" },
             true,
         );
@@ -361,7 +396,7 @@ impl Packs {
         })
         .await?;
         job.phase(
-            if server { "server-files" } else { "pack-files" },
+            phases.0,
             if server { "Server files" } else { "Pack files" },
             true,
         );
@@ -372,11 +407,7 @@ impl Packs {
                 if server { "Server files" } else { "Pack files" },
             )
             .await?;
-        job.phase(
-            if server { "server-apply" } else { "pack-apply" },
-            "Apply files",
-            false,
-        );
+        job.phase(phases.1, "Apply files", false);
         job.progress("pack", "Staging verified files", 0, changes.len() as u64);
         // Apply executable bits to private staging copies, keeping cached blobs immutable.
         let staging = self.layout.state("pack-apply-staging");

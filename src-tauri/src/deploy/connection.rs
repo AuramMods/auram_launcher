@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ConnectionSettings {
     pub schema: u32,
@@ -55,6 +55,48 @@ pub struct Secret {
     pub passphrase: String,
 }
 impl ConnectionSettings {
+    fn instance_entry(&self, layout: &Layout, id: &str) -> Result<keyring::Entry> {
+        Ok(keyring::Entry::new(
+            "art.arcane.auram.sftp",
+            &self.instance_identity(layout, id),
+        )?)
+    }
+    pub(crate) fn instance_identity(&self, layout: &Layout, id: &str) -> String {
+        hex::encode(sha2::Sha256::digest(format!(
+            "{}:{id}:{}:{}:{}:{}:{}",
+            layout.root.display(),
+            self.host,
+            self.port,
+            self.username,
+            self.authentication,
+            self.key_path
+        )))
+    }
+    pub fn instance_secret(&self, layout: &Layout, id: &str) -> Result<Secret> {
+        match self.instance_entry(layout, id)?.get_password() {
+            Ok(value) => Ok(serde_json::from_str(&value)?),
+            Err(keyring::Error::NoEntry) if id == "legacy-sftp" => self.secret(layout),
+            Err(keyring::Error::NoEntry) => Ok(Secret::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    pub fn save_instance_secret(&self, layout: &Layout, id: &str, secret: Secret) -> Result<()> {
+        Ok(self
+            .instance_entry(layout, id)?
+            .set_password(&serde_json::to_string(&secret)?)?)
+    }
+    pub fn forget_instance_secret(&self, layout: &Layout, id: &str) -> Result<()> {
+        if id == "legacy-sftp" {
+            match self.entry(layout)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match self.instance_entry(layout, id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
     fn entry(&self, layout: &Layout) -> Result<keyring::Entry> {
         let identity = hex::encode(sha2::Sha256::digest(format!(
             "{}:{}:{}:{}:{}:{}",

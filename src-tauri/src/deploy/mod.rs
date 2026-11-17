@@ -1,5 +1,6 @@
 //! Scoped SFTP deployments. Credentials and remote mutations stay in Rust.
 pub mod connection;
+pub mod local;
 mod plan;
 mod transaction;
 pub use plan::{inspect, DeploymentPlan};

@@ -232,6 +232,192 @@ impl Fixture {
     }
 }
 
+// Stage the same versioned source and immutable objects produced by a real
+// server build, without needing Java/Forge in a deterministic transport test.
+async fn stage_server(f: &Fixture, tag: &PackTag) {
+    let client = f.install(tag).await;
+    let payload = Manifest {
+        files: client
+            .files
+            .into_iter()
+            .filter_map(|(path, mut file)| {
+                let destination = path.strip_prefix("minecraft/")?;
+                if !crate::deploy::payload_path(destination) {
+                    return None;
+                }
+                file.source = Some(path.clone());
+                Some((destination.to_string(), file))
+            })
+            .collect(),
+        ..client
+    };
+    storage::write_json(
+        &f.packs.layout.state("server-deploy-payload.json"),
+        &payload,
+    )
+    .unwrap();
+    let version = crate::server::ServerVersion {
+        schema: 1,
+        version: tag.name.clone(),
+        commit: tag.sha.clone(),
+        minecraft: "1.20.1".into(),
+        forge: "47.4.10".into(),
+    };
+    storage::write_json(&f.packs.layout.server().join("auram.json"), &version).unwrap();
+    let mut runtime = payload.clone();
+    for (path, bytes) in [
+        ("run.sh", b"#!/bin/sh\n# verified fixture\n".as_slice()),
+        ("libraries/forge.jar", b"runtime"),
+        ("user_jvm_args.txt", b"-Xmx4096M"),
+        ("server.properties", b"default properties"),
+    ] {
+        let file = PackFile {
+            sha: blob(bytes),
+            size: bytes.len() as u64,
+            mode: "100644".into(),
+            source: None,
+        };
+        storage::atomic_write(&f.packs.blob_path(&file), bytes).unwrap();
+        runtime.files.insert(path.into(), file);
+    }
+    storage::write_json(
+        &f.packs.layout.server().join(".auram-manifest.json"),
+        &runtime,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn saved_local_servers_use_real_transactions_and_changelists_independently() {
+    use crate::{
+        deploy::{self, connection::Remote},
+        server_instances,
+    };
+    let f = Fixture::new().await;
+    let a = f._temp.path().join("Server 世界 A");
+    let b = f._temp.path().join("Server B");
+    // Destinations are external to the launcher's data tree, as a user-selected
+    // server directory is in production.
+    let external = tempfile::tempdir().unwrap();
+    let a = external.path().join(a.file_name().unwrap());
+    let b = external.path().join(b.file_name().unwrap());
+    for directory in [&a, &b] {
+        fs::create_dir(directory).unwrap();
+        storage::atomic_write(&directory.join("world/level.dat"), b"world").unwrap();
+        storage::atomic_write(&directory.join("server.properties"), b"private properties").unwrap();
+        storage::atomic_write(&directory.join("mods/custom.jar"), b"old custom mod").unwrap();
+        storage::atomic_write(&directory.join("config/custom.toml"), b"old custom config").unwrap();
+    }
+    storage::atomic_write(&a.join("mods/client.jar.client"), b"same").unwrap();
+    let base = f.snapshot(
+        "139",
+        files(&[
+            ("server_config.conf", ""),
+            ("minecraft/mods/client.jar", "same"),
+            ("minecraft/mods/obsolete.jar", "old"),
+            ("minecraft/config/stable.toml", "stable"),
+            ("minecraft/config/changed.toml", "before"),
+        ]),
+        None,
+        Some(vec![]),
+    );
+    stage_server(&f, &base).await;
+    let first = server_instances::deploy_local(&f.packs, &a.to_string_lossy(), &Job::default())
+        .await
+        .unwrap();
+    assert_eq!(first.version, "139");
+    assert!(!a.join("mods/client.jar").exists());
+    assert_eq!(fs::read(a.join("mods/client.jar.client")).unwrap(), b"same");
+    assert!(!a.join("mods/custom.jar").exists());
+    assert!(!a.join("config/custom.toml").exists());
+    assert_eq!(fs::read(a.join("world/level.dat")).unwrap(), b"world");
+    assert_eq!(
+        fs::read(a.join("server.properties")).unwrap(),
+        b"private properties"
+    );
+    assert_eq!(fs::read(a.join("libraries/forge.jar")).unwrap(), b"runtime");
+    storage::atomic_write(&a.join("config/stable.toml"), b"user change").unwrap();
+    storage::atomic_write(&a.join("user_jvm_args.txt"), b"-Xmx6000M").unwrap();
+    let target = f.snapshot(
+        "145",
+        files(&[
+            ("server_config.conf", ""),
+            ("minecraft/mods/renamed.jar", "same"),
+            ("minecraft/config/stable.toml", "stable"),
+            ("minecraft/config/changed.toml", "after"),
+            ("minecraft/kubejs/server_scripts/new.js", "script"),
+        ]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/client.jar".into(),
+            "-minecraft/mods/obsolete.jar".into(),
+            "+minecraft/mods/renamed.jar".into(),
+            "*minecraft/config/changed.toml".into(),
+            "+minecraft/kubejs/server_scripts/new.js".into(),
+        ]),
+    );
+    stage_server(&f, &target).await;
+    // A cancelled deployment must leave the actual known server version intact.
+    let cancelled = Job::default();
+    cancelled.cancel.cancel();
+    assert!(
+        server_instances::deploy_local(&f.packs, &a.to_string_lossy(), &cancelled)
+            .await
+            .is_err()
+    );
+    let remote = deploy::local::LocalRemote::new(a.clone()).unwrap();
+    assert_eq!(
+        deploy::read_version(&remote)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        "139"
+    );
+    let planned = deploy::inspect(&f.packs, &remote, &Job::default())
+        .await
+        .unwrap();
+    assert_eq!(planned.strategy, "changelists", "{:?}", planned.notes);
+    let updated = server_instances::deploy_local(&f.packs, &a.to_string_lossy(), &Job::default())
+        .await
+        .unwrap();
+    assert_eq!(updated.version, "145");
+    assert_eq!(
+        fs::read(a.join("mods/renamed.jar.client")).unwrap(),
+        b"same"
+    );
+    assert!(!a.join("mods/client.jar.client").exists());
+    assert!(!a.join("mods/obsolete.jar").exists());
+    assert_eq!(
+        fs::read(a.join("config/stable.toml")).unwrap(),
+        b"user change"
+    );
+    assert_eq!(fs::read(a.join("config/changed.toml")).unwrap(), b"after");
+    assert_eq!(fs::read(a.join("user_jvm_args.txt")).unwrap(), b"-Xmx6000M");
+    assert!(remote.stat(".auram-deploy/lock").await.unwrap().is_none());
+    let full = server_instances::deploy_local(&f.packs, &b.to_string_lossy(), &Job::default())
+        .await
+        .unwrap();
+    assert_eq!(full.version, "145");
+    assert_eq!(fs::read(b.join("mods/renamed.jar")).unwrap(), b"same");
+    for directory in [&a, &b] {
+        assert_eq!(
+            fs::read(directory.join("world/level.dat")).unwrap(),
+            b"world"
+        );
+        assert_eq!(
+            fs::read(directory.join("server.properties")).unwrap(),
+            b"private properties"
+        );
+        assert!(
+            walkdir::WalkDir::new(directory.join(".auram-deploy/transactions"))
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name() == "custom.jar")
+        );
+    }
+}
+
 #[tokio::test]
 async fn force_reinstall_deletes_all_client_data_and_reuses_verified_shared_content() {
     let f = Fixture::new().await;

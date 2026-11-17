@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 qa = []
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-plugin-opener", "dep:tauri-plugin-updater", "dep:tauri-plugin-process", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-clipboard-manager"]
+desktop = ["dep:tauri", "dep:tauri-plugin-opener", "dep:tauri-plugin-updater", "dep:tauri-plugin-process", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-clipboard-manager", "dep:tauri-plugin-dialog"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -53,6 +53,7 @@ regex = "1"
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3"
+tauri-plugin-dialog = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"

@@ -9,7 +9,8 @@ import { Badge } from '@/components/ui/badge';
 import { JobProgressPanel } from '@/components/job-progress';
 import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
 import { SidebarAccount } from '@/components/sidebar-account';
-import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
+import { ServerInstances } from '@/components/server-instances';
+import type { ServerInstance } from '@/lib/server-instances';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { createStartupTask, type PackPreparation } from '@/lib/startup';
 import { Switch } from '@/components/ui/switch';
@@ -23,7 +24,7 @@ import './style.css';
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
 type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;servers:ServerInstance[];dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
@@ -112,11 +113,7 @@ function App() {
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}
-        {tab==='server'&&<>
-          <div className="page-heading"><span className="eyebrow">BETTER TOGETHER</span><h1>Your own corner<br/>of the world<span>.</span></h1><p>Build an Auram server from your installed pack version.</p></div>
-          <Card><CardHeader><div className="flex justify-between items-center"><CardTitle className="section-title"><Server/>Auram server</CardTitle><Badge variant="outline">{status?.serverReady?'Built':'Not built yet'}</Badge></div><CardDescription>Forge runtime, server mods, configuration, and start scripts in one place.</CardDescription></CardHeader><CardContent><div className="server-description"><p>Client-only mods are excluded using the pack’s server rules. Rebuilding preserves your worlds, access lists, and server settings.</p><div className="flex gap-3 mt-6"><Button disabled={busy||running||!installed} onClick={()=>void run('buildServer')}><Server/>{status?.serverReady?'Update server files':'Build server'}</Button><Button variant="outline" disabled={!status?.serverReady} onClick={()=>void action('open_folder',{folder:'server'})}><FolderOpen/>Open server folder</Button></div>{!installed&&<p className="mt-3 text-xs">Install Auram in the Play tab first.</p>}</div>{status?.serverReady&&<div className="eula-section"><div><Label htmlFor="eula">Minecraft EULA</Label><p>Read the agreement before accepting. Start your server with run.sh or run.bat from its folder.</p><button className="text-action" onClick={()=>void action('open_eula')}>Read the Minecraft EULA <ArrowRight size={12}/></button></div><Switch id="eula" checked={status.eulaAccepted} disabled={busy} onCheckedChange={accepted=>void action('set_server_eula',{accepted})}/></div>}</CardContent></Card>
-          <SftpDeploy saved={status?.sftp} builtVersion={status?.serverVersion?.version??null} busy={busy} refresh={refresh} onError={setError} onNotice={setNotice}/>
-        </>}
+        {tab==='server'&&<ServerInstances servers={status?.servers??[]} targetVersion={status?.pack??null} busy={busy||running} refresh={refresh} onBusyChange={setActive} onError={setError} onNotice={setNotice}/>}
         {tab==='settings'&&<>
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
           <Card><CardHeader><div className="flex items-center justify-between"><CardTitle>Game memory</CardTitle><Badge variant="outline">Automatic</Badge></div><CardDescription>Auram selects its original memory preset for your computer.</CardDescription></CardHeader><CardContent><div className="memory-value">{memory?(memory.maximumMib/1024).toFixed(1):'…'} <span>GiB</span></div>{memory?<><p className="text-xs text-muted-foreground"><span className="text-violet-200">{memory.profile} tuning</span> · {(memory.initialMib/1024).toFixed(1)} GiB initial allocation. {memory.systemMemoryMib!==null?`${(memory.systemMemoryMib/1024).toFixed(1)} GiB system memory detected.`:'System memory detection unavailable; using the low-memory preset.'}</p><p className="mt-2 text-xs text-muted-foreground">9 GiB maximum on systems with up to {memory.highSystemMemoryAboveMib/1024} GiB of RAM; 20 GiB maximum above that.</p></>:<p className="text-xs text-muted-foreground">Detecting system memory…</p>}</CardContent></Card>

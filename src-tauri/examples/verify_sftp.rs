@@ -122,6 +122,32 @@ async fn main() -> Result<()> {
             bail!("Native credential deletion failed");
         }
         println!("PASS: native credential-store persistence, metadata reload, no plaintext settings and credential deletion");
+        for (id, password) in [("saved-a", "instance-a"), ("saved-b", "instance-b")] {
+            settings.save_instance_secret(
+                &layout,
+                id,
+                Secret {
+                    password: password.into(),
+                    passphrase: String::new(),
+                },
+            )?;
+        }
+        if settings.instance_secret(&layout, "saved-a")?.password != "instance-a"
+            || settings.instance_secret(&layout, "saved-b")?.password != "instance-b"
+        {
+            bail!("Saved server credentials were shared across instances");
+        }
+        settings.forget_instance_secret(&layout, "saved-a")?;
+        if !settings
+            .instance_secret(&layout, "saved-a")?
+            .password
+            .is_empty()
+            || settings.instance_secret(&layout, "saved-b")?.password != "instance-b"
+        {
+            bail!("Removing one saved server affected another credential");
+        }
+        settings.forget_instance_secret(&layout, "saved-b")?;
+        println!("PASS: per-instance native credentials survive reload and independent deletion");
     }
     payload(
         &packs,
