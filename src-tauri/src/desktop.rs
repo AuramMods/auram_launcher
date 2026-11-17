@@ -131,6 +131,7 @@ enum Operation {
     Install,
     Repair,
     Launch,
+    LaunchInstalled,
     SignIn,
     SignOut,
     BuildServer,
@@ -156,6 +157,7 @@ async fn run_operation(
                 Operation::Install
                     | Operation::Repair
                     | Operation::Launch
+                    | Operation::LaunchInstalled
                     | Operation::BuildServer
                     | Operation::ImportLegacy
             )
@@ -174,8 +176,10 @@ async fn run_operation(
                     .ensure(Versions::read(&core.layout.client())?, job)
                     .await?;
             }
-            Operation::Launch => {
-                core.packs.update(false, job).await?;
+            Operation::Launch | Operation::LaunchInstalled => {
+                if matches!(operation, Operation::Launch) {
+                    core.packs.update(false, job).await?;
+                }
                 let ready = core
                     .runtime
                     .ensure(Versions::read(&core.layout.client())?, job)

@@ -20,7 +20,7 @@ type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;memoryMib:number;microsoftClientId:string;browserLogin:boolean};
 type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;eulaAccepted:boolean;dataPath:string};
 type JobProgress = {operation:string;message:string;completed:number;total:number;bytes:number;totalBytes:number};
-type Operation = 'install'|'repair'|'launch'|'signIn'|'signOut'|'buildServer'|'importLegacy';
+type Operation = 'install'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 const bytes = (n:number) => n>=1024**3 ? `${(n/1024**3).toFixed(1)} GB` : `${(n/1024**2).toFixed(1)} MB`;
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
@@ -46,7 +46,7 @@ function App() {
   const busy=active||!!status?.busy;
   async function run(operation:Operation) {
     setActive(true);setError('');setNotice('');setProgress(null);
-    try {await invoke('run_operation',{operation});await refresh();setNotice(operation==='launch'?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':'All set.');}
+    try {await invoke('run_operation',{operation});await refresh();setNotice((operation==='launch'||operation==='launchInstalled')?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':'All set.');}
     catch(e){setError(String(e));}
     finally {setActive(false);setProgress(null);setChallenge(null);}
   }
@@ -78,7 +78,7 @@ function App() {
           </section>
           <div className="detail-grid">
             <Card><CardHeader><CardTitle className="section-title"><ShieldCheck/>Microsoft account</CardTitle><CardDescription>{status?.account?'Ready for your next session.':'Sign in once. Come back and play.'}</CardDescription></CardHeader><CardContent><div className="account-row"><div className="identity-icon"><UserRound/></div><div><strong>{status?.account?.name??'Your adventure starts here'}</strong><p>{status?.account?'Session saved securely on this device':'Use your Minecraft Java account'}</p></div></div><div className="flex gap-2 mt-5"><Button variant="secondary" disabled={busy} onClick={()=>void run('signIn')}>{status?.account?'Change account':'Sign in with Microsoft'}<ArrowRight/></Button>{status?.account&&<Button variant="ghost" size="icon" aria-label="Sign out" disabled={busy} onClick={()=>void run('signOut')}><LogOut/></Button>}</div></CardContent></Card>
-            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changed files download. Your worlds stay yours.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}</CardContent></Card>
+            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changed files download. Your worlds stay yours.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{installed&&<Button variant="ghost" className="justify-between" disabled={busy||running} onClick={()=>void run('launchInstalled')}><span className="flex items-center gap-2"><Play/>Play installed version</span><ChevronRight/></Button>}{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}</CardContent></Card>
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}

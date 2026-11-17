@@ -19,9 +19,11 @@ The Flutter/Dart implementation and bundled ZIP were replaced with Tauri 2, a Ru
 - Isolated signed updater: rejected a mismatched signature, then installed Build 23 over Build 22 and restarted into the exact newer commit. Both builds came from real commits; production data was excluded.
 - Rust tests cover refresh rotation/concurrency, revoked credentials, device challenge lifecycle, download corruption/ranges/cancellation/deduplication, path/archive safety, migration, transaction rollback, configuration preservation, launch arguments and server dependencies.
 - Real temporary Git remote tests cover reachable commit counts, release retries, unpublished local work and rejection of divergent release pushes.
-- Windows and macOS CI passed for committed Build 23. The latest Copy Code/server refinements require a final two-platform run.
-- The real pack server reached Minecraft's ready state in an isolated directory. Fresh-directory startup and shutdown verification is the current live check.
+- A real Java 17 argument-file fixture exercises Unicode paths, spaces, quotes, backslashes and a 40,000-character JVM option on both build platforms.
+- Windows and macOS CI passed for committed Build 23. The final code is checked by the same CI and release matrices; the release workflow records the exact source SHA.
+- A fresh server built from current pack tag 141 reached Minecraft's ready state on managed Java 17 through the generated run.sh and exited successfully after the console stop command.
+- Play installed version provides a launch path that does not check GitHub for pack updates while retaining normal authentication requirements.
 
 ## Distribution and interactive limits
 
-Full real-account Minecraft authentication/launch requires the account owner's interaction; protocol behavior and the real registration's device challenge have been exercised without reading private account credentials. macOS distribution currently uses ad-hoc signing, with mandatory updater signatures; Apple notarization and Windows Authenticode credentials are not configured in CI. Initial installation may require an OS trust confirmation. Publication and endpoint verification remain the final work items.
+Full real-account Minecraft authentication/launch requires the account owner's interaction; protocol behavior and the real registration's device challenge have been exercised without reading private account credentials. macOS distribution currently uses ad-hoc signing, with mandatory updater signatures; Apple notarization and Windows Authenticode credentials are not configured in CI. Initial installation may require an OS trust confirmation. Published release metadata, checksums, signatures, and workflow logs identify the delivered build and commit.

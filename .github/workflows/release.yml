@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-26
             target: aarch64-apple-darwin
             bundles: dmg,app
             platform: darwin-aarch64
@@ -68,6 +68,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - run: cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --example verify_java_args
       - run: pnpm build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
