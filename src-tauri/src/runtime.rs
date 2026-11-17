@@ -850,4 +850,13 @@ mod tests {
             "\"C:\\\\Users\\\\Name S\\\\世界\"\n\"a\\\"b\"\n"
         );
     }
+    #[test]
+    fn archive_links_cannot_escape_the_extraction_root() {
+        assert!(archive_link("folder/link", "../../outside").is_err());
+        assert!(archive_link("folder/link", "/outside").is_err());
+        assert_eq!(
+            archive_link("jdk/legal/module/LICENSE", "../../license/LICENSE").unwrap(),
+            "jdk/license/LICENSE"
+        );
+    }
 }

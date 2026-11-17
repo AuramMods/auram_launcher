@@ -445,4 +445,42 @@ mod tests {
         assert!(vault.load().unwrap().is_none());
         server.abort();
     }
+    #[tokio::test]
+    async fn revoked_credentials_are_reported_without_erasing_the_vault() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"invalid_grant"})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let vault = Arc::new(MemoryVault::default());
+        vault
+            .save(&Credentials {
+                client_id: "client".into(),
+                refresh_token: "retained".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut auth = Auth::new(reqwest::Client::new());
+        auth.vault = vault.clone();
+        auth.token_url = format!("http://{address}/token");
+        let error = auth
+            .session("client", &Job::default())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("sign in again"));
+        assert_eq!(vault.load().unwrap().unwrap().refresh_token, "retained");
+        server.abort();
+    }
 }

@@ -436,4 +436,20 @@ mod tests {
         assert!(layout.server().join("world/level.dat").exists());
         assert!(source.exists());
     }
+    #[test]
+    fn failed_application_rolls_back_all_originals() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("existing"), b"original").unwrap();
+        let staged = temp.path().join("staged");
+        fs::write(&staged, b"new").unwrap();
+        let changes = vec![
+            ("existing".into(), Some(staged)),
+            ("missing".into(), Some(temp.path().join("not-present"))),
+        ];
+        assert!(transact(&root, &temp.path().join("tx"), &changes).is_err());
+        assert_eq!(fs::read(root.join("existing")).unwrap(), b"original");
+        assert!(!root.join("missing").exists());
+    }
 }

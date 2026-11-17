@@ -367,8 +367,20 @@ mod tests {
         }
         let mut response = HeaderMap::new();
         response.insert("etag", "\"fixture\"".parse().unwrap());
-        if mode == 0 && range == "bytes=3-" {
-            response.insert("content-range", "bytes 3-5/6".parse().unwrap());
+        if [0, 3, 4].contains(&mode) && range == "bytes=3-" {
+            response.insert(
+                "content-range",
+                if mode == 4 {
+                    "bytes 2-5/6"
+                } else {
+                    "bytes 3-5/6"
+                }
+                .parse()
+                .unwrap(),
+            );
+            if mode == 3 {
+                response.insert("etag", "\"changed\"".parse().unwrap());
+            }
             (StatusCode::PARTIAL_CONTENT, response, "lo\n".to_string())
         } else {
             (StatusCode::OK, response, "hello\n".to_string())
@@ -376,7 +388,7 @@ mod tests {
     }
     #[tokio::test]
     async fn resumes_and_handles_ignored_ranges_and_416() {
-        for mode in 0..3 {
+        for mode in 0..5 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -412,5 +424,48 @@ mod tests {
             assert_eq!(fs::read(&item.target).unwrap(), b"hello\n");
             server.abort();
         }
+    }
+    #[tokio::test]
+    async fn corrupt_transfers_retry_and_duplicate_destinations_download_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new().route(
+            "/file",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "wrong!"
+                    } else {
+                        "hello\n"
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let net = Downloader::new(&layout).unwrap();
+        let item = Download {
+            url: format!("http://{address}/file"),
+            target: temp.path().join("download"),
+            size: Some(6),
+            checksum: Checksum::GitBlob("ce013625030ba8dba906f756967f9e9ca394464a".into()),
+        };
+        net.many(vec![item.clone(), item.clone()], &Job::default())
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        net.get(&item, &Job::default()).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }
