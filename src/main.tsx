@@ -2,11 +2,12 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleAlert, FolderOpen, Gamepad2, HardDrive, LoaderCircle, LogOut, Play, RefreshCw, Server, Settings2, ShieldCheck, UserRound, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleAlert, FolderOpen, Gamepad2, HardDrive, LoaderCircle, LogOut, Play, RefreshCw, Server, Settings2, ShieldCheck, UserRound, Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { JobProgressPanel } from '@/components/job-progress';
+import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
 import { SftpDeploy, type SftpSettings } from '@/components/sftp-deploy';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { highMemoryAboveMib, jvmProfile } from '@/lib/jvm-profile';
@@ -21,14 +22,15 @@ import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;memoryMib:number;microsoftClientId:string;browserLogin:boolean};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string};
-type Operation = 'install'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;serverVersion:{version:string;commit:string}|null;sftp:SftpSettings;eulaAccepted:boolean;dataPath:string;clientPath:string};
+type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'launchInstalled'|'signIn'|'signOut'|'buildServer'|'importLegacy';
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
   const [status,setStatus]=React.useState<Status|null>(null);
   const [error,setError]=React.useState('');
   const [notice,setNotice]=React.useState('');
   const [active,setActive]=React.useState(false);
+  const [confirmReinstall,setConfirmReinstall]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
   const [settings,setSettings]=React.useState<Settings|null>(null);
   const [challenge,setChallenge]=React.useState<{code:string;verificationUri:string;expiresAt:number}|null>(null);
@@ -49,9 +51,9 @@ function App() {
   const busy=active||!!status?.busy||progress?.state==='running'||progress?.state==='cancelling';
   async function run(operation:Operation) {
     setActive(true);setError('');setNotice('');setProgress(null);
-    try {await invoke('run_operation',{operation});await refresh();setNotice((operation==='launch'||operation==='launchInstalled')?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':'All set.');}
+    try {await invoke('run_operation',{operation});await refresh();setNotice((operation==='launch'||operation==='launchInstalled')?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':operation==='forceReinstall'?'Auram was freshly reinstalled.':'All set.');}
     catch(e){setError(String(e));}
-    finally {setActive(false);setChallenge(null);}
+    finally {setActive(false);setChallenge(null);await refresh().catch(()=>{});}
   }
   async function action(name:string,args?:Record<string,unknown>) {try {setError('');await invoke(name,args);await refresh();}catch(e){setError(String(e));}}
   async function save() {if(settings){await action('save_settings',{settings});setNotice('Settings saved.');}}
@@ -81,7 +83,7 @@ function App() {
           </section>
           <div className="detail-grid">
             <Card><CardHeader><CardTitle className="section-title"><ShieldCheck/>Microsoft account</CardTitle><CardDescription>{status?.account?'Ready for your next session.':'Sign in once. Come back and play.'}</CardDescription></CardHeader><CardContent><div className="account-row"><div className="identity-icon"><UserRound/></div><div><strong>{status?.account?.name??'Your adventure starts here'}</strong><p>{status?.account?'Session saved securely on this device':'Use your Minecraft Java account'}</p></div></div><div className="flex gap-2 mt-5"><Button variant="secondary" disabled={busy} onClick={()=>void run('signIn')}>{status?.account?'Change account':'Sign in with Microsoft'}<ArrowRight/></Button>{status?.account&&<Button variant="ghost" size="icon" aria-label="Sign out" disabled={busy} onClick={()=>void run('signOut')}><LogOut/></Button>}</div></CardContent></Card>
-            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Your worlds preserved.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{installed&&<Button variant="ghost" className="justify-between" disabled={busy||running} onClick={()=>void run('launchInstalled')}><span className="flex items-center gap-2"><Play/>Play installed version</span><ChevronRight/></Button>}{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}</CardContent></Card>
+            <Card><CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader><CardContent className="flex flex-col gap-2"><Button variant="outline" className="justify-between" disabled={busy||running||!installed} onClick={()=>void run('install')}><span className="flex items-center gap-2"><RefreshCw/>Check pack updates</span><ChevronRight/></Button><Button variant="ghost" className="justify-between" onClick={()=>void action('open_folder',{folder:'client'})}><span className="flex items-center gap-2"><FolderOpen/>Open game folder</span><ChevronRight/></Button>{installed&&<Button variant="ghost" className="justify-between" disabled={busy||running} onClick={()=>void run('launchInstalled')}><span className="flex items-center gap-2"><Play/>Play installed version</span><ChevronRight/></Button>}{status?.legacyAvailable&&<Button variant="secondary" disabled={busy||running} onClick={()=>void run('importLegacy')}>Import existing Flutter installation</Button>}<Button variant="destructive" className="justify-between mt-2" disabled={busy||running} onClick={()=>setConfirmReinstall(true)}><span className="flex items-center gap-2"><Trash2/>Force reinstall</span><ChevronRight/></Button><p className="text-xs text-muted-foreground">Force reinstall deletes local worlds and all client pack files.</p></CardContent></Card>
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}
@@ -99,6 +101,7 @@ function App() {
       </main>
       <footer className={`activity-bar ${busy?'has-progress':''}`}>{busy?<JobProgressPanel progress={progress} onCancel={()=>void action('cancel_operation')}/>:<><span className="status-dot on"/><span>{running?'Minecraft is running. Closing this window keeps your game open.':'Ready when you are.'}</span><span className="activity-right">AURAM / {status?.pack?.name??'NEW INSTALLATION'}</span></>}</footer>
     </div>
+    <ForceReinstallDialog open={confirmReinstall} onOpenChange={setConfirmReinstall} clientPath={status?.clientPath} busy={busy||running} onConfirm={()=>{setConfirmReinstall(false);void run('forceReinstall');}}/>
     <Dialog open={challenge!==null} onOpenChange={open=>{if(!open){setChallenge(null);void invoke('cancel_operation');}}}>
       <DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Sign in with Microsoft</DialogTitle><DialogDescription>Copy your code, then enter it on Microsoft’s sign-in page. Auram will remember your session securely.</DialogDescription></DialogHeader>
       <div className="rounded-lg border border-zinc-800 bg-black p-6 text-center"><code className="select-all text-3xl font-medium tracking-[.2em] text-violet-200">{challenge?.code}</code></div>

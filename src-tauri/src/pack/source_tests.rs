@@ -225,6 +225,159 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn force_reinstall_deletes_all_client_data_and_reuses_verified_shared_content() {
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[
+            ("minecraft/mods/shared.jar", "shared"),
+            ("minecraft/mods/old.jar", "old"),
+            ("minecraft/config/a.toml", "old config"),
+        ]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    for path in [
+        "saves/world/level.dat",
+        "screenshots/screenshot.png",
+        "options.txt",
+        "resourcepacks/custom.zip",
+        "shaderpacks/custom.zip",
+        "mods/custom.jar",
+    ] {
+        storage::atomic_write(&f.packs.layout.game().join(path), b"user file").unwrap();
+    }
+    // A broken installed-manifest file must not prevent an explicit reset.
+    storage::atomic_write(
+        &f.packs.layout.client().join(".auram-manifest.json"),
+        b"invalid state",
+    )
+    .unwrap();
+    let retained = [
+        f.packs.layout.runtime().join("assets/objects/retained"),
+        f.packs.layout.server().join("world/level.dat"),
+        f.packs.layout.state("settings.json"),
+        f.packs.layout.root.join("downloads/retained.part"),
+    ];
+    for path in &retained {
+        storage::atomic_write(path, b"retained").unwrap();
+    }
+    let target = f.snapshot(
+        "145",
+        files(&[
+            ("minecraft/mods/shared.jar", "shared"),
+            ("minecraft/mods/new.jar", "new"),
+            ("minecraft/config/a.toml", "fresh config"),
+        ]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/old.jar".into(),
+            "+minecraft/mods/new.jar".into(),
+            "*minecraft/config/a.toml".into(),
+        ]),
+    );
+    f.latest(&target);
+    f.clear_requests();
+    let installed = f.packs.force_reinstall(&Job::default()).await.unwrap();
+    assert_eq!(installed.tag.sha, target.sha);
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("mods/new.jar")).unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("config/a.toml")).unwrap(),
+        b"fresh config"
+    );
+    for path in [
+        "saves",
+        "screenshots",
+        "options.txt",
+        "resourcepacks",
+        "shaderpacks",
+        "mods/custom.jar",
+        "mods/old.jar",
+    ] {
+        assert!(
+            !f.packs.layout.game().join(path).exists(),
+            "{path} survived the reset"
+        );
+    }
+    for path in retained {
+        assert_eq!(fs::read(path).unwrap(), b"retained");
+    }
+    assert!(
+        f.payloads().iter().all(|p| !p.ends_with("shared.jar")),
+        "Unchanged cached jar was fetched again"
+    );
+    assert!(!f.packs.layout.client_reset_pending().unwrap());
+}
+
+#[tokio::test]
+async fn failed_force_reinstall_leaves_no_old_install_pointer_and_can_retry_fresh() {
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/old.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    storage::atomic_write(
+        &f.packs.layout.game().join("saves/world/level.dat"),
+        b"world",
+    )
+    .unwrap();
+    let target = f.snapshot(
+        "145",
+        files(&[("minecraft/mods/new.jar", "new")]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/old.jar".into(),
+            "+minecraft/mods/new.jar".into(),
+        ]),
+    );
+    f.latest(&target);
+    let path = format!("/raw/{}/minecraft/mods/new.jar", target.sha);
+    let body = f.state.lock().unwrap().bodies.remove(&path).unwrap();
+    assert!(f.packs.force_reinstall(&Job::default()).await.is_err());
+    assert!(f.packs.installed().unwrap().is_none());
+    assert!(!f.packs.layout.game().join("saves/world/level.dat").exists());
+    f.state.lock().unwrap().bodies.insert(path, body);
+    assert_eq!(
+        f.packs
+            .update(false, &Job::default())
+            .await
+            .unwrap()
+            .tag
+            .sha,
+        target.sha
+    );
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("mods/new.jar")).unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_before_force_reinstall_keeps_existing_client_files() {
+    let f = Fixture::new().await;
+    storage::atomic_write(
+        &f.packs.layout.game().join("saves/world/level.dat"),
+        b"world",
+    )
+    .unwrap();
+    let job = Job::default();
+    job.cancel.cancel();
+    assert!(f.packs.force_reinstall(&job).await.is_err());
+    assert_eq!(
+        fs::read(f.packs.layout.game().join("saves/world/level.dat")).unwrap(),
+        b"world"
+    );
+    assert!(!f.packs.layout.client_reset_pending().unwrap());
+}
+
+#[tokio::test]
 async fn server_deploy_composes_skipped_changelists_and_preserves_disabled_jar_renames() {
     use crate::deploy::{self, tests::DiskRemote, Baseline, OwnedFile};
     use crate::server::ServerVersion;

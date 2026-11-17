@@ -38,6 +38,7 @@ impl Core {
             "pass",
             "Native application started with isolated QA data",
         );
+        layout.resume_client_reset()?;
         storage::recover(&layout.client(), &layout.state("client-transaction"))?;
         storage::recover(&layout.server(), &layout.state("server-transaction"))?;
         let settings = storage::read_optional(&layout.state("settings.json"))?.unwrap_or_default();
@@ -92,6 +93,7 @@ pub struct Status {
     sftp: ConnectionSettings,
     eula_accepted: bool,
     data_path: String,
+    client_path: String,
 }
 fn status(core: &Core) -> Result<Status> {
     let account = core.auth.profile();
@@ -118,6 +120,7 @@ fn status(core: &Core) -> Result<Status> {
         sftp: ConnectionSettings::load(&core.layout)?,
         eula_accepted: eula.lines().any(|line| line.trim() == "eula=true"),
         data_path: core.layout.root.display().to_string(),
+        client_path: core.layout.client().display().to_string(),
     })
 }
 #[tauri::command]
@@ -136,6 +139,7 @@ fn retry_initialize(backend: tauri::State<Backend>) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 enum Operation {
     Install,
+    ForceReinstall,
     Repair,
     Launch,
     LaunchInstalled,
@@ -162,11 +166,16 @@ impl Operation {
             ]
         };
         match self {
-            Self::Install | Self::Repair => {
+            Self::Install | Self::Repair | Self::ForceReinstall => {
                 let mut phases = pack();
+                if matches!(self, Self::ForceReinstall) {
+                    phases.insert(0, PhaseSpec("client-reset", "Delete client pack", false));
+                }
                 phases.extend(runtime());
                 (
-                    if matches!(self, Self::Repair) {
+                    if matches!(self, Self::ForceReinstall) {
+                        "Reinstalling Auram"
+                    } else if matches!(self, Self::Repair) {
                         "Repairing Auram"
                     } else {
                         "Preparing Auram"
@@ -230,6 +239,7 @@ async fn run_operation(
             && matches!(
                 operation,
                 Operation::Install
+                    | Operation::ForceReinstall
                     | Operation::Repair
                     | Operation::Launch
                     | Operation::LaunchInstalled
@@ -239,6 +249,7 @@ async fn run_operation(
         {
             bail!("Close Minecraft before changing its installation");
         }
+        // Force reinstall discards the previous client journal during its reset.
         if matches!(
             operation,
             Operation::Install
@@ -248,6 +259,8 @@ async fn run_operation(
                 | Operation::BuildServer
                 | Operation::ImportLegacy
         ) {
+            let layout = core.layout.clone();
+            tokio::task::spawn_blocking(move || layout.resume_client_reset()).await??;
             // A prior activation can fail to roll back while Windows holds a file lock.
             // Recover before reading version metadata, including the offline launch path.
             storage::recover(
@@ -266,6 +279,12 @@ async fn run_operation(
                 core.packs.update(false, job).await?;
                 let versions = Versions::read(&core.layout.client())?;
                 core.runtime.ensure(versions, job).await?;
+            }
+            Operation::ForceReinstall => {
+                core.packs.force_reinstall(job).await?;
+                core.runtime
+                    .ensure(Versions::read(&core.layout.client())?, job)
+                    .await?;
             }
             Operation::Repair => {
                 core.packs.update(true, job).await?;

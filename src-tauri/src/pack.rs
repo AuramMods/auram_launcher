@@ -76,6 +76,9 @@ impl Packs {
         Source::new(self)
     }
     pub fn installed(&self) -> Result<Option<Manifest>> {
+        if self.layout.client_reset_pending()? {
+            return Ok(None);
+        }
         storage::read_optional(&self.layout.client().join(".auram-manifest.json"))
     }
     pub async fn latest(&self) -> Result<PackTag> {
@@ -167,6 +170,8 @@ impl Packs {
         Ok(result)
     }
     pub async fn update(&self, repair: bool, job: &Job) -> Result<Manifest> {
+        let layout = self.layout.clone();
+        tokio::task::spawn_blocking(move || layout.resume_client_reset()).await??;
         job.phase("pack-plan", "Read pack", false);
         storage::recover(
             &self.layout.client(),
@@ -210,6 +215,25 @@ impl Packs {
             changed.as_ref(),
         )
         .await
+    }
+    pub async fn force_reinstall(&self, job: &Job) -> Result<Manifest> {
+        job.check()?;
+        job.phase("client-reset", "Delete client pack", false);
+        job.progress(
+            "client-reset",
+            "Deleting the entire client pack, including local worlds and custom files",
+            0,
+            0,
+        );
+        let layout = self.layout.clone();
+        // Cancellation is deferred once the persistent deletion intent is written.
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            layout.begin_client_reset()?;
+            layout.resume_client_reset()
+        })
+        .await??;
+        job.check()?;
+        self.update(false, job).await
     }
     pub async fn reconcile(
         &self,

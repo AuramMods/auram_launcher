@@ -22,6 +22,14 @@ All downloaded files are size/hash checked before activation. Git's blob SHA-1 i
 
 Transactions back up originals, delete obsolete owned files before installing replacements, handle file/directory transitions, and activate the manifest last. Unknown files blocking a transition cause rollback. Recovery removes staged files before restoring old parent files; it never recursively deletes user directories to make an update fit. Modified managed files also receive retained backups. Worlds, screenshots, local mods and shared Java/Mojang/Forge resources remain preserved.
 
+## Explicit force reinstall
+
+**Force reinstall** under **Your installation** is a separate destructive operation. Its confirmation names the client directory and warns that all local client files are permanently deleted, including worlds, screenshots, options, resource/shader packs, custom mods, and the installed manifest. It then installs the currently published pack into the empty client instance and verifies its Java/Minecraft/Forge resources. Valid shared cache content is reused instead of downloaded again.
+
+This action retains launcher settings, Microsoft credentials, SFTP connection details, local/remote server data, shared caches, partial downloads, and earlier retained backups. Cancellation or a failed reinstall does not restore deleted client data. If installation fails after deletion, the UI shows the client as uninstalled so **Install Auram** can retry a fresh install.
+
+A persistent deletion intent is written before removal. If deletion is interrupted, it is resumed before any older client installation journal can replay files. A pending reset never counts as an installed pack. The intent is cleared only after the client and its old transaction data are removed and an empty instance directory is ready. Reset completion is idempotent and cannot erase a later installation on subsequent launches. Deletion never follows symlinks to external user data. Ordinary updates and repair retain their preservation behavior above.
+
 ## Verification
 
 Run basic checks locally:

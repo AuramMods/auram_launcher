@@ -117,6 +117,10 @@ pub fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 pub struct Layout {
     pub root: PathBuf,
 }
+#[derive(Serialize, Deserialize)]
+struct ClientReset {
+    schema: u32,
+}
 impl Layout {
     pub fn discover() -> Result<Self> {
         let base = directories::BaseDirs::new().context("Unable to locate application data")?;
@@ -167,6 +171,39 @@ impl Layout {
     }
     pub fn state(&self, name: &str) -> PathBuf {
         self.root.join("state").join(name)
+    }
+    /// Only the explicit destructive reinstall action creates this intent.
+    pub fn begin_client_reset(&self) -> Result<()> {
+        safe_join(&self.root, "client")?;
+        let marker = safe_join(&self.root, "state/client-reset.json")?;
+        write_json(&marker, &ClientReset { schema: 1 })
+    }
+    pub fn client_reset_pending(&self) -> Result<bool> {
+        Ok(
+            read_optional::<ClientReset>(&safe_join(&self.root, "state/client-reset.json")?)?
+                .is_some(),
+        )
+    }
+    /// Finish an authorized deletion before any old install journal can restore files.
+    /// Keeping the intent until cleanup completes also makes partial deletion restartable.
+    pub fn resume_client_reset(&self) -> Result<()> {
+        let marker = safe_join(&self.root, "state/client-reset.json")?;
+        let Some(reset) = read_optional::<ClientReset>(&marker)? else {
+            return Ok(());
+        };
+        if reset.schema != 1 {
+            bail!("Unsupported client reset schema");
+        }
+        let client = safe_join(&self.root, "client")?;
+        remove_reset_directory(&client).context(
+            "Delete the client pack; close Minecraft and any programs using its files, then retry",
+        )?;
+        let transaction = safe_join(&self.root, "state/client-transaction")?;
+        remove_reset_directory(&transaction)
+            .context("Remove the previous client installation journal")?;
+        fs::create_dir_all(&client)?;
+        fs::remove_file(marker)?;
+        Ok(())
     }
     pub fn legacy_candidates() -> Vec<PathBuf> {
         let Some(base) = directories::BaseDirs::new() else {
@@ -221,6 +258,37 @@ impl Layout {
             &marker,
             &serde_json::json!({"schema":1,"source":source,"completed":chrono::Utc::now()}),
         )
+    }
+}
+
+fn remove_reset_directory(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        #[cfg(windows)]
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Retry an actual Windows deletion failure caused by read-only files.
+            // Never follow symlinks/reparse points to change external permissions.
+            for entry in walkdir::WalkDir::new(path).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(path)?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let file = safe_join(path, &relative)?;
+                    let mut permissions = fs::metadata(&file)?.permissions();
+                    if permissions.readonly() {
+                        permissions.set_readonly(false);
+                        fs::set_permissions(file, permissions)?;
+                    }
+                }
+            }
+            fs::remove_dir_all(path)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
 pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Result<()> {
@@ -437,6 +505,95 @@ fn remove_empty_parents(root: &Path, file: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_reset_resumes_after_restart_and_cannot_replay_old_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().join("Auram with spaces 世界")).unwrap();
+        atomic_write(&layout.game().join("saves/world/level.dat"), b"world").unwrap();
+        atomic_write(&layout.game().join("mods/custom.jar"), b"custom").unwrap();
+        atomic_write(
+            &layout.client().join(".auram-manifest.json"),
+            b"old baseline",
+        )
+        .unwrap();
+        atomic_write(
+            &layout.state("client-transaction/journal.json"),
+            b"incomplete old journal",
+        )
+        .unwrap();
+        atomic_write(
+            &layout.state("client-transaction/original/mods/old.jar"),
+            b"old",
+        )
+        .unwrap();
+        let retained = [
+            layout.server().join("world/level.dat"),
+            layout.runtime().join("assets/objects/asset"),
+            layout.root.join("downloads/content.part"),
+            layout.state("settings.json"),
+            layout.state("sftp-connection.json"),
+            layout.root.join("backups/retained"),
+        ];
+        for path in &retained {
+            atomic_write(path, b"retained").unwrap();
+        }
+        layout.begin_client_reset().unwrap();
+        // Simulate application termination partway through deletion.
+        fs::remove_file(layout.game().join("mods/custom.jar")).unwrap();
+        let restarted = Layout::new(layout.root.clone()).unwrap();
+        assert!(restarted.client_reset_pending().unwrap());
+        restarted.resume_client_reset().unwrap();
+        recover(&restarted.client(), &restarted.state("client-transaction")).unwrap();
+        assert_eq!(fs::read_dir(restarted.client()).unwrap().count(), 0);
+        assert!(!restarted.state("client-transaction").exists());
+        assert!(!restarted.client_reset_pending().unwrap());
+        for path in retained {
+            assert_eq!(fs::read(path).unwrap(), b"retained");
+        }
+        atomic_write(&restarted.game().join("fresh.txt"), b"new installation").unwrap();
+        restarted.resume_client_reset().unwrap();
+        assert_eq!(
+            fs::read(restarted.game().join("fresh.txt")).unwrap(),
+            b"new installation"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn client_reset_removes_windows_readonly_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let path = layout.game().join("config/readonly.toml");
+        atomic_write(&path, b"config").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        layout.begin_client_reset().unwrap();
+        layout.resume_client_reset().unwrap();
+        assert!(!path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn client_reset_does_not_follow_links_to_external_user_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().join("app")).unwrap();
+        let outside = temp.path().join("external");
+        atomic_write(&outside.join("world/level.dat"), b"external world").unwrap();
+        symlink(&outside, layout.client().join("external-worlds")).unwrap();
+        layout.begin_client_reset().unwrap();
+        layout.resume_client_reset().unwrap();
+        assert_eq!(
+            fs::read(outside.join("world/level.dat")).unwrap(),
+            b"external world"
+        );
+        fs::remove_dir(layout.client()).unwrap();
+        symlink(&outside, layout.client()).unwrap();
+        assert!(layout.begin_client_reset().is_err());
+        assert_eq!(
+            fs::read(outside.join("world/level.dat")).unwrap(),
+            b"external world"
+        );
+    }
     #[test]
     fn transactions_handle_file_directory_transitions_and_preserve_blocking_user_files() {
         let temp = tempfile::tempdir().unwrap();
