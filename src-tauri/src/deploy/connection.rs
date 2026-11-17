@@ -1,4 +1,7 @@
-use super::safe_path;
+use super::{
+    adaptive::{Retry, Slots, MAX_CONNECTIONS},
+    safe_path,
+};
 use crate::{
     jobs::{Job, TaskState},
     storage::{self, Layout},
@@ -17,7 +20,10 @@ use sha1::Digest;
 use std::{
     future::Future,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,6 +172,7 @@ pub struct SftpRemote {
     session: SftpSession,
     ssh: client::Handle<Handler>,
     root: String,
+    closed: AtomicBool,
 }
 pub(crate) async fn wait<T>(
     job: &Job,
@@ -190,6 +197,7 @@ pub async fn connect(
     let config = client::Config {
         inactivity_timeout: Some(Duration::from_secs(90)),
         keepalive_interval: Some(Duration::from_secs(15)),
+        nodelay: true,
         ..Default::default()
     };
     let attempt = tokio::select! {_=job.cancel.cancelled()=>bail!("Connection cancelled"),v=tokio::time::timeout(Duration::from_secs(25),client::connect(Arc::new(config),(settings.host.as_str(),settings.port),Handler {expected:settings.fingerprint.clone(),observed:observed.clone()}))=>v.context("SSH connection timed out")?};
@@ -266,16 +274,24 @@ pub async fn connect(
         session,
         ssh,
         root: root.trim_end_matches('/').into(),
+        closed: AtomicBool::new(false),
     })
 }
 impl SftpRemote {
     pub async fn close(self) {
+        self.disconnect().await;
+    }
+    async fn disconnect(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
-            let _ = self.session.close().await;
+            // Release the actual SSH connection even if SFTP shutdown stalls.
             let _ = self
                 .ssh
                 .disconnect(russh::Disconnect::ByApplication, "Auram finished", "en")
                 .await;
+            let _ = self.session.close().await;
         })
         .await;
     }
@@ -283,10 +299,25 @@ impl SftpRemote {
         safe_path(p)?;
         Ok(format!("{}/{p}", self.root))
     }
-    async fn guarded(&self, p: &str) -> Result<String> {
+    async fn guarded_parent(&self, p: &str) -> Result<String> {
         let full = self.path(p)?;
+        let Some((parent, _)) = p.rsplit_once('/') else {
+            return Ok(full);
+        };
+        let expected = self.path(parent)?;
+        // REALPATH resolves all ancestors in one request, instead of one
+        // LSTAT per component for every tiny file. Recheck on every operation;
+        // do not cache remote path safety or trust externally mutable aliases.
+        match self.session.canonicalize(&expected).await {
+            Ok(actual) if actual.trim_end_matches('/') == expected => return Ok(full),
+            Ok(_) => bail!("Refusing a remote directory symlink or alias: {parent}"),
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Parents() also examines not-yet-created paths. Validate the existing
+        // prefix normally until the first genuinely absent component.
         let mut partial = String::new();
-        for piece in p.split('/') {
+        for piece in parent.split('/') {
             if !partial.is_empty() {
                 partial.push('/');
             }
@@ -297,40 +328,130 @@ impl SftpRemote {
                 }
                 Ok(_) => {}
                 Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => break,
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(full)
     }
+    async fn guarded(&self, p: &str) -> Result<String> {
+        let full = self.guarded_parent(p).await?;
+        match self.session.symlink_metadata(&full).await {
+            Ok(meta) if meta.is_symlink() => bail!("Refusing to follow a remote symlink: {p}"),
+            Ok(_) => {}
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(full)
+    }
 }
-/// Metadata and activation use the primary connection. Independent SSH/SFTP
-/// transports carry up to eight file uploads, rather than one shared channel.
+/// Metadata operations use a surviving control connection. Private staged
+/// uploads start with twenty transports and retire failed/limited slots.
 pub struct SftpPool {
     remotes: Vec<SftpRemote>,
-    slots: Mutex<Vec<usize>>,
-    available: tokio::sync::Semaphore,
-}
-struct UploadSlot<'a> {
-    pool: &'a SftpPool,
-    index: usize,
-    _permit: tokio::sync::SemaphorePermit<'a>,
-}
-impl Drop for UploadSlot<'_> {
-    fn drop(&mut self) {
-        self.pool
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(self.index);
-    }
+    slots: Slots,
+    read_job: Job,
 }
 impl SftpPool {
     pub fn connection_count(&self) -> usize {
-        self.remotes.len()
+        self.slots.count()
+    }
+    fn control(&self) -> Result<&SftpRemote> {
+        Ok(&self.remotes[self.slots.control()?])
     }
     pub async fn close(self) {
         futures_util::future::join_all(self.remotes.into_iter().map(SftpRemote::close)).await;
     }
+}
+/// Interpret actual protocol/transport failures. Permission, disk/integrity,
+/// authentication and host-key failures must never become concurrency retries.
+fn retry_kind(error: &anyhow::Error) -> Retry {
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<SftpError>() {
+            if matches!(error, SftpError::Status(s) if s.status_code==StatusCode::PermissionDenied)
+            {
+                return Retry::Never;
+            }
+            match error {
+                SftpError::Timeout => return Retry::Disconnected,
+                SftpError::UnexpectedBehavior(message)
+                    if message == "sender dropped"
+                        || message.starts_with("SendError:")
+                        || message.starts_with("RecvError:") =>
+                {
+                    return Retry::Disconnected
+                }
+                SftpError::Status(s)
+                    if matches!(
+                        s.status_code,
+                        StatusCode::ConnectionLost | StatusCode::NoConnection
+                    ) =>
+                {
+                    return Retry::Disconnected
+                }
+                _ => {}
+            }
+        }
+        if let Some(error) = cause.downcast_ref::<russh::Error>() {
+            match error {
+                russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::ResourceShortage) => {
+                    return Retry::Limit
+                }
+                russh::Error::HUP
+                | russh::Error::Disconnect
+                | russh::Error::ConnectionTimeout
+                | russh::Error::KeepaliveTimeout
+                | russh::Error::InactivityTimeout
+                | russh::Error::SendError => return Retry::Disconnected,
+                _ => {}
+            }
+        }
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+            ) {
+                return Retry::Disconnected;
+            }
+        }
+    }
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if [
+        "too many connections",
+        "too many concurrent connections",
+        "connection limit",
+        "maximum connections",
+        "max connections",
+        "too many sessions",
+        "too many open files",
+        "resource shortage",
+        "maxstartups",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+    {
+        return Retry::Limit;
+    }
+    if [
+        "broken pipe",
+        "connection reset",
+        "connection closed",
+        "connection lost",
+        "channel closed",
+        "unexpected eof on stream",
+        "senderror:",
+        "recverror:",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+    {
+        return Retry::Disconnected;
+    }
+    Retry::Never
 }
 pub async fn connect_pool(
     settings: &ConnectionSettings,
@@ -340,32 +461,62 @@ pub async fn connect_pool(
     use futures_util::StreamExt;
     job.progress(
         "sftp-connect",
-        "Opening up to eight SSH/SFTP connections",
+        "Opening twenty SSH/SFTP connections",
         0,
-        0,
+        MAX_CONNECTIONS as u64,
     );
     let primary = connect(settings, secret, job).await?;
-    let additional = futures_util::stream::iter(0..7)
-        .map(|_| connect(settings, secret, job))
-        .buffer_unordered(7)
-        .collect::<Vec<_>>()
-        .await;
+    let root = primary.root.clone();
     let mut remotes = vec![primary];
-    for result in additional {
-        match result {
-            Ok(remote) => remotes.push(remote),
-            Err(error) if error.downcast_ref::<HostKeyNeeded>().is_some() => {
-                futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
-                return Err(error);
+    let mut missing = MAX_CONNECTIONS - 1;
+    for round in 0..3 {
+        let parallel = if round == 0 { MAX_CONNECTIONS - 1 } else { 4 };
+        let attempts = futures_util::stream::iter(0..missing)
+            .map(|_| connect(settings, secret, job))
+            .buffer_unordered(parallel)
+            .collect::<Vec<_>>()
+            .await;
+        let mut retry = 0;
+        let mut fatal = None;
+        for result in attempts {
+            match result {
+                Ok(remote) if remote.root == root => remotes.push(remote),
+                Ok(remote) => {
+                    remote.close().await;
+                    fatal = Some(anyhow::anyhow!(
+                        "SFTP connections resolved different server directories"
+                    ));
+                }
+                Err(error) if error.is::<HostKeyNeeded>() => fatal = Some(error),
+                Err(error) => {
+                    if retry_kind(&error) != Retry::Never {
+                        retry += 1;
+                    }
+                }
             }
-            // Some providers cap simultaneous SSH sessions. Use connections
-            // that actually succeeded, rather than guessing their limits.
-            Err(_) => {}
         }
-    }
-    if let Err(error) = job.check() {
-        futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
-        return Err(error);
+        if let Some(error) = fatal {
+            futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
+            return Err(error);
+        }
+        if let Err(error) = job.check() {
+            futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;
+            return Err(error);
+        }
+        if retry == 0 || round == 2 {
+            break;
+        }
+        missing = retry;
+        job.progress(
+            "sftp-connect",
+            format!(
+                "{} connections accepted; retrying server-limited connections",
+                remotes.len()
+            ),
+            remotes.len() as u64,
+            MAX_CONNECTIONS as u64,
+        );
+        tokio::select! {_=job.cancel.cancelled()=>{futures_util::future::join_all(remotes.into_iter().map(SftpRemote::close)).await;bail!("SFTP connection cancelled");},_=tokio::time::sleep(Duration::from_millis(200*(1<<round)))=>{}}
     }
     job.progress(
         "sftp-connect",
@@ -373,14 +524,17 @@ pub async fn connect_pool(
             "{} SFTP connections ready for parallel uploads",
             remotes.len()
         ),
-        1,
-        1,
+        remotes.len() as u64,
+        MAX_CONNECTIONS as u64,
     );
-    let count = remotes.len();
+    let slots = Slots::new(remotes.len());
+    // Rollback reads must remain usable after the operation is cancelled.
+    let mut read_job = job.clone();
+    read_job.cancel = tokio_util::sync::CancellationToken::new();
     Ok(SftpPool {
         remotes,
-        slots: Mutex::new((0..count).collect()),
-        available: tokio::sync::Semaphore::new(count),
+        slots,
+        read_job,
     })
 }
 #[derive(Clone, Debug)]
@@ -411,7 +565,7 @@ impl Remote for SftpRemote {
     async fn stat(&self, path: &str) -> Result<Option<Attrs>> {
         match self
             .session
-            .symlink_metadata(self.guarded(path).await?)
+            .symlink_metadata(self.guarded_parent(path).await?)
             .await
         {
             Ok(m) => Ok(Some(Attrs {
@@ -485,11 +639,18 @@ impl Remote for SftpRemote {
         let mut task = job.task(label, label, Some(size));
         let result = async {
             let mut source = tokio::fs::File::open(local).await?;
+            let full = wait(
+                job,
+                "validating the upload path",
+                Duration::from_secs(30),
+                self.guarded(path),
+            )
+            .await?;
             let mut file = wait(
                 job,
                 &format!("opening upload {label}"),
                 Duration::from_secs(30),
-                async { Ok(self.session.create(self.guarded(path).await?).await?) },
+                async { Ok(self.session.create(&full).await?) },
             )
             .await?;
             let mut buffer = vec![0u8; 65536];
@@ -525,14 +686,9 @@ impl Remote for SftpRemote {
             )
             .await?;
             task.state(TaskState::Verifying, 0);
-            if self
-                .stat(path)
-                .await?
-                .context("Uploaded file missing")?
-                .size
-                != size
-            {
-                bail!("Uploaded file size mismatch: {label}");
+            let uploaded = self.session.symlink_metadata(&full).await?;
+            if uploaded.is_dir() || uploaded.is_symlink() || uploaded.size != Some(size) {
+                bail!("Uploaded file size/type mismatch: {label}");
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -571,51 +727,72 @@ impl Remote for SftpRemote {
 }
 
 impl Remote for SftpPool {
+    // Metadata/rollback requests stay independent of the upload cancellation
+    // token, so cancellation cannot prevent restoration of the previous pack.
     async fn stat(&self, p: &str) -> Result<Option<Attrs>> {
-        self.remotes[0].stat(p).await
+        self.slots
+            .run(
+                &self.read_job,
+                |index| self.remotes[index].stat(p),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn list(&self, p: &str) -> Result<Vec<(String, Attrs)>> {
-        self.remotes[0].list(p).await
+        self.slots
+            .run(
+                &self.read_job,
+                |index| self.remotes[index].list(p),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn read(&self, p: &str, n: u64) -> Result<Vec<u8>> {
-        self.remotes[0].read(p, n).await
+        self.slots
+            .run(
+                &self.read_job,
+                |index| self.remotes[index].read(p, n),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn hash(&self, p: &str) -> Result<String> {
-        self.remotes[0].hash(p).await
+        self.slots
+            .run(
+                &self.read_job,
+                |index| self.remotes[index].hash(p),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn upload(&self, local: &Path, p: &str, label: &str, job: &Job) -> Result<()> {
-        let permit = tokio::select! {
-            biased;
-            _=job.cancel.cancelled()=>bail!("SFTP upload cancelled"),
-            permit=self.available.acquire()=>permit.context("SFTP upload pool closed")?,
-        };
-        let index = self
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .context("SFTP connection slot unavailable")?;
-        let slot = UploadSlot {
-            pool: self,
-            index,
-            _permit: permit,
-        };
-        self.remotes[slot.index].upload(local, p, label, job).await
+        self.slots
+            .run(
+                job,
+                |index| self.remotes[index].upload(local, p, label, job),
+                |index| self.remotes[index].disconnect(),
+                retry_kind,
+            )
+            .await
     }
     async fn write(&self, p: &str, b: &[u8]) -> Result<()> {
-        self.remotes[0].write(p, b).await
+        self.control()?.write(p, b).await
     }
     async fn mkdir(&self, p: &str) -> Result<()> {
-        self.remotes[0].mkdir(p).await
+        self.control()?.mkdir(p).await
     }
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        self.remotes[0].rename(from, to).await
+        self.control()?.rename(from, to).await
     }
     async fn remove(&self, p: &str) -> Result<()> {
-        self.remotes[0].remove(p).await
+        self.control()?.remove(p).await
     }
     async fn rmdir(&self, p: &str) -> Result<()> {
-        self.remotes[0].rmdir(p).await
+        self.control()?.rmdir(p).await
     }
 }
 
@@ -634,4 +811,81 @@ pub async fn parents(remote: &impl Remote, path: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn status(code: StatusCode, message: &str) -> anyhow::Error {
+        SftpError::Status(russh_sftp::protocol::Status {
+            id: 1,
+            status_code: code,
+            error_message: message.into(),
+            language_tag: String::new(),
+        })
+        .into()
+    }
+    #[test]
+    fn actual_protocol_limits_back_off_but_permissions_and_integrity_errors_do_not() {
+        assert_eq!(
+            retry_kind(
+                &anyhow::Error::from(SftpError::UnexpectedBehavior("sender dropped".into()))
+                    .context("validating upload path")
+            ),
+            Retry::Disconnected
+        );
+        assert_eq!(
+            retry_kind(
+                &std::io::Error::other(SftpError::UnexpectedBehavior(
+                    "RecvError: channel closed".into()
+                ))
+                .into()
+            ),
+            Retry::Disconnected
+        );
+        assert_eq!(
+            retry_kind(&status(
+                StatusCode::Failure,
+                "Too many concurrent connections"
+            )),
+            Retry::Limit
+        );
+        assert_eq!(
+            retry_kind(&status(
+                StatusCode::PermissionDenied,
+                "Too many connections"
+            )),
+            Retry::Never
+        );
+        assert_eq!(
+            retry_kind(&status(StatusCode::Failure, "No space left on device")),
+            Retry::Never
+        );
+        assert_eq!(
+            retry_kind(
+                &russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::ResourceShortage)
+                    .into()
+            ),
+            Retry::Limit
+        );
+        assert_eq!(retry_kind(&russh::Error::HUP.into()), Retry::Disconnected);
+        assert_eq!(
+            retry_kind(&std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()),
+            Retry::Disconnected
+        );
+        assert_eq!(
+            retry_kind(&anyhow::anyhow!("Uploaded file size mismatch")),
+            Retry::Never
+        );
+        assert_eq!(
+            retry_kind(
+                &HostKeyNeeded {
+                    fingerprint: "changed".into(),
+                    changed: true
+                }
+                .into()
+            ),
+            Retry::Never
+        );
+    }
 }

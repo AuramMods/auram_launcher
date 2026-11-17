@@ -505,7 +505,7 @@ async fn same_version_reads_only_version_and_lock_without_listing_or_hashing() {
 }
 
 #[tokio::test]
-async fn directory_replacement_schedules_eight_uploads_and_clears_empty_roots() {
+async fn directory_replacement_schedules_twenty_uploads_and_reports_preparation_and_activation() {
     let (_temp, packs) = packs();
     let remote = DiskRemote::new();
     let names = (0..20)
@@ -520,8 +520,47 @@ async fn directory_replacement_schedules_eight_uploads_and_clears_empty_roots() 
     remote.put("kubejs/old.js", b"old");
     remote.slow_uploads.store(true, Ordering::SeqCst);
     let plan = inspect(&packs, &remote, &Job::default()).await.unwrap();
-    apply(&packs, &remote, plan, &Job::default()).await.unwrap();
-    assert_eq!(remote.peak_uploads.load(Ordering::SeqCst), 8);
+    let snapshots = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink = snapshots.clone();
+    let job = Job::new(
+        "Deploying server",
+        &[],
+        std::sync::Arc::new(move |progress| sink.lock().unwrap().push(progress)),
+    );
+    apply(&packs, &remote, plan, &job).await.unwrap();
+    assert_eq!(remote.peak_uploads.load(Ordering::SeqCst), MAX_CONNECTIONS);
+    let snapshots = snapshots.lock().unwrap();
+    for id in [
+        "sftp-destination",
+        "sftp-stage",
+        "sftp-validate",
+        "sftp-apply",
+    ] {
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.phases.iter().any(|phase| phase.id == id
+                    && phase.total > 0
+                    && phase.completed == phase.total)),
+            "No complete count emitted for {id}"
+        );
+    }
+    let prepared = snapshots
+        .iter()
+        .position(|snapshot| {
+            snapshot.phases.iter().any(|phase| {
+                phase.id == "sftp-stage" && phase.total > 0 && phase.completed == phase.total
+            })
+        })
+        .unwrap();
+    let uploading = snapshots
+        .iter()
+        .position(|snapshot| snapshot.uploaded_bytes > 0)
+        .unwrap();
+    assert!(
+        prepared < uploading,
+        "Directory preparation must be visible before file uploads"
+    );
     assert!(remote.get("scripts/old.zs").is_none());
     assert!(remote.get("kubejs/old.js").is_none());
     assert!(remote.root.path().join("mods").is_dir());

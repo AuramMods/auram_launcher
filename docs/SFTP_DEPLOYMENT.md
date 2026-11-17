@@ -33,7 +33,11 @@ Jars named `mods/example.jar` and `mods/example.jar.client` have one canonical i
 
 Stop the remote server before deployment. SFTP cannot stop or restart Minecraft. No remote shell commands are executed.
 
-The launcher reconnects and rebuilds its plan when deployment starts. A nonempty journal directory is atomically renamed into the deployment lock; an existing nonempty lock cannot be overwritten. All required payload bodies are fetched through the verified cache and uploaded to private staging paths before activation. Mods are queued first, with up to eight uploads on eight separate SSH/SFTP connections. If a provider actually rejects extra connections, successfully established connections remain usable. SSH host-key changes remain errors. Connection setup, metadata requests and upload I/O have cancellation and timeout handling; closing a session is bounded too. SSH authenticates transport integrity; completed SFTP writes and remote sizes are checked. The live verification harness additionally reads uploaded bodies back and checks their Git blob hashes.
+The launcher reconnects and rebuilds its plan when deployment starts. A nonempty journal directory is atomically renamed into the deployment lock; an existing nonempty lock cannot be overwritten. All required payload bodies are fetched through the verified cache and uploaded to private staging paths before activation. Mods are queued first. Every deployment initially attempts twenty independent SSH/SFTP connections, with brief retries for rejected/closed setup connections. If the provider rejects extra connections, successfully established connections remain usable. If an actual connection-limit response or transport closure occurs during upload, the failing slot is retired and its SSH transport is closed. Its private staged file is retried with backoff on a surviving slot; healthy uploads have no artificial delay. A new deployment tries twenty again. Permission, authentication, host-key, disk and integrity failures do not become concurrency retries. Losing every transport fails with retained recovery state. SSH host-key changes remain errors. Connection setup, metadata requests and upload I/O have cancellation and timeout handling; closing a session is bounded too. SSH authenticates transport integrity; completed SFTP writes and remote sizes are checked. The live verification harness additionally reads uploaded bodies back and checks their Git blob hashes.
+
+Destination checks and staging-directory creation run in bounded parallel batches and report completed/total counts before uploads. The transfer file/byte bar starts only once directories are ready. Destination revalidation, replacing/removing obsolete files, and interrupted-deployment recovery also report counts; completed/skipped step segments are hidden. Full deployment moves the old directories into retained backups instead of recursively deleting thousands of files.
+
+TCP_NODELAY is enabled. Ancestor safety checks use one server-side canonical-path resolution per parent, with leaf symlink/type checks, instead of issuing an LSTAT for every ancestor on every file. Nonexistent parents retain the checked-prefix fallback; permission errors and symlink/alias paths remain errors. Paths are checked afresh rather than cached. The final upload size/type check reuses the validated name. Cached local pack blobs are checksum-verified once per lookup instead of twice. File close acknowledgements, remote size/type checks, and fsync behavior are retained.
 
 Activation retains originals before replacing/removing changed files or swapping the four fully staged directories. Each mutation has a persistent start marker, allowing recovery even when a request succeeded but its acknowledgement was lost. Ownership is written near the end and `auram.json` is installed last. Cancellation is deferred during activation/restoration. Successful or rolled-back journals are atomically moved out of the active lock into retained transaction receipts, avoiding an empty-lock cleanup window.
 
@@ -41,7 +45,7 @@ After a disconnected/interrupted deployment, reconnect, inspect, and choose **Re
 
 ## Local verification
 
-`cargo test --manifest-path src-tauri/Cargo.toml --lib` includes deterministic filesystem/HTTP fixtures for scoped deployment, aliases, same-size changed jars, renamed blobs, untouched configuration preservation, zero-body metadata-only inspection, eight concurrent uploads, skipped changelists, cancellation/timeouts, lock exclusion, unsafe paths, symlinks, and failures before/after every remote mutation. Recovery is restartable and idempotent in those interruption cases.
+`cargo test --manifest-path src-tauri/Cargo.toml --lib` includes deterministic filesystem/HTTP fixtures for scoped deployment, aliases, same-size changed jars, renamed blobs, untouched configuration preservation, zero-body metadata-only inspection, twenty concurrent uploads, skipped changelists, cancellation/timeouts, lock exclusion, unsafe paths, symlinks, and failures before/after every remote mutation. Recovery is restartable and idempotent in those interruption cases.
 
 A disposable loopback OpenSSH container exercises the real transport:
 
@@ -57,4 +61,22 @@ AURAM_SFTP_TEST_PORT=65252 cargo run --manifest-path src-tauri/Cargo.toml \
 docker stop auram-sftp-qa
 ```
 
-The fixture connects only to `127.0.0.1`, creates a unique test directory, and uses dummy credentials. Pass `-- --credential-store` to exercise native credential persistence/deletion. An optional `AURAM_SFTP_TEST_KEY` selects a fixture key configured in the container, with the dummy passphrase `fixture-passphrase`. Tests include real password/key authentication, unknown/changed host-key rejection, eight real simultaneous connections, uploaded content hashes, version publication, alias handling, whole-directory replacement, repeat synchronization, lock semantics, and preservation of server-owned files. They do not replace a test against a user's hosting provider.
+The fixture connects only to `127.0.0.1`, creates a unique test directory, and uses dummy credentials. Pass `-- --credential-store` to exercise native credential persistence/deletion. An optional `AURAM_SFTP_TEST_KEY` selects a fixture key configured in the container, with the dummy passphrase `fixture-passphrase`. Tests include real password/key authentication, unknown/changed host-key rejection, twenty real simultaneous connections, uploaded content hashes, version publication, alias handling, whole-directory replacement, repeat synchronization, lock semantics, and preservation of server-owned files. They do not replace a test against a user's hosting provider.
+
+## Small-file performance fixture
+
+`bench_sftp_small_files` creates a unique directory on the disposable **loopback** fixture and checks every uploaded body against its Git blob hash. It accepts the same `AURAM_SFTP_TEST_PORT` as the live harness; its optional argument is the number of tiny files (default 128).
+
+For reproducible network latency, run the localhost-only proxy against the Docker port above:
+
+```sh
+python3 scripts/fixtures/sftp_latency_proxy.py --upstream-port 65252 --delay-ms 10 \
+  --limit-file "$PWD/.qa/sftp-limit"
+# In another shell:
+AURAM_SFTP_TEST_PORT=1427 cargo run --manifest-path src-tauri/Cargo.toml \
+  --locked --no-default-features --example bench_sftp_small_files -- 128
+```
+
+To simulate a limit imposed during transfer, start without a limit file and add `AURAM_SFTP_BENCH_LIMIT_FILE="$PWD/.qa/sftp-limit"` to that benchmark command. After establishing twenty connections, the harness writes a limit of three; the proxy drops excess existing transports. Verify the JSON result reports twenty initial connections, three remaining connections and matching uploaded bodies. For an initial connection cap, write `3` to the limit file before starting the benchmark without `AURAM_SFTP_BENCH_LIMIT_FILE`. This fixture does not connect to production servers.
+
+On the development Mac, 128 tiny files across sixteen nested configuration folders with 10 ms added per proxy direction took 13.82 seconds before this change (8 connections) and 4.09 seconds afterward (20 connections), with all uploaded bytes checked. First upload began after 3.24 seconds versus 1.38 seconds. The same fixture completed with verified bodies after a live 20-to-3 connection reduction. These are controlled fixture measurements, not a throughput guarantee for a hosting provider.

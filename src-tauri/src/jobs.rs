@@ -227,7 +227,13 @@ impl Tracker {
                     percent: if matches!(phase.state, PhaseState::Complete | PhaseState::Skipped) {
                         Some(100.0)
                     } else if phase.determinate {
-                        batch.as_ref().map(|b| b.percent)
+                        batch.as_ref().map(|b| b.percent).or_else(|| {
+                            (phase.total > 0).then(|| {
+                                (phase.completed.min(phase.total) as f64 / phase.total as f64
+                                    * 100.0)
+                                    .min(100.0)
+                            })
+                        })
                     } else {
                         None
                     },
@@ -486,6 +492,13 @@ impl Job {
             phase.detail = message;
             phase.completed = completed;
             phase.total = total;
+        });
+    }
+    pub fn detail(&self, operation: &str, message: impl Into<String>) {
+        let message = message.into();
+        self.change(false, |tracker| {
+            tracker.operation = operation.into();
+            tracker.phase().detail = message;
         });
     }
     pub fn plan_downloads(&self, label: &str, items: &[(String, String, Option<u64>)]) {

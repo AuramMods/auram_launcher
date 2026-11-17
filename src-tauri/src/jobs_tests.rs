@@ -17,6 +17,28 @@ fn batch(job: &Job) -> BatchProgress {
         .unwrap()
 }
 #[test]
+fn counted_preparation_and_cleanup_show_percentages_without_a_download_batch() {
+    let job = Job::new(
+        "Deployment",
+        &[PhaseSpec("prepare", "Prepare folders", true)],
+        Arc::new(|_| {}),
+    );
+    job.progress("prepare", "Preparing directories", 3, 12);
+    job.flush();
+    let phase = job.snapshot().phases[0].clone();
+    assert_eq!(phase.percent, Some(25.0));
+    assert!(phase.batch.is_none());
+    job.detail("prepare", "Server connection limit; reducing parallelism");
+    job.flush();
+    let phase = job.snapshot().phases[0].clone();
+    assert_eq!(phase.completed, 3);
+    assert_eq!(phase.total, 12);
+    assert_eq!(phase.percent, Some(25.0));
+    job.progress("prepare", "Preparing directories", 12, 12);
+    job.flush();
+    assert_eq!(job.snapshot().phases[0].percent, Some(100.0));
+}
+#[test]
 fn interleaved_transfers_and_retries_never_inflate_verified_progress() {
     let job = job();
     job.plan_downloads(

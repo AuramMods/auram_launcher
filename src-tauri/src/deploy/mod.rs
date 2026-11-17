@@ -1,5 +1,7 @@
 //! Scoped SFTP deployments. Credentials and remote mutations stay in Rust.
+mod adaptive;
 pub mod connection;
+pub use adaptive::MAX_CONNECTIONS;
 pub mod local;
 mod plan;
 mod transaction;

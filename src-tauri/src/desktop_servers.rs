@@ -248,10 +248,13 @@ pub async fn deploy_server_instance(
                 PhaseSpec("destination-files", "Local runtime", true),
                 PhaseSpec("destination-apply", "Install runtime", false),
                 PhaseSpec("sftp-connect", "Destination", false),
-                PhaseSpec("sftp-recover", "Recover", false),
+                PhaseSpec("sftp-recover", "Recover", true),
                 PhaseSpec("sftp-plan", "Plan update", false),
+                PhaseSpec("sftp-destination", "Check destination", true),
+                PhaseSpec("sftp-stage", "Prepare folders", true),
                 PhaseSpec("sftp-upload", "Transfer files", true),
-                PhaseSpec("sftp-apply", "Activate update", false),
+                PhaseSpec("sftp-validate", "Verify destination", true),
+                PhaseSpec("sftp-apply", "Activate update", true),
             ],
             Arc::new(move |p| {
                 let _ = emitter.emit("progress", p);

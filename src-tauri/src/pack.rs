@@ -142,14 +142,16 @@ impl Packs {
             .get(path)
             .with_context(|| format!("Pack is missing {path}"))?;
         let item = self.download(manifest, path, file)?;
-        if !Downloader::valid(&item).await? {
-            self.reuse_owned(
-                &self.layout.client(),
-                self.installed()?.as_ref(),
-                &item,
-                job,
-            )?;
+        job.check()?;
+        if Downloader::valid(&item).await? {
+            return Ok(item.target);
         }
+        self.reuse_owned(
+            &self.layout.client(),
+            self.installed()?.as_ref(),
+            &item,
+            job,
+        )?;
         self.net.get(&item, job).await?;
         Ok(item.target)
     }

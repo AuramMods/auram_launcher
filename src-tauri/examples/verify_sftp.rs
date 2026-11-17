@@ -82,8 +82,8 @@ async fn main() -> Result<()> {
     remote.close().await;
     settings.directory = format!("/upload/{directory}");
     let remote = connection::connect_pool(&settings, &secret, &job).await?;
-    if remote.connection_count() != 8 {
-        bail!("Expected eight actual SFTP connections");
+    if remote.connection_count() != deploy::MAX_CONNECTIONS {
+        bail!("Expected twenty actual SFTP connections");
     }
     // SFTP v3 must not overwrite the nonempty deployment lock directory.
     for path in ["lock-a/a", "lock-b/b"] {
@@ -191,6 +191,39 @@ async fn main() -> Result<()> {
     if plan.uploads != 6 || plan.replacements != 4 {
         bail!("Unexpected update plan");
     }
+    // Cancellation must preserve the old version and complete recovery using
+    // the pool even though its original job's cancellation token is set.
+    let token = tokio_util::sync::CancellationToken::new();
+    let trigger = token.clone();
+    let mut cancelled = Job::new(
+        "Cancel live transfer",
+        &[],
+        std::sync::Arc::new(move |progress| {
+            if progress.uploaded_bytes > 0 {
+                trigger.cancel();
+            }
+        }),
+    );
+    cancelled.cancel = token;
+    let cancelled_remote = connection::connect_pool(&settings, &secret, &cancelled).await?;
+    if deploy::apply(&packs, &cancelled_remote, plan.clone(), &cancelled)
+        .await
+        .is_ok()
+    {
+        bail!("Cancelled live SFTP transfer unexpectedly completed");
+    }
+    if deploy::read_version(&cancelled_remote)
+        .await?
+        .context("Previous version lost")?
+        .version
+        != "fixture-old"
+        || cancelled_remote.stat(".auram-deploy/lock").await?.is_some()
+        || cancelled_remote.read("config/a.toml", 100).await? != b"before"
+    {
+        bail!("Cancelled live deployment did not restore the previous server");
+    }
+    cancelled_remote.close().await;
+    println!("PASS: cancellation during live uploads preserves the previous server and completes rollback");
     deploy::apply(&packs, &remote, plan, &job).await?;
     if remote.hash("mods/client.jar.client").await? != blob(b"CLIENT")
         || remote.hash("mods/rename-new.jar").await? != blob(b"same")
@@ -252,6 +285,6 @@ async fn main() -> Result<()> {
         .await;
         println!("PASS: encrypted private-key authentication");
     }
-    println!("PASS: actual OpenSSH SFTP, host-key pinning/rejection, password authentication/rejection, scoped full/update deploys, disabled jar aliases, eight separate connections, full directory replacement, streaming upload hashes, nonempty lock exclusion, preserved worlds/properties, version commit and idempotent repeat");
+    println!("PASS: actual OpenSSH SFTP, host-key pinning/rejection, password authentication/rejection, scoped full/update deploys, disabled jar aliases, twenty separate connections, full directory replacement, streaming upload hashes, nonempty lock exclusion, preserved worlds/properties, version commit and idempotent repeat");
     Ok(())
 }

@@ -2,7 +2,7 @@ use super::{
     connection::{parents, Remote},
     payload_path,
     plan::{Action, ActionKind, DeploymentPlan},
-    safe_path, ROOTS,
+    safe_path, MAX_CONNECTIONS, ROOTS,
 };
 use crate::{jobs::Job, pack::Packs};
 use anyhow::{bail, Context, Result};
@@ -93,7 +93,7 @@ async fn unlock(remote: &impl Remote, journal: &Journal) -> Result<()> {
     Ok(())
 }
 pub async fn recover(remote: &impl Remote, job: &Job) -> Result<()> {
-    job.phase("sftp-recover", "Recover deployment", false);
+    job.phase("sftp-recover", "Recover deployment", true);
     let Some(_) = remote.stat(".auram-deploy/lock").await? else {
         return Ok(());
     };
@@ -109,15 +109,21 @@ pub async fn recover(remote: &impl Remote, job: &Job) -> Result<()> {
     }
     // Recovery deliberately ignores cancellation once restoration starts.
     for (index, action) in journal.actions.iter().enumerate().rev() {
-        if !exists(remote, &started(index)).await? {
-            continue;
-        }
         job.progress(
             "sftp-recover",
-            "Restoring the previous remote installation",
-            (journal.actions.len() - index) as u64,
+            "Inspecting and restoring the previous server installation",
+            (journal.actions.len() - index - 1) as u64,
             journal.actions.len() as u64,
         );
+        if !exists(remote, &started(index)).await? {
+            job.progress(
+                "sftp-recover",
+                "Inspecting and restoring the previous server installation",
+                (journal.actions.len() - index) as u64,
+                journal.actions.len() as u64,
+            );
+            continue;
+        }
         if matches!(action.kind, ActionKind::Rename) {
             let from = action.from.as_ref().context("Rename source missing")?;
             if exists(remote, &action.path).await? {
@@ -151,14 +157,21 @@ pub async fn recover(remote: &impl Remote, job: &Job) -> Result<()> {
             }
         }
         remote.remove(&started(index)).await?;
+        job.progress(
+            "sftp-recover",
+            "Inspecting and restoring the previous server installation",
+            (journal.actions.len() - index) as u64,
+            journal.actions.len() as u64,
+        );
     }
     unlock(remote, &journal).await?;
     job.progress(
         "sftp-recover",
         "Previous remote installation restored; retry deployment when ready",
-        1,
-        1,
+        journal.actions.len() as u64,
+        journal.actions.len() as u64,
     );
+    job.flush();
     Ok(())
 }
 pub async fn apply(
@@ -194,15 +207,41 @@ pub async fn apply(
             payload: None,
         });
     }
-    for action in &plan.actions {
-        if let Some(meta) = remote.stat(&action.path).await? {
-            if meta.symlink || meta.directory != matches!(action.kind, ActionKind::ReplaceDirectory)
-            {
-                bail!("Remote directory or symlink blocks file {}", action.path);
-            }
-            originals.insert(action.path.clone());
-        }
+    job.phase("sftp-destination", "Check destination", true);
+    {
+        let progress = crate::local_work::Progress::new(
+            job,
+            "Checking server files and directories",
+            plan.actions.len(),
+        );
+        let existing = futures_util::stream::iter(plan.actions.clone())
+            .map(|action| {
+                let progress = &progress;
+                async move {
+                    job.check()?;
+                    let existing = remote.stat(&action.path).await?;
+                    if existing.as_ref().is_some_and(|meta| {
+                        meta.symlink
+                            || meta.directory != matches!(action.kind, ActionKind::ReplaceDirectory)
+                    }) {
+                        bail!("Remote directory or symlink blocks file {}", action.path);
+                    }
+                    progress.complete();
+                    Ok::<_, anyhow::Error>(existing.map(|_| action.path.clone()))
+                }
+            })
+            .buffer_unordered(MAX_CONNECTIONS)
+            .try_collect::<Vec<_>>()
+            .await?;
+        originals.extend(existing.into_iter().flatten());
     }
+    job.phase("sftp-stage", "Prepare folders", true);
+    job.progress(
+        "sftp-stage",
+        "Creating the recoverable deployment journal",
+        0,
+        0,
+    );
     let journal = Journal {
         schema: if plan.replacements > 0 { 2 } else { 1 },
         id: id.clone(),
@@ -226,7 +265,6 @@ pub async fn apply(
             .context("Acquire remote deployment lock; another launcher may be deploying");
     }
     let result = async {
-        job.phase("sftp-upload", "Upload files", true);
         // Whole-directory replacement uploads into a separate tree. The live
         // four directories are not moved until every staged upload is ready.
         let staging_root=format!("{}/stage",data_root(&id));
@@ -247,9 +285,6 @@ pub async fn apply(
                 uploads.push((target,action.payload.clone(),action.file.clone(),action.path.clone()));
             }
         }
-        job.plan_downloads("SFTP uploads",&uploads.iter().filter_map(|(_,payload,file,label)|
-            file.as_ref().filter(|_|payload.is_some()).map(|f|(label.clone(),label.clone(),Some(f.size)))
-        ).collect::<Vec<_>>());
         for (target,_,_,_) in &uploads {
             let mut parent=target.rsplit_once('/').unwrap().0;
             while parent!=staging_root {
@@ -259,10 +294,20 @@ pub async fn apply(
         }
         let mut by_depth=std::collections::BTreeMap::<usize,Vec<String>>::new();
         for directory in directories {by_depth.entry(directory.split('/').count()).or_default().push(directory);}
-        for directories in by_depth.into_values() {
-            futures_util::stream::iter(directories).map(|directory|async move {job.check()?;remote.mkdir(&directory).await})
-                .buffer_unordered(8).try_collect::<Vec<_>>().await?;
+        {
+            let total=by_depth.values().map(Vec::len).sum();
+            let progress=crate::local_work::Progress::new(job,"Preparing server deployment directories",total);
+            for directories in by_depth.into_values() {
+                let progress=&progress;
+                futures_util::stream::iter(directories).map(|directory|async move {
+                    job.check()?;remote.mkdir(&directory).await?;progress.complete();Ok::<_,anyhow::Error>(())
+                }).buffer_unordered(MAX_CONNECTIONS).try_collect::<Vec<_>>().await?;
+            }
         }
+        job.phase("sftp-upload", "Transfer files", true);
+        job.plan_downloads("Server uploads",&uploads.iter().filter_map(|(_,payload,file,label)|
+            file.as_ref().filter(|_|payload.is_some()).map(|f|(label.clone(),label.clone(),Some(f.size)))
+        ).collect::<Vec<_>>());
         futures_util::stream::iter(uploads).map(|(target,payload,_,label)| {
             let marker=&marker;let ownership=&ownership;let payload_manifest=&plan.payload;
             async move {
@@ -275,23 +320,36 @@ pub async fn apply(
                 }
                 Ok::<_,anyhow::Error>(())
             }
-        }).buffer_unordered(8).try_collect::<Vec<_>>().await?;
+        }).buffer_unordered(MAX_CONNECTIONS).try_collect::<Vec<_>>().await?;
         job.check()?;
-        for action in &journal.actions {
-            let present=exists(remote,&action.path).await?;
-            if present!=journal.originals.contains(&action.path) {bail!("Remote file moved while staging: {}. Stop the server and retry.",action.path);}
-            if let Some(from)=&action.from {if !exists(remote,from).await?{bail!("Remote rename source moved while staging: {from}. Stop the server and retry.");}}
-            let alternate=if action.path.starts_with("mods/") {
-                action.path.strip_suffix(".jar.client").map(|p|format!("{p}.jar")).or_else(||action.path.ends_with(".jar").then(||format!("{}.client",action.path)))
-            }else{None};
-            if let Some(alternate)=alternate {if exists(remote,&alternate).await?{bail!("Remote jar state changed while staging: {alternate}. Stop the server and retry.");}}
+        job.phase("sftp-validate", "Verify destination", true);
+        {
+            let progress=crate::local_work::Progress::new(job,"Checking the server has not changed during transfer",journal.actions.len());
+            futures_util::stream::iter(journal.actions.clone()).map(|action| {
+                let progress=&progress;let originals=&journal.originals;
+                async move {
+                    job.check()?;
+                    let present=exists(remote,&action.path).await?;
+                    if present!=originals.contains(&action.path) {bail!("Remote file moved while staging: {}. Stop the server and retry.",action.path);}
+                    if let Some(from)=&action.from {if !exists(remote,from).await?{bail!("Remote rename source moved while staging: {from}. Stop the server and retry.");}}
+                    let alternate=if action.path.starts_with("mods/") {
+                        action.path.strip_suffix(".jar.client").map(|p|format!("{p}.jar")).or_else(||action.path.ends_with(".jar").then(||format!("{}.client",action.path)))
+                    }else{None};
+                    if let Some(alternate)=alternate {if exists(remote,&alternate).await?{bail!("Remote jar state changed while staging: {alternate}. Stop the server and retry.");}}
+                    progress.complete();Ok::<_,anyhow::Error>(())
+                }
+            }).buffer_unordered(MAX_CONNECTIONS).try_collect::<Vec<_>>().await?;
         }
-        job.phase("sftp-apply", "Activate update", false);
+        job.phase("sftp-apply", "Activate update", true);
         // Cancellation is deferred during activation, as in local pack updates.
         for (index, action) in plan.actions.iter().enumerate() {
             job.progress(
                 "sftp-apply",
-                "Activating staged files; retaining originals",
+                match action.kind {
+                    ActionKind::Remove => "Removing obsolete files; retaining backups",
+                    ActionKind::ReplaceDirectory => "Replacing pack directories; retaining originals as backups",
+                    _ => "Activating staged files; retaining originals",
+                },
                 index as u64,
                 plan.actions.len() as u64,
             );
@@ -314,7 +372,9 @@ pub async fn apply(
                     remote.rename(&stage(&id, index), &action.path).await?;
                 }
             }
+            job.progress("sftp-apply", "Activating staged files; retaining originals", (index+1) as u64, plan.actions.len() as u64);
         }
+        job.detail("sftp-apply", "Finalizing the deployment journal");
         remote
             .write(".auram-deploy/lock/complete", b"complete")
             .await?;
@@ -336,9 +396,10 @@ pub async fn apply(
     }
     job.progress(
         "sftp-apply",
-        format!("Remote Auram {} deployed", plan.target_version.version),
-        1,
-        1,
+        format!("Auram server {} deployed", plan.target_version.version),
+        plan.actions.len() as u64,
+        plan.actions.len() as u64,
     );
+    job.flush();
     Ok(())
 }
