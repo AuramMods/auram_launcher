@@ -44,6 +44,7 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
+ignore = "0.4"
 
 [dev-dependencies]
 axum = "0.8"

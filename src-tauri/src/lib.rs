@@ -1,3 +1,6 @@
+pub mod download;
+pub mod jobs;
+pub mod storage;
 #[cfg(feature = "desktop")]
 pub fn run() {
     tauri::Builder::default()

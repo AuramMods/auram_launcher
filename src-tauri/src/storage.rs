@@ -1,0 +1,417 @@
+use anyhow::{bail, Context, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{
+    fs,
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
+
+pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty() || relative.contains('\\') {
+        bail!("Invalid relative path: {relative}");
+    }
+    let mut out = root.to_path_buf();
+    for part in Path::new(relative).components() {
+        let Component::Normal(name) = part else {
+            bail!("Unsafe path: {relative}");
+        };
+        let name = name.to_str().context("Non-UTF8 path")?;
+        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if name.ends_with(['.', ' '])
+            || name.chars().any(|c| c < ' ' || ":<>\"|?*".contains(c))
+            || ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            bail!("Unsupported path component: {name}");
+        }
+        out.push(name);
+        match fs::symlink_metadata(&out) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!("Refusing symlink: {}", out.display())
+            }
+            #[cfg(windows)]
+            Ok(meta)
+                if {
+                    use std::os::windows::fs::MetadataExt;
+                    meta.file_attributes() & 0x400 != 0
+                } =>
+            {
+                bail!("Refusing reparse point: {}", out.display())
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(path.parent().context("Path has no parent")?)?;
+    let temporary = path.with_extension(format!("{}.tmp", rand::random::<u64>()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    atomic_write(path, &serde_json::to_vec_pretty(value)?)
+}
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    Ok(serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("Read {}", path.display()))?,
+    )?)
+}
+pub fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match fs::read(path) {
+        Ok(data) => {
+            Ok(Some(serde_json::from_slice(&data).with_context(|| {
+                format!("Invalid state: {}", path.display())
+            })?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub root: PathBuf,
+}
+impl Layout {
+    pub fn discover() -> Result<Self> {
+        let base = directories::BaseDirs::new().context("Unable to locate application data")?;
+        let root = if cfg!(debug_assertions) {
+            std::env::var_os("AURAM_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| base.data_local_dir().join("AuramLauncherDev"))
+        } else {
+            base.data_local_dir().join("AuramLauncher")
+        };
+        Self::new(root)
+    }
+    pub fn new(root: PathBuf) -> Result<Self> {
+        for name in [
+            "cache",
+            "downloads",
+            "client",
+            "server",
+            "state",
+            "logs",
+            "backups",
+        ] {
+            fs::create_dir_all(root.join(name))?;
+        }
+        Ok(Self { root })
+    }
+    pub fn client(&self) -> PathBuf {
+        self.root.join("client")
+    }
+    pub fn game(&self) -> PathBuf {
+        self.client().join("minecraft")
+    }
+    pub fn server(&self) -> PathBuf {
+        self.root.join("server")
+    }
+    pub fn runtime(&self) -> PathBuf {
+        self.root.join("cache/minecraft")
+    }
+    pub fn state(&self, name: &str) -> PathBuf {
+        self.root.join("state").join(name)
+    }
+    pub fn legacy_candidates() -> Vec<PathBuf> {
+        let Some(base) = directories::BaseDirs::new() else {
+            return vec![];
+        };
+        #[cfg(target_os = "macos")]
+        return vec![base.data_dir().join("art.arcane.auram.auramLauncher/Auram")];
+        #[cfg(target_os = "windows")]
+        return vec![
+            base.data_dir()
+                .join("art.arcane.auram/auram_launcher/Auram"),
+            base.data_dir().join("art.arcane.auram/Auram/Auram"),
+        ];
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = base;
+            vec![]
+        }
+    }
+    pub fn migrate(&self, source: &Path) -> Result<()> {
+        let marker = self.state("migration.json");
+        if read_optional::<serde_json::Value>(&marker)?.is_some() {
+            return Ok(());
+        }
+        let old_game = source.join("minecraft/minecraft");
+        if !old_game.is_dir() {
+            bail!("Legacy game folder not found: {}", old_game.display());
+        }
+        copy_missing(
+            &old_game,
+            &self.game(),
+            &["assets", "libraries", "versions", "natives"],
+        )?;
+        for name in ["assets", "libraries", "versions"] {
+            copy_missing(&old_game.join(name), &self.runtime().join(name), &[])?;
+        }
+        copy_missing(&source.join("minecraft/server"), &self.server(), &[])?;
+        for name in ["mmc-pack.json", "instance.cfg"] {
+            let from = source.join("minecraft").join(name);
+            let to = self.client().join(name);
+            if from.is_file() && !to.exists() {
+                atomic_write(&to, &fs::read(from)?)?;
+            }
+        }
+        // Java and imported resource bytes are verified by their provisioners before reuse.
+        copy_missing(
+            &source.join("jvm"),
+            &self.root.join("cache/java/imported"),
+            &[],
+        )?;
+        write_json(
+            &marker,
+            &serde_json::json!({"schema":1,"source":source,"completed":chrono::Utc::now()}),
+        )
+    }
+}
+pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0 || !exclude.contains(&e.file_name().to_str().unwrap_or(""))
+        })
+    {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(source)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative = relative
+            .to_str()
+            .context("Non-UTF8 legacy path")?
+            .replace('\\', "/");
+        let target = safe_join(destination, &relative)?;
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(target)?;
+        } else if !target.exists() {
+            atomic_write(&target, &fs::read(entry.path())?)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Settings {
+    pub schema: u32,
+    pub memory_mib: u64,
+    pub microsoft_client_id: String,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        let memory = sysinfo::System::new_all().total_memory() / 1024 / 1024;
+        Self {
+            schema: 1,
+            memory_mib: if memory == 0 {
+                4096
+            } else {
+                (memory / 2).clamp(2048, 8192)
+            },
+            microsoft_client_id: "cf95d5d7-7830-4ad4-a70e-d54e50e80b40".into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedPath {
+    relative: String,
+    existed: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct Journal {
+    schema: u32,
+    ready: bool,
+    paths: Vec<SavedPath>,
+}
+
+pub fn recover(root: &Path, transaction: &Path) -> Result<()> {
+    let journal_path = transaction.join("journal.json");
+    let Some(journal) = read_optional::<Journal>(&journal_path)? else {
+        return Ok(());
+    };
+    if journal.schema != 1 {
+        bail!("Unsupported recovery journal schema");
+    }
+    if journal.ready {
+        for entry in &journal.paths {
+            let target = safe_join(root, &entry.relative)?;
+            if entry.existed {
+                atomic_write(
+                    &target,
+                    &fs::read(safe_join(&transaction.join("original"), &entry.relative)?)?,
+                )?;
+            } else {
+                match fs::remove_file(&target) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(transaction)?;
+    Ok(())
+}
+
+pub fn transact(
+    root: &Path,
+    transaction: &Path,
+    changes: &[(String, Option<PathBuf>)],
+) -> Result<()> {
+    recover(root, transaction)?;
+    fs::create_dir_all(transaction)?;
+    let mut journal = Journal {
+        schema: 1,
+        ready: false,
+        paths: vec![],
+    };
+    for (relative, _) in changes {
+        let target = safe_join(root, relative)?;
+        let existed = target.try_exists()?;
+        if existed {
+            atomic_write(
+                &safe_join(&transaction.join("original"), relative)?,
+                &fs::read(&target)?,
+            )?;
+        }
+        journal.paths.push(SavedPath {
+            relative: relative.clone(),
+            existed,
+        });
+    }
+    journal.ready = true;
+    write_json(&transaction.join("journal.json"), &journal)?;
+    let apply = (|| {
+        for (relative, source) in changes {
+            let target = safe_join(root, relative)?;
+            if let Some(source) = source {
+                atomic_write(&target, &fs::read(source)?)?;
+            } else if target.try_exists()? {
+                fs::remove_file(target)?;
+            }
+        }
+        // Removing the journal is the commit point; backups can then be cleaned independently.
+        fs::remove_file(transaction.join("journal.json"))?;
+        Ok(())
+    })();
+    if apply.is_err() {
+        recover(root, transaction)?;
+    } else {
+        let _ = fs::remove_dir_all(transaction);
+    }
+    apply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn paths_reject_traversal_windows_names_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        for bad in [
+            "../outside",
+            "/absolute",
+            "a/../../b",
+            "C:/x",
+            "a\\b",
+            "CON.txt",
+            "a/COM1",
+            "name.",
+            "name ",
+            "a:b",
+        ] {
+            assert!(safe_join(temp.path(), bad).is_err(), "{bad}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp", temp.path().join("link")).unwrap();
+            assert!(safe_join(temp.path(), "link/a").is_err());
+        }
+    }
+    #[test]
+    fn interrupted_transaction_restores_originals_and_removes_new_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("instance");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("old"), b"updated").unwrap();
+        fs::write(root.join("new"), b"new").unwrap();
+        let tx = temp.path().join("tx");
+        atomic_write(&tx.join("original/old"), b"original").unwrap();
+        write_json(
+            &tx.join("journal.json"),
+            &Journal {
+                schema: 1,
+                ready: true,
+                paths: vec![
+                    SavedPath {
+                        relative: "old".into(),
+                        existed: true,
+                    },
+                    SavedPath {
+                        relative: "new".into(),
+                        existed: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        recover(&root, &tx).unwrap();
+        assert_eq!(fs::read(root.join("old")).unwrap(), b"original");
+        assert!(!root.join("new").exists());
+    }
+    #[test]
+    fn migration_is_repeatable_and_preserves_custom_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        atomic_write(
+            &source.join("minecraft/minecraft/saves/world/level.dat"),
+            b"world",
+        )
+        .unwrap();
+        atomic_write(
+            &source.join("minecraft/minecraft/assets/objects/ab/hash"),
+            b"asset",
+        )
+        .unwrap();
+        atomic_write(&source.join("minecraft/server/world/level.dat"), b"server").unwrap();
+        let layout = Layout::new(temp.path().join("new")).unwrap();
+        layout.migrate(&source).unwrap();
+        atomic_write(&layout.game().join("saves/world/level.dat"), b"modified").unwrap();
+        layout.migrate(&source).unwrap();
+        assert_eq!(
+            fs::read(layout.game().join("saves/world/level.dat")).unwrap(),
+            b"modified"
+        );
+        assert!(layout.runtime().join("assets/objects/ab/hash").exists());
+        assert!(layout.server().join("world/level.dat").exists());
+        assert!(source.exists());
+    }
+}
