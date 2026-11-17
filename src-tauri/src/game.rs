@@ -43,6 +43,8 @@ impl Game {
             bail!("Minecraft is already running");
         }
         job.check()?;
+        job.phase("launch", "Launch", false);
+        job.progress("launch", "Preparing natives and starting Minecraft", 0, 0);
         let arguments = runtime.arguments(ready, session, settings)?;
         let main = ready.forge["mainClass"]
             .as_str()

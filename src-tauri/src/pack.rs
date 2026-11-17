@@ -88,6 +88,7 @@ impl Packs {
             .repository
             .raw_url(&manifest.tag.sha, file.source.as_deref().unwrap_or(path))?;
         Ok(Download {
+            label: Some(file.source.as_deref().unwrap_or(path).into()),
             url: url.into(),
             target: self.blob_path(file),
             size: Some(file.size),
@@ -148,6 +149,7 @@ impl Packs {
         Ok(result)
     }
     pub async fn update(&self, repair: bool, job: &Job) -> Result<Manifest> {
+        job.phase("pack-plan", "Read pack", false);
         storage::recover(
             &self.layout.client(),
             &self.layout.state("client-transaction"),
@@ -225,8 +227,18 @@ impl Packs {
             chrono::Utc::now().format("%Y%m%d-%H%M%S"),
             rand::random::<u32>()
         ));
-        for (relative, file) in &desired.files {
+        for (index, (relative, file)) in desired.files.iter().enumerate() {
             job.check()?;
+            job.progress(
+                "pack",
+                if server {
+                    "Inspecting managed server files"
+                } else {
+                    "Inspecting managed pack files"
+                },
+                index as u64,
+                desired.files.len() as u64,
+            );
             let target = storage::safe_join(root, relative)?;
             let previous = old.and_then(|m| m.files.get(relative)).or_else(|| {
                 // On a case-insensitive filesystem a case-only rename is still owned.
@@ -324,7 +336,24 @@ impl Packs {
                 }
             }
         }
-        self.net.many(downloads, job).await?;
+        job.phase(
+            if server { "server-files" } else { "pack-files" },
+            if server { "Server files" } else { "Pack files" },
+            true,
+        );
+        self.net
+            .many_named(
+                downloads,
+                job,
+                if server { "Server files" } else { "Pack files" },
+            )
+            .await?;
+        job.phase(
+            if server { "server-apply" } else { "pack-apply" },
+            "Apply files",
+            false,
+        );
+        job.progress("pack", "Staging verified files", 0, changes.len() as u64);
         // Apply executable bits to private staging copies, keeping cached blobs immutable.
         let staging = self.layout.state("pack-apply-staging");
         if staging.exists() {
@@ -349,6 +378,7 @@ impl Packs {
         // Cancellation is deferred during the short journaled apply/rollback phase.
         storage::transact(root, transaction, &changes)?;
         job.progress("pack", format!("Pack {} ready", desired.tag.name), 1, 1);
+        job.complete_phase();
         Ok(next)
     }
 }

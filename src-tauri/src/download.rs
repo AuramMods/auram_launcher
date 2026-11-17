@@ -1,5 +1,5 @@
 use crate::{
-    jobs::{Job, Progress},
+    jobs::{Job, TaskState, TaskTicket},
     storage::{self, Layout},
 };
 use anyhow::{bail, Context, Result};
@@ -10,7 +10,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -56,10 +56,25 @@ impl Checksum {
 }
 #[derive(Clone, Debug)]
 pub struct Download {
+    pub label: Option<String>,
     pub url: String,
     pub target: PathBuf,
     pub size: Option<u64>,
     pub checksum: Checksum,
+}
+impl Download {
+    fn progress_key(&self) -> String {
+        self.target.to_string_lossy().into_owned()
+    }
+    fn progress_name(&self) -> String {
+        self.label.clone().unwrap_or_else(|| {
+            self.target
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Partial {
@@ -115,6 +130,9 @@ impl Downloader {
         .await?
     }
     pub async fn many(&self, downloads: Vec<Download>, job: &Job) -> Result<()> {
+        self.many_named(downloads, job, "Files").await
+    }
+    pub async fn many_named(&self, downloads: Vec<Download>, job: &Job, label: &str) -> Result<()> {
         let mut unique = std::collections::BTreeMap::<PathBuf, Download>::new();
         for download in downloads {
             if let Some(existing) = unique.get(&download.target) {
@@ -126,60 +144,77 @@ impl Downloader {
             }
         }
         let downloads = unique.into_values().collect::<Vec<_>>();
-        let total = downloads.len() as u64;
-        let counter = std::sync::atomic::AtomicU64::new(0);
-        let done = &counter;
-        futures_util::stream::iter(downloads.into_iter().map(|download| async move {
-            self.get(&download, job).await?;
-            let completed = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            job.progress(
-                "download",
-                format!("Files ready: {completed} / {total}"),
-                completed,
-                total,
-            );
-            Ok::<_, anyhow::Error>(())
-        }))
+        job.plan_downloads(
+            label,
+            &downloads
+                .iter()
+                .map(|d| (d.progress_key(), d.progress_name(), d.size))
+                .collect::<Vec<_>>(),
+        );
+        let result = futures_util::stream::iter(
+            downloads
+                .into_iter()
+                .map(|download| async move { self.get(&download, job).await }),
+        )
         .buffer_unordered(12)
         .try_collect::<Vec<_>>()
-        .await?;
-        Ok(())
+        .await;
+        job.flush();
+        result.map(|_| ())
     }
     pub async fn get(&self, download: &Download, job: &Job) -> Result<()> {
-        job.check()?;
-        if Self::valid(download).await? {
-            return Ok(());
-        }
-        fs::create_dir_all(download.target.parent().context("Download has no parent")?)?;
-        let key = hex::encode(sha2::Sha256::digest(
-            format!("{}:{:?}", download.url, download.checksum).as_bytes(),
-        ));
-        let part = self.partial_dir.join(format!("{key}.part"));
-        let meta = self.partial_dir.join(format!("{key}.json"));
-        for attempt in 0..5 {
+        let mut task = job.task(
+            &download.progress_key(),
+            &download.progress_name(),
+            download.size,
+        );
+        let result = async {
             job.check()?;
-            let result = self.attempt(download, &part, &meta, job).await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    if job.cancel.is_cancelled() {
-                        bail!("Operation cancelled");
+            if Self::valid(download).await? {
+                task.complete(true);
+                return Ok(());
+            }
+            fs::create_dir_all(download.target.parent().context("Download has no parent")?)?;
+            let key = hex::encode(sha2::Sha256::digest(
+                format!("{}:{:?}", download.url, download.checksum).as_bytes(),
+            ));
+            let part = self.partial_dir.join(format!("{key}.part"));
+            let meta = self.partial_dir.join(format!("{key}.json"));
+            for attempt in 0..5 {
+                job.check()?;
+                task.state(TaskState::Checking, attempt + 1);
+                let result = self.attempt(download, &part, &meta, job, &task).await;
+                match result {
+                    Ok(()) => {
+                        task.complete(false);
+                        return Ok(());
                     }
-                    if let Some(status) = error.downcast_ref::<PermanentStatus>() {
-                        bail!("Download failed: HTTP {} ({})", status.0, download.url);
+                    Err(error) => {
+                        if job.cancel.is_cancelled() {
+                            bail!("Operation cancelled");
+                        }
+                        if let Some(status) = error.downcast_ref::<PermanentStatus>() {
+                            bail!("Download failed: HTTP {} ({})", status.0, download.url);
+                        }
+                        if attempt == 4 {
+                            return Err(error).with_context(|| format!("Download {}", download.url));
+                        }
+                        let delay = error
+                            .downcast_ref::<RetryAfter>()
+                            .map(|e| e.0)
+                            .unwrap_or(Duration::from_millis(400 * (1 << attempt)));
+                        task.state(TaskState::Retrying, attempt + 1);
+                        tokio::select! {_=job.cancel.cancelled()=>bail!("Operation cancelled"),_=tokio::time::sleep(delay)=>{}}
                     }
-                    if attempt == 4 {
-                        return Err(error).with_context(|| format!("Download {}", download.url));
-                    }
-                    let delay = error
-                        .downcast_ref::<RetryAfter>()
-                        .map(|e| e.0)
-                        .unwrap_or(Duration::from_millis(400 * (1 << attempt)));
-                    tokio::select! {_=job.cancel.cancelled()=>bail!("Operation cancelled"),_=tokio::time::sleep(delay)=>{}}
                 }
             }
+            unreachable!()
         }
-        unreachable!()
+        .await;
+        if let Err(error) = &result {
+            task.fail(&format!("{error:#}"));
+        }
+        result
     }
     async fn attempt(
         &self,
@@ -187,6 +222,7 @@ impl Downloader {
         part: &Path,
         meta: &Path,
         job: &Job,
+        task: &TaskTicket,
     ) -> Result<()> {
         let previous = storage::read_optional::<Partial>(meta)?.unwrap_or_default();
         let offset = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
@@ -260,10 +296,9 @@ impl Downloader {
         let mut received = if append { offset } else { 0 };
         let total = download
             .size
-            .or_else(|| response.content_length().map(|size| size + received))
-            .unwrap_or(0);
+            .or_else(|| response.content_length().map(|size| size + received));
         let mut stream = response.bytes_stream();
-        let mut last = Instant::now() - Duration::from_secs(1);
+        task.transfer(received, total, 0);
         loop {
             let next = tokio::select! {_=job.cancel.cancelled()=>{file.flush().await?;bail!("Operation cancelled");},next=stream.next()=>next};
             let Some(chunk) = next else {
@@ -279,21 +314,7 @@ impl Downloader {
                 fs::remove_file(part)?;
                 bail!("Download exceeds expected size");
             }
-            if last.elapsed() > Duration::from_millis(120) {
-                (job.emit)(Progress {
-                    operation: "download".into(),
-                    message: download
-                        .target
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into(),
-                    bytes: received,
-                    total_bytes: total,
-                    ..Default::default()
-                });
-                last = Instant::now();
-            }
+            task.transfer(received, total, chunk.len() as u64);
         }
         file.flush().await?;
         file.sync_all().await?;
@@ -302,6 +323,7 @@ impl Downloader {
             target: part.to_path_buf(),
             ..download.clone()
         };
+        task.state(TaskState::Verifying, 0);
         if !Self::valid(&pending).await? {
             fs::remove_file(part)?;
             bail!("Downloaded file failed integrity verification");
@@ -403,6 +425,7 @@ mod tests {
             let layout = Layout::new(temp.path().into()).unwrap();
             let downloader = Downloader::new(&layout).unwrap();
             let item = Download {
+                label: None,
                 url: format!("http://{address}/file"),
                 target: temp.path().join("target"),
                 size: Some(6),
@@ -455,6 +478,7 @@ mod tests {
         let layout = Layout::new(temp.path().into()).unwrap();
         let net = Downloader::new(&layout).unwrap();
         let item = Download {
+            label: None,
             url: format!("http://{address}/file"),
             target: temp.path().join("download"),
             size: Some(6),
@@ -466,6 +490,126 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         net.get(&item, &Job::default()).await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn parallel_transfers_keep_one_verified_total_and_separate_file_progress() {
+        use crate::jobs::PhaseSpec;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let gates = Arc::new([Semaphore::new(0), Semaphore::new(0)]);
+        let app = Router::new()
+            .route(
+                "/{name}",
+                get(
+                    |axum::extract::Path(name): axum::extract::Path<String>,
+                     State(gates): State<Arc<[Semaphore; 2]>>| async move {
+                        let index = usize::from(name == "large");
+                        let size = if index == 0 { 100 } else { 900 };
+                        let first = futures_util::stream::once(async move {
+                            Ok::<_, std::io::Error>(vec![b'a'; size / 2])
+                        });
+                        let second = futures_util::stream::once(async move {
+                            gates[index].acquire().await.unwrap().forget();
+                            Ok::<_, std::io::Error>(vec![b'a'; size / 2])
+                        });
+                        axum::http::Response::builder()
+                            .header("content-length", size)
+                            .body(axum::body::Body::from_stream(first.chain(second)))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(gates.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let net = Downloader::new(&layout).unwrap();
+        let job = Job::new(
+            "Install",
+            &[PhaseSpec("files", "Pack files", true)],
+            Arc::new(|_| {}),
+        );
+        let files = [("small", 100), ("large", 900), ("cached", 200)]
+            .into_iter()
+            .map(|(name, size)| Download {
+                label: Some(format!("mods/{name}.jar")),
+                url: format!("http://{address}/{name}"),
+                target: temp.path().join(name),
+                size: Some(size),
+                checksum: Checksum::Sha256(hex::encode(sha2::Sha256::digest(vec![
+                    b'a';
+                    size as usize
+                ]))),
+            })
+            .collect::<Vec<_>>();
+        fs::write(&files[2].target, vec![b'a'; 200]).unwrap();
+        let running = job.clone();
+        let counter = net.clone();
+        let downloads = tokio::spawn(async move { net.many(files, &running).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                job.flush();
+                let snapshot = job.snapshot();
+                if counter.transferred_bytes() == 500
+                    && snapshot.phases[0]
+                        .batch
+                        .as_ref()
+                        .is_some_and(|b| b.cached == 1)
+                    && snapshot.tasks.len() == 2
+                    && snapshot
+                        .tasks
+                        .iter()
+                        .all(|task| task.bytes == task.total_bytes.unwrap() / 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        job.flush();
+        let midway = job.snapshot();
+        let batch = midway.phases[0].batch.as_ref().unwrap();
+        assert_eq!((batch.completed, batch.cached, batch.total), (1, 1, 3));
+        assert_eq!(batch.total_bytes, Some(1200));
+        assert!((batch.percent - 100.0 / 6.0).abs() < 0.001);
+        assert_eq!(midway.tasks.len(), 2);
+        assert!(midway.tasks.iter().all(|task| {
+            task.state == TaskState::Downloading && task.bytes == task.total_bytes.unwrap() / 2
+        }));
+        assert!(midway
+            .tasks
+            .iter()
+            .all(|task| task.name.starts_with("mods/")));
+
+        gates[0].add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                job.flush();
+                if job.snapshot().phases[0].batch.as_ref().unwrap().completed == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let one_done = job.snapshot();
+        assert_eq!(one_done.phases[0].batch.as_ref().unwrap().percent, 25.0);
+        assert_eq!(one_done.tasks.len(), 1);
+        assert_eq!(one_done.tasks[0].name, "mods/large.jar");
+
+        gates[1].add_permits(1);
+        downloads.await.unwrap().unwrap();
+        let complete = job.snapshot();
+        assert_eq!(complete.phases[0].percent, Some(100.0));
+        assert_eq!(complete.downloaded_bytes, 1000);
+        assert!(complete.tasks.is_empty());
         server.abort();
     }
     #[tokio::test]
@@ -492,6 +636,7 @@ mod tests {
         let job = Job::default();
         let running = job.clone();
         let item = Download {
+            label: None,
             url: format!("http://{address}/slow"),
             target: temp.path().join("unfinished"),
             size: Some(6),

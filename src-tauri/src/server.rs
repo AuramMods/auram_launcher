@@ -143,6 +143,7 @@ fn relative_resource(source: &str, default_prefix: &str) -> Result<String> {
     )
 }
 pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
+    job.phase("server-pack", "Server inputs", false);
     let installed = packs
         .installed()?
         .context("Install the client pack before building a server")?;
@@ -156,6 +157,8 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     resolve_dependencies(packs, &full, &mut desired, job).await?;
     let versions = Versions::read(&packs.layout.client())?;
     let java = runtime.java(job).await?;
+    job.phase("server-forge", "Forge server", false);
+    job.progress("server", "Verifying Forge server runtime", 0, 0);
     let installer = runtime.installer(&versions, job).await?;
     let cache = packs.layout.root.join("cache/server").join(format!(
         "{}-{}-{}",

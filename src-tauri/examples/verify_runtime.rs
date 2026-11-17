@@ -13,14 +13,15 @@ async fn main() -> anyhow::Result<()> {
         layout,
         platform: Platform::current()?,
     };
-    let job = Job {
-        emit: std::sync::Arc::new(|p| {
+    let job = Job::new(
+        "Verification",
+        &[],
+        std::sync::Arc::new(|p| {
             if p.operation != "download" {
                 println!("{}: {}", p.operation, p.message)
             }
         }),
-        ..Default::default()
-    };
+    );
     if std::env::args().any(|a| a == "--client") {
         let ready = runtime
             .ensure(

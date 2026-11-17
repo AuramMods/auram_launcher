@@ -20,14 +20,15 @@ async fn main() -> anyhow::Result<()> {
         layout: layout.clone(),
         platform: Platform::current()?,
     };
-    let job = Job {
-        emit: std::sync::Arc::new(|p| {
+    let job = Job::new(
+        "Verification",
+        &[],
+        std::sync::Arc::new(|p| {
             if p.operation != "download" {
                 println!("{}: {}", p.operation, p.message)
             }
         }),
-        ..Default::default()
-    };
+    );
     let full = packs.manifest(packs.latest().await?, &job).await?;
     storage::atomic_copy(
         &packs.file(&full, "mmc-pack.json", &job).await?,

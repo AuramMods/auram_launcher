@@ -116,12 +116,15 @@ pub struct Ready {
 }
 impl Runtime {
     pub async fn java(&self, job: &Job) -> Result<PathBuf> {
+        job.phase("java", "Java 17", false);
+        job.progress("java", "Verifying the Java runtime", 0, 0);
         let all: HashMap<String, JavaPackage> =
             serde_json::from_str(include_str!("../java-runtimes.json"))?;
         let package = &all[self.platform.key()];
         let java_root = self.layout.root.join("cache/java").join(&package.sha256);
         let snapshot = java_root.join(".verified.json");
         if snapshot.exists() && verify_snapshot(&java_root, &snapshot)? {
+            job.complete_phase();
             return find_java(&java_root);
         }
         job.progress("java", "Preparing Java 17", 0, 0);
@@ -133,6 +136,7 @@ impl Runtime {
         self.net
             .get(
                 &Download {
+                    label: Some("Java 17 runtime archive".into()),
                     url: package.url.clone(),
                     target: archive.clone(),
                     size: Some(package.size),
@@ -150,6 +154,7 @@ impl Runtime {
             fs::remove_dir_all(&staging)?;
         }
         fs::create_dir_all(&staging)?;
+        job.progress("java", "Extracting and verifying Java 17", 0, 0);
         extract_zip(&archive, &staging).context("Extract managed Java archive")?;
         let java = find_java(&staging)?;
         run_logged(
@@ -166,6 +171,7 @@ impl Runtime {
             fs::remove_dir_all(&java_root)?;
         }
         fs::rename(&staging, &java_root)?;
+        job.complete_phase();
         find_java(&java_root)
     }
     pub async fn installer(&self, versions: &Versions, job: &Job) -> Result<PathBuf> {
@@ -201,6 +207,7 @@ impl Runtime {
         self.net
             .get(
                 &Download {
+                    label: Some("Forge installer".into()),
                     url,
                     target: target.clone(),
                     size: None,
@@ -213,6 +220,7 @@ impl Runtime {
     }
     pub async fn ensure(&self, versions: Versions, job: &Job) -> Result<Ready> {
         let java = self.java(job).await?;
+        job.phase("minecraft", "Minecraft", false);
         job.progress("runtime", "Preparing Minecraft and Forge", 0, 0);
         let runtime = self.layout.runtime();
         fs::create_dir_all(&runtime)?;
@@ -255,7 +263,11 @@ impl Runtime {
             )
             .await?;
         let libraries = library_downloads(&vanilla, &runtime.join("libraries"), self.platform)?;
-        self.net.many(libraries, job).await?;
+        self.net
+            .many_named(libraries, job, "Minecraft libraries")
+            .await?;
+        job.phase("forge", "Forge", false);
+        job.progress("forge", "Verifying Forge runtime", 0, 0);
         let forge_dir = runtime.join("versions").join(versions.forge_id());
         let forge_json = forge_dir.join(format!("{}.json", versions.forge_id()));
         let forge_snapshot = self.layout.state(&format!(
@@ -297,11 +309,13 @@ impl Runtime {
         }
         let forge: Value = storage::read_json(&forge_json)?;
         self.net
-            .many(
+            .many_named(
                 library_downloads(&forge, &runtime.join("libraries"), self.platform)?,
                 job,
+                "Forge libraries",
             )
             .await?;
+        job.phase("assets", "Assets", true);
         job.progress("assets", "Checking Minecraft assets", 0, 0);
         let index = &vanilla["assetIndex"];
         let index_id = index["id"].as_str().context("Asset index ID missing")?;
@@ -310,16 +324,17 @@ impl Runtime {
         self.net.get(&artifact(index, &index_file)?, job).await?;
         let index: Value = storage::read_json(&index_file)?;
         let mut assets = Vec::new();
-        for object in index["objects"]
+        for (name, object) in index["objects"]
             .as_object()
             .context("Asset objects missing")?
-            .values()
+            .iter()
         {
             let hash = object["hash"].as_str().context("Asset hash missing")?;
             if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 bail!("Invalid asset hash");
             }
             assets.push(Download {
+                label: Some(name.clone()),
                 url: format!(
                     "https://resources.download.minecraft.net/{}/{hash}",
                     &hash[..2]
@@ -329,7 +344,8 @@ impl Runtime {
                 checksum: Checksum::Sha1(hash.into()),
             });
         }
-        self.net.many(assets, job).await?;
+        self.net.many_named(assets, job, "Mojang assets").await?;
+        job.complete_phase();
         Ok(Ready {
             java,
             vanilla,
@@ -489,6 +505,7 @@ impl Runtime {
 }
 fn artifact(value: &Value, target: &Path) -> Result<Download> {
     Ok(Download {
+        label: None,
         url: value["url"]
             .as_str()
             .context("Artifact URL missing")?
@@ -789,44 +806,59 @@ pub async fn run_logged(
     job: &Job,
     secrets: &[String],
 ) -> Result<()> {
-    fs::create_dir_all(log.parent().context("Log has no parent")?)?;
-    let file = std::sync::Arc::new(std::sync::Mutex::new(fs::File::create(log)?));
-    let (mut command, input) = crate::java_bridge::command(java, args)?;
-    command
-        .current_dir(cwd)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    let mut child = command.spawn().context("Unable to start Java")?;
-    crate::java_bridge::feed(&mut child, input).await?;
-    let stdout = child.stdout.take().context("Java output missing")?;
-    let stderr = child.stderr.take().context("Java error output missing")?;
-    let output = async {
-        let (one, two) = tokio::join!(
-            copy_log(stdout, file.clone(), secrets),
-            copy_log(stderr, file.clone(), secrets)
-        );
-        one?;
-        two?;
-        Ok::<_, anyhow::Error>(())
+    let label = match log.file_stem().and_then(|s| s.to_str()) {
+        Some("forge-client") => "Forge client installer",
+        Some("forge-server") => "Forge server installer",
+        _ => "Java runtime check",
     };
-    let status = async {
-        let (status, output) = tokio::join!(child.wait(), output);
-        output?;
-        Ok::<_, anyhow::Error>(status?)
-    };
-    let status = tokio::select! {_=job.cancel.cancelled()=>bail!("Operation cancelled"),status=status=>status?};
-    if !status.success() {
-        bail!("Java exited with {status}. See {}", log.display());
+    let mut task = job.task(&format!("process:{}", log.display()), label, None);
+    task.state(crate::jobs::TaskState::Running, 0);
+    let result = async {
+        fs::create_dir_all(log.parent().context("Log has no parent")?)?;
+        let file = std::sync::Arc::new(std::sync::Mutex::new(fs::File::create(log)?));
+        let (mut command, input) = crate::java_bridge::command(java, args)?;
+        command
+            .current_dir(cwd)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let mut child = command.spawn().context("Unable to start Java")?;
+        crate::java_bridge::feed(&mut child, input).await?;
+        let stdout = child.stdout.take().context("Java output missing")?;
+        let stderr = child.stderr.take().context("Java error output missing")?;
+        let output = async {
+            let (one, two) = tokio::join!(
+                copy_log(stdout, file.clone(), secrets),
+                copy_log(stderr, file.clone(), secrets)
+            );
+            one?;
+            two?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let status = async {
+            let (status, output) = tokio::join!(child.wait(), output);
+            output?;
+            Ok::<_, anyhow::Error>(status?)
+        };
+        let status = tokio::select! {_=job.cancel.cancelled()=>bail!("Operation cancelled"),status=status=>status?};
+        if !status.success() {
+            bail!("Java exited with {status}. See {}", log.display());
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    match &result {
+        Ok(()) => task.complete(false),
+        Err(error) => task.fail(&format!("{error:#}")),
+    }
+    result
 }
 pub(crate) async fn copy_log(
     reader: impl tokio::io::AsyncRead + Unpin,

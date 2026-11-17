@@ -2,7 +2,7 @@ use crate::{
     auth::{Auth, Profile},
     download::Downloader,
     game::{Game, GameStatus},
-    jobs::{Jobs, Progress},
+    jobs::{Jobs, PhaseSpec, Progress},
     pack::{PackTag, Packs},
     runtime::{Platform, Runtime, Versions},
     server,
@@ -80,6 +80,7 @@ pub struct Status {
     account_error: Option<String>,
     settings: Settings,
     busy: bool,
+    progress: Option<Progress>,
     game: GameStatus,
     legacy_available: bool,
     server_ready: bool,
@@ -100,6 +101,7 @@ fn status(core: &Core) -> Result<Status> {
         account_error,
         settings: core.settings(),
         busy: core.jobs.busy(),
+        progress: core.jobs.progress(),
         game: core.game.status(),
         legacy_available: Layout::legacy_candidates()
             .iter()
@@ -134,6 +136,70 @@ enum Operation {
     BuildServer,
     ImportLegacy,
 }
+impl Operation {
+    fn progress_plan(&self) -> (&'static str, Vec<PhaseSpec>) {
+        let pack = || {
+            vec![
+                PhaseSpec("pack-plan", "Read pack", false),
+                PhaseSpec("pack-files", "Pack files", true),
+                PhaseSpec("pack-apply", "Apply files", false),
+            ]
+        };
+        let runtime = || {
+            vec![
+                PhaseSpec("java", "Java 17", false),
+                PhaseSpec("minecraft", "Minecraft", false),
+                PhaseSpec("forge", "Forge", false),
+                PhaseSpec("assets", "Assets", true),
+            ]
+        };
+        match self {
+            Self::Install | Self::Repair => {
+                let mut phases = pack();
+                phases.extend(runtime());
+                (
+                    if matches!(self, Self::Repair) {
+                        "Repairing Auram"
+                    } else {
+                        "Preparing Auram"
+                    },
+                    phases,
+                )
+            }
+            Self::Launch | Self::LaunchInstalled => {
+                let mut phases = if matches!(self, Self::Launch) {
+                    pack()
+                } else {
+                    vec![]
+                };
+                phases.extend(runtime());
+                phases.extend([
+                    PhaseSpec("account", "Account", false),
+                    PhaseSpec("launch", "Launch", false),
+                ]);
+                ("Launching Auram", phases)
+            }
+            Self::BuildServer => (
+                "Building server",
+                vec![
+                    PhaseSpec("server-pack", "Server inputs", false),
+                    PhaseSpec("java", "Java 17", false),
+                    PhaseSpec("server-forge", "Forge server", false),
+                    PhaseSpec("server-files", "Server files", true),
+                    PhaseSpec("server-apply", "Apply files", false),
+                ],
+            ),
+            Self::ImportLegacy => (
+                "Importing installation",
+                vec![PhaseSpec("migration", "Import files", false)],
+            ),
+            Self::SignIn | Self::SignOut => (
+                "Microsoft account",
+                vec![PhaseSpec("account", "Account", false)],
+            ),
+        }
+    }
+}
 #[tauri::command]
 async fn run_operation(
     operation: Operation,
@@ -145,7 +211,11 @@ async fn run_operation(
     let emit = Arc::new(move |progress: Progress| {
         let _ = app.emit("progress", progress);
     });
-    let lease = core.jobs.begin(emit).map_err(|e| e.to_string())?;
+    let (title, phases) = operation.progress_plan();
+    let lease = core
+        .jobs
+        .begin(title, &phases, emit)
+        .map_err(|e| e.to_string())?;
     let job = &lease.job;
     let result: Result<()> = async {
         if core.game.status().running
@@ -204,6 +274,8 @@ async fn run_operation(
                     .ensure(Versions::read(&core.layout.client())?, job)
                     .await?;
                 let settings = core.settings();
+                job.phase("account", "Account", false);
+                job.progress("account", "Checking your Minecraft session", 0, 0);
                 let session = core
                     .auth
                     .session(&settings.microsoft_client_id, job)
@@ -247,6 +319,7 @@ async fn run_operation(
         Ok(())
     }
     .await;
+    job.finish(result.as_ref().err().map(|e| format!("{e:#}")));
     result.map_err(|e| format!("{e:#}"))
 }
 #[tauri::command]
