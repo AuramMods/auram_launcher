@@ -29,3 +29,4 @@ pub fn qa_event(root: &std::path::Path, event: &str, status: &str, details: &str
         );
     }
 }
+pub mod java_bridge;

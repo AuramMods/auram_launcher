@@ -9,13 +9,21 @@ use std::{fs, process::Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let layout = Layout::new(std::env::temp_dir().join("auram-runtime-verification"))?;
+    auram_core::java_bridge::entry();
+    let layout = Layout::new(
+        std::env::var_os("AURAM_VERIFY_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("auram-runtime-verification")),
+    )?;
     let runtime = Runtime {
         net: Downloader::new(&layout)?,
         layout,
         platform: Platform::current()?,
     };
-    let java = runtime.java(&Job::default()).await?;
+    let java = runtime
+        .java(&Job::default())
+        .await
+        .context("Provision managed Java")?;
     let temp = tempfile::tempdir()?;
     let classes = temp.path().join("argument path with spaces 世界");
     fs::create_dir_all(&classes)?;
@@ -31,8 +39,10 @@ public class EchoArgs { public static void main(String[] args) throws Exception 
     let compiler = java.with_file_name(if cfg!(windows) { "javac.exe" } else { "javac" });
     let result = Command::new(compiler)
         .args(["-encoding", "UTF-8"])
-        .arg(&source)
-        .output()?;
+        .arg("EchoArgs.java")
+        .current_dir(&classes)
+        .output()
+        .context("Start Java compiler")?;
     if !result.status.success() {
         bail!(
             "Java fixture compilation failed: {}",
@@ -51,10 +61,19 @@ public class EchoArgs { public static void main(String[] args) throws Exception 
     ];
     let file = temp.path().join("launch args.txt");
     storage::atomic_write(&file, runtime::argfile(&arguments).as_bytes())?;
-    let result = Command::new(&java)
-        .arg(format!("@{}", file.display()))
-        .output()
-        .context("Execute Java argument file")?;
+    let (mut command, input) =
+        auram_core::java_bridge::command(&java, &[format!("@{}", file.display())])?;
+    command
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().context("Execute Java argument file")?;
+    auram_core::java_bridge::feed(&mut child, input).await?;
+    let result = child.wait_with_output().await?;
     if !result.status.success() {
         bail!(
             "Java argument-file execution failed: {}",

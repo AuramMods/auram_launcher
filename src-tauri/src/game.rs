@@ -59,18 +59,23 @@ impl Game {
         )?;
         let log = runtime.layout.root.join("logs/game.log");
         let file = Arc::new(Mutex::new(fs::File::create(&log)?));
-        let mut command = tokio::process::Command::new(&ready.java);
+        let mut native_arguments = vec![format!("@{}", argument_path.display())];
+        native_arguments.extend_from_slice(&arguments[main_position + 1..]);
+        let (mut command, input) = crate::java_bridge::command(&ready.java, &native_arguments)?;
         command
-            .arg(format!("@{}", argument_path.display()))
-            .args(&arguments[main_position + 1..])
             .current_dir(runtime.layout.game())
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
         #[cfg(windows)]
         command.creation_flags(0x08000000);
         let mut child = command.spawn().context("Unable to start Minecraft")?;
+        crate::java_bridge::feed(&mut child, input).await?;
         let stdout = child.stdout.take().context("Minecraft output missing")?;
         let stderr = child
             .stderr

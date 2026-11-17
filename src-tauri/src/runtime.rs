@@ -150,7 +150,7 @@ impl Runtime {
             fs::remove_dir_all(&staging)?;
         }
         fs::create_dir_all(&staging)?;
-        extract_zip(&archive, &staging)?;
+        extract_zip(&archive, &staging).context("Extract managed Java archive")?;
         let java = find_java(&staging)?;
         run_logged(
             &java,
@@ -791,17 +791,21 @@ pub async fn run_logged(
 ) -> Result<()> {
     fs::create_dir_all(log.parent().context("Log has no parent")?)?;
     let file = std::sync::Arc::new(std::sync::Mutex::new(fs::File::create(log)?));
-    let mut command = tokio::process::Command::new(java);
+    let (mut command, input) = crate::java_bridge::command(java, args)?;
     command
-        .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let mut child = command.spawn().context("Unable to start Java")?;
+    crate::java_bridge::feed(&mut child, input).await?;
     let stdout = child.stdout.take().context("Java output missing")?;
     let stderr = child.stderr.take().context("Java error output missing")?;
     let output = async {

@@ -8,6 +8,7 @@ use auram_core::{
 };
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    auram_core::java_bridge::entry();
     let root = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)

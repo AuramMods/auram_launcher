@@ -6,6 +6,7 @@ use auram_core::{
 };
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    auram_core::java_bridge::entry();
     let layout = Layout::new(std::env::temp_dir().join("auram-runtime-verification"))?;
     let runtime = Runtime {
         net: Downloader::new(&layout)?,

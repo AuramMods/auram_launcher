@@ -49,6 +49,9 @@ ignore = "0.4"
 regex = "1"
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"

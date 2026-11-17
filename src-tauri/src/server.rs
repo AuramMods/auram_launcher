@@ -243,9 +243,18 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
 }
 fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<()> {
     let java_quote = format!("'{}'", java.to_string_lossy().replace('\'', "'\\''"));
-    let java_windows = java.to_string_lossy().replace('%', "%%");
+    #[cfg(windows)]
+    let windows_java = crate::java_bridge::helper(java)?;
+    #[cfg(not(windows))]
+    let windows_java = java.to_path_buf();
+    let java_windows = windows_java.to_string_lossy().replace('%', "%%");
+    let java_mode = if cfg!(windows) {
+        "--auram-java-cli"
+    } else {
+        ""
+    };
     storage::atomic_write(&root.join("run.sh"),format!("#!/bin/sh\nset -eu\ncd -- \"$(dirname -- \"$0\")\"\nJAVA={java_quote}\nif [ ! -x \"$JAVA\" ]; then if [ -n \"${{JAVA_HOME:-}}\" ]; then JAVA=\"$JAVA_HOME/bin/java\"; else JAVA=java; fi; fi\nexec \"$JAVA\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/unix_args.txt nogui \"$@\"\n",versions.minecraft,versions.forge).as_bytes())?;
-    storage::atomic_write(&root.join("run.bat"),format!("@echo off\r\ncd /d \"%~dp0\"\r\nset \"JAVA={java_windows}\"\r\nif not exist \"%JAVA%\" if defined JAVA_HOME set \"JAVA=%JAVA_HOME%\\bin\\java.exe\"\r\nif not exist \"%JAVA%\" set \"JAVA=java\"\r\n\"%JAVA%\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/win_args.txt nogui %*\r\n",versions.minecraft,versions.forge).as_bytes())?;
+    storage::atomic_write(&root.join("run.bat"),format!("@echo off\r\nchcp 65001 >nul\r\ncd /d \"%~dp0\"\r\nset \"JAVA={java_windows}\"\r\nset \"JAVAMODE={java_mode}\"\r\nif not exist \"%JAVA%\" set \"JAVAMODE=\"\r\nif not exist \"%JAVA%\" if defined JAVA_HOME set \"JAVA=%JAVA_HOME%\\bin\\java.exe\"\r\nif not exist \"%JAVA%\" set \"JAVA=java\"\r\n\"%JAVA%\" %JAVAMODE% @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/win_args.txt nogui %*\r\n",versions.minecraft,versions.forge).as_bytes())?;
     storage::atomic_write(
         &root.join("user_jvm_args.txt"),
         format!(

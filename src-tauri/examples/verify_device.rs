@@ -1,6 +1,7 @@
 use auram_core::{auth::Auth, download::Downloader, jobs::Job, storage::Layout};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    auram_core::java_bridge::entry();
     let layout = Layout::new(std::env::temp_dir().join("auram-auth-verification"))?;
     let auth = Auth::new(Downloader::new(&layout)?.client);
     let job = Job::default();

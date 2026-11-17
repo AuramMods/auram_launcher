@@ -69,11 +69,15 @@ pub fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination.parent().context("Destination has no parent")?)?;
     let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
     let result = (|| {
-        fs::copy(source, &temporary)?;
-        fs::OpenOptions::new()
+        let mut input = fs::File::open(source)?;
+        let mut output = fs::OpenOptions::new()
             .write(true)
-            .open(&temporary)?
-            .sync_all()?;
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        fs::set_permissions(&temporary, input.metadata()?.permissions())?;
+        drop(output);
         fs::rename(&temporary, destination)?;
         Ok(())
     })();
@@ -362,6 +366,19 @@ pub fn transact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn atomic_copy_preserves_readonly_files_without_reopening_for_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("readonly");
+        fs::write(&source, b"Java license").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
+        let target = temp.path().join("copy");
+        atomic_copy(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"Java license");
+        assert!(fs::metadata(&target).unwrap().permissions().readonly());
+    }
     #[test]
     fn paths_reject_traversal_windows_names_and_symlinks() {
         let temp = tempfile::tempdir().unwrap();

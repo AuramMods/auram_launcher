@@ -1,6 +1,7 @@
 use auram_core::{download::Downloader, jobs::Job, pack::Packs, storage::Layout};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    auram_core::java_bridge::entry();
     let root = std::env::temp_dir().join("auram-pack-inspection");
     let layout = Layout::new(root)?;
     let packs = Packs {
