@@ -6,11 +6,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+pub fn validate_relative(relative: &str) -> Result<()> {
     if relative.is_empty() || relative.contains('\\') {
         bail!("Invalid relative path: {relative}");
     }
-    let mut out = root.to_path_buf();
     for part in Path::new(relative).components() {
         let Component::Normal(name) = part else {
             bail!("Unsafe path: {relative}");
@@ -26,7 +25,14 @@ pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
         {
             bail!("Unsupported path component: {name}");
         }
-        out.push(name);
+    }
+    Ok(())
+}
+pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+    validate_relative(relative)?;
+    let mut out = root.to_path_buf();
+    for part in Path::new(relative).components() {
+        out.push(part.as_os_str());
         match fs::symlink_metadata(&out) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 bail!("Refusing symlink: {}", out.display())
@@ -116,6 +122,21 @@ pub fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub root: PathBuf,
+    credential_root: PathBuf,
+}
+#[derive(Serialize, Deserialize)]
+struct CredentialScope {
+    schema: u32,
+    root: PathBuf,
+}
+pub(crate) fn write_credential_scope(root: &Path, credential_root: &Path) -> Result<()> {
+    write_json(
+        &root.join("state/credential-root.json"),
+        &CredentialScope {
+            schema: 1,
+            root: credential_root.into(),
+        },
+    )
 }
 #[derive(Serialize, Deserialize)]
 struct ClientReset {
@@ -123,20 +144,7 @@ struct ClientReset {
 }
 impl Layout {
     pub fn discover() -> Result<Self> {
-        let base = directories::BaseDirs::new().context("Unable to locate application data")?;
-        let root = if cfg!(feature = "qa") {
-            PathBuf::from(
-                std::env::var_os("AURAM_QA_DATA_DIR")
-                    .context("QA builds require an isolated AURAM_QA_DATA_DIR")?,
-            )
-        } else if cfg!(debug_assertions) {
-            std::env::var_os("AURAM_DATA_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| base.data_local_dir().join("AuramLauncherDev"))
-        } else {
-            base.data_local_dir().join("AuramLauncher")
-        };
-        Self::new(root)
+        Self::new(crate::data_location::Locations::discover()?.resolve()?)
     }
     pub fn new(root: PathBuf) -> Result<Self> {
         let root = if root.is_absolute() {
@@ -155,7 +163,19 @@ impl Layout {
         ] {
             fs::create_dir_all(root.join(name))?;
         }
-        Ok(Self { root })
+        let credential_root =
+            match read_optional::<CredentialScope>(&root.join("state/credential-root.json"))? {
+                Some(scope) if scope.schema == 1 && scope.root.is_absolute() => scope.root,
+                Some(_) => bail!("Unsupported credential namespace state"),
+                None => root.clone(),
+            };
+        Ok(Self {
+            root,
+            credential_root,
+        })
+    }
+    pub fn credential_root(&self) -> &Path {
+        &self.credential_root
     }
     pub fn client(&self) -> PathBuf {
         self.root.join("client")

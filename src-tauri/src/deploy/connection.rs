@@ -60,6 +60,18 @@ pub struct Secret {
     pub password: String,
     pub passphrase: String,
 }
+fn credential_key_path(layout: &Layout, key: &str) -> String {
+    Path::new(key)
+        .strip_prefix(&layout.root)
+        .map(|relative| {
+            layout
+                .credential_root()
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|_| key.into())
+}
 impl ConnectionSettings {
     fn instance_entry(&self, layout: &Layout, id: &str) -> Result<keyring::Entry> {
         Ok(keyring::Entry::new(
@@ -70,12 +82,12 @@ impl ConnectionSettings {
     pub(crate) fn instance_identity(&self, layout: &Layout, id: &str) -> String {
         hex::encode(sha2::Sha256::digest(format!(
             "{}:{id}:{}:{}:{}:{}:{}",
-            layout.root.display(),
+            layout.credential_root().display(),
             self.host,
             self.port,
             self.username,
             self.authentication,
-            self.key_path
+            credential_key_path(layout, &self.key_path)
         )))
     }
     pub fn instance_secret(&self, layout: &Layout, id: &str) -> Result<Secret> {
@@ -106,12 +118,12 @@ impl ConnectionSettings {
     fn entry(&self, layout: &Layout) -> Result<keyring::Entry> {
         let identity = hex::encode(sha2::Sha256::digest(format!(
             "{}:{}:{}:{}:{}:{}",
-            layout.root.display(),
+            layout.credential_root().display(),
             self.host,
             self.port,
             self.username,
             self.authentication,
-            self.key_path
+            credential_key_path(layout, &self.key_path)
         )));
         Ok(keyring::Entry::new("art.arcane.auram.sftp", &identity)?)
     }

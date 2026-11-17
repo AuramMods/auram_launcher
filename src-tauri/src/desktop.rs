@@ -65,15 +65,19 @@ impl Core {
             .clone()
     }
 }
-pub struct Backend(Mutex<Result<Arc<Core>, String>>);
+pub struct Backend(Mutex<Result<Arc<Core>, String>>, tokio::sync::Mutex<()>);
 impl Backend {
     fn new() -> Self {
-        Self(Mutex::new(
-            Core::new().map(Arc::new).map_err(|e| format!("{e:#}")),
-        ))
+        Self(
+            Mutex::new(Core::new().map(Arc::new).map_err(|e| format!("{e:#}"))),
+            tokio::sync::Mutex::new(()),
+        )
     }
     pub(crate) fn core(&self) -> Result<Arc<Core>, String> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub(crate) fn location_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.1
     }
 }
 #[derive(Serialize)]
@@ -487,6 +491,9 @@ pub fn run() {
             cancel_operation,
             copy_code_and_open,
             save_settings,
+            crate::desktop_location::get_data_location,
+            crate::desktop_location::choose_data_directory,
+            crate::desktop_location::change_data_location,
             open_folder,
             crate::desktop_servers::choose_server_directory,
             crate::desktop_servers::save_server_instance,

@@ -1,7 +1,10 @@
 pub mod auth;
+pub mod data_location;
 pub mod deploy;
 #[cfg(feature = "desktop")]
 mod desktop;
+#[cfg(feature = "desktop")]
+mod desktop_location;
 #[cfg(feature = "desktop")]
 mod desktop_servers;
 pub mod download;

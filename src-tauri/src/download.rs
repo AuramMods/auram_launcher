@@ -328,7 +328,19 @@ impl Downloader {
             fs::remove_file(part)?;
             bail!("Downloaded file failed integrity verification");
         }
-        fs::rename(part, &download.target)?;
+        match fs::rename(part, &download.target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                // Partial downloads and their final destination can live on
+                // different Windows drives. Promote a destination-local copy.
+                storage::atomic_copy(part, &download.target)?;
+                if !Self::valid(download).await? {
+                    bail!("Copied download failed integrity verification; the verified partial was retained");
+                }
+                fs::remove_file(part)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         let _ = fs::remove_file(meta);
         Ok(())
     }
