@@ -40,7 +40,14 @@ pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
             {
                 bail!("Refusing reparse point: {}", out.display())
             }
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Err(e.into())
+            }
             _ => {}
         }
     }
@@ -294,19 +301,43 @@ pub fn recover(root: &Path, transaction: &Path) -> Result<()> {
         bail!("Unsupported recovery journal schema");
     }
     if journal.ready {
+        // Remove new files before restoring old files that may occupy their parents.
+        for entry in journal.paths.iter().rev().filter(|entry| !entry.existed) {
+            let target = safe_join(root, &entry.relative)?;
+            if target.is_dir() {
+                // Never remove user-owned contents to make a rollback fit.
+                match fs::remove_dir(&target) {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                match fs::remove_file(&target) {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            remove_empty_parents(root, &target);
+        }
         for entry in &journal.paths {
             let target = safe_join(root, &entry.relative)?;
             if entry.existed {
+                if target.is_dir() {
+                    fs::remove_dir(&target)?;
+                }
                 atomic_copy(
                     &safe_join(&transaction.join("original"), &entry.relative)?,
                     &target,
                 )?;
-            } else {
-                match fs::remove_file(&target) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
             }
         }
     }
@@ -320,6 +351,9 @@ pub fn transact(
     changes: &[(String, Option<PathBuf>)],
 ) -> Result<()> {
     recover(root, transaction)?;
+    if transaction.exists() {
+        fs::remove_dir_all(transaction)?;
+    }
     fs::create_dir_all(transaction)?;
     let mut journal = Journal {
         schema: 1,
@@ -328,7 +362,18 @@ pub fn transact(
     };
     for (relative, _) in changes {
         let target = safe_join(root, relative)?;
-        let existed = target.try_exists()?;
+        let existed = match fs::metadata(&target) {
+            Ok(metadata) => metadata.is_file(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(error) => return Err(error.into()),
+        };
         if existed {
             atomic_copy(
                 &target,
@@ -343,12 +388,28 @@ pub fn transact(
     journal.ready = true;
     write_json(&transaction.join("journal.json"), &journal)?;
     let apply = (|| {
-        for (relative, source) in changes {
+        let mut ordered = changes.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(path, source)| {
+            (
+                path == ".auram-manifest.json",
+                source.is_some(),
+                if source.is_none() {
+                    std::cmp::Reverse(path.matches('/').count())
+                } else {
+                    std::cmp::Reverse(0)
+                },
+            )
+        });
+        for (relative, source) in ordered {
             let target = safe_join(root, relative)?;
             if let Some(source) = source {
+                if target.is_dir() {
+                    fs::remove_dir(&target)?;
+                }
                 atomic_copy(source, &target)?;
             } else if target.try_exists()? {
-                fs::remove_file(target)?;
+                fs::remove_file(&target)?;
+                remove_empty_parents(root, &target);
             }
         }
         // Removing the journal is the commit point; backups can then be cleaned independently.
@@ -363,9 +424,98 @@ pub fn transact(
     apply
 }
 
+fn remove_empty_parents(root: &Path, file: &Path) {
+    let mut current = file.parent();
+    while let Some(parent) = current.filter(|p| *p != root && p.starts_with(root)) {
+        if fs::remove_dir(parent).is_err() {
+            break;
+        }
+        current = parent.parent();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transactions_handle_file_directory_transitions_and_preserve_blocking_user_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("client");
+        let tx = temp.path().join("tx");
+        let replacement = temp.path().join("replacement");
+        atomic_write(&replacement, b"new").unwrap();
+        let manifest = temp.path().join("next-manifest");
+        atomic_write(&manifest, b"new baseline").unwrap();
+        atomic_write(&root.join("item"), b"old file").unwrap();
+        atomic_write(&root.join(".auram-manifest.json"), b"old baseline").unwrap();
+        transact(
+            &root,
+            &tx,
+            &[
+                ("item/a/b".into(), Some(replacement.clone())),
+                ("item".into(), None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("item/a/b")).unwrap(), b"new");
+        atomic_write(&root.join("item/user.txt"), b"user").unwrap();
+        let changes = vec![
+            ("item".into(), Some(replacement.clone())),
+            ("item/a/b".into(), None),
+            (".auram-manifest.json".into(), Some(manifest)),
+        ];
+        assert!(transact(&root, &tx, &changes).is_err());
+        assert_eq!(fs::read(root.join("item/a/b")).unwrap(), b"new");
+        assert_eq!(fs::read(root.join("item/user.txt")).unwrap(), b"user");
+        assert_eq!(
+            fs::read(root.join(".auram-manifest.json")).unwrap(),
+            b"old baseline"
+        );
+        fs::remove_file(root.join("item/user.txt")).unwrap();
+        // The now-empty managed parent directory is removed without recursive deletion.
+        fs::remove_file(root.join("item/a/b")).unwrap();
+        fs::remove_dir(root.join("item/a")).unwrap();
+        atomic_write(&root.join("item/owned"), b"old").unwrap();
+        transact(
+            &root,
+            &tx,
+            &[
+                ("item".into(), Some(replacement)),
+                ("item/owned".into(), None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("item")).unwrap(), b"new");
+    }
+    #[test]
+    fn interrupted_file_to_directory_update_restores_original_parent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("client");
+        let tx = temp.path().join("tx");
+        atomic_write(&root.join("item/a/b"), b"new").unwrap();
+        atomic_write(&tx.join("original/item"), b"original").unwrap();
+        write_json(
+            &tx.join("journal.json"),
+            &Journal {
+                schema: 1,
+                ready: true,
+                paths: vec![
+                    SavedPath {
+                        relative: "item".into(),
+                        existed: true,
+                    },
+                    SavedPath {
+                        relative: "item/a/b".into(),
+                        existed: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        recover(&root, &tx).unwrap();
+        recover(&root, &tx).unwrap();
+        assert_eq!(fs::read(root.join("item")).unwrap(), b"original");
+    }
     #[test]
     fn atomic_copy_preserves_readonly_files_without_reopening_for_write() {
         let temp = tempfile::tempdir().unwrap();

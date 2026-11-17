@@ -6,12 +6,14 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
+mod source;
+pub use source::Repository;
+use source::{Selection, Source, CLIENT_POLICY};
 
-const API: &str = "https://api.github.com/repos/AuramMods/Auram";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackTag {
     pub name: String,
@@ -21,124 +23,60 @@ pub struct PackTag {
 pub struct PackFile {
     pub sha: String,
     pub size: u64,
+    #[serde(default = "regular_mode")]
+    pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema: u32,
+    #[serde(default)]
+    pub policy: u32,
     pub tag: PackTag,
     pub files: BTreeMap<String, PackFile>,
 }
-#[derive(Deserialize)]
-struct TagResponse {
-    name: String,
-    commit: Commit,
-}
-#[derive(Deserialize)]
-struct Commit {
-    sha: String,
-}
-#[derive(Deserialize)]
-struct Tree {
-    tree: Vec<TreeEntry>,
-    #[serde(default)]
-    truncated: bool,
-}
-#[derive(Deserialize)]
-struct TreeEntry {
-    path: String,
-    sha: String,
-    #[serde(rename = "type")]
-    kind: String,
-    mode: String,
-    size: Option<u64>,
+fn regular_mode() -> String {
+    "100644".into()
 }
 
 #[derive(Clone)]
 pub struct Packs {
     pub layout: Layout,
     pub net: Downloader,
+    repository: Repository,
 }
 impl Packs {
+    pub fn new(layout: Layout, net: Downloader) -> Self {
+        Self {
+            layout,
+            net,
+            repository: Repository::default(),
+        }
+    }
+    fn source(&self) -> Source<'_> {
+        Source::new(self)
+    }
     pub fn installed(&self) -> Result<Option<Manifest>> {
         storage::read_optional(&self.layout.client().join(".auram-manifest.json"))
     }
     pub async fn latest(&self) -> Result<PackTag> {
-        let mut tags = Vec::new();
-        for page in 1..=100 {
-            let batch: Vec<TagResponse> = self
-                .net
-                .json(&format!("{API}/tags?per_page=100&page={page}"))
-                .await?;
-            let length = batch.len();
-            tags.extend(
-                batch
-                    .into_iter()
-                    .filter(|tag| version(&tag.name).is_some())
-                    .map(|tag| PackTag {
-                        name: tag.name,
-                        sha: tag.commit.sha,
-                    }),
-            );
-            if length < 100 {
-                break;
-            }
-        }
-        tags.sort_by(|a, b| version(&b.name).cmp(&version(&a.name)));
-        tags.into_iter()
-            .next()
-            .context("The pack repository has no version tags")
+        self.source().discover(&Job::default()).await
     }
     pub async fn manifest(&self, tag: PackTag, job: &Job) -> Result<Manifest> {
-        let cache = self.layout.state(&format!("pack-{}.json", tag.sha));
-        if let Some(value) = storage::read_optional::<Manifest>(&cache)? {
-            return Ok(value);
-        }
-        job.progress("pack", "Reading pack file manifest", 0, 0);
-        let recursive: Tree = self
-            .net
-            .json(&format!("{API}/git/trees/{}?recursive=1", tag.sha))
-            .await?;
-        let mut entries = recursive.tree;
-        if recursive.truncated {
-            entries = Vec::new();
-            let mut queue = vec![(String::new(), tag.sha.clone())];
-            while let Some((prefix, sha)) = queue.pop() {
-                job.check()?;
-                let tree: Tree = self.net.json(&format!("{API}/git/trees/{sha}")).await?;
-                if tree.truncated {
-                    bail!("GitHub returned an incomplete pack directory");
-                }
-                for mut entry in tree.tree {
-                    entry.path = format!("{prefix}{}", entry.path);
-                    if entry.kind == "tree" {
-                        queue.push((format!("{}/", entry.path), entry.sha));
-                    } else {
-                        entries.push(entry);
-                    }
-                }
+        let cache = self
+            .layout
+            .state(&format!("pack-server-source-1-{}.json", tag.sha));
+        if let Some(value) = storage::read_optional::<Manifest>(&cache).ok().flatten() {
+            if value.tag.sha == tag.sha && source::validate_inventory(&value).is_ok() {
+                return Ok(value);
             }
         }
-        let files = entries
-            .into_iter()
-            .filter(|e| e.kind == "blob" && e.mode != "120000")
-            .map(|e| {
-                (
-                    e.path,
-                    PackFile {
-                        sha: e.sha,
-                        size: e.size.unwrap_or(0),
-                        source: None,
-                    },
-                )
-            })
-            .collect();
-        let manifest = Manifest {
-            schema: 1,
-            tag,
-            files,
-        };
+        job.progress("pack", "Reading pack file manifest", 0, 0);
+        let manifest = self
+            .source()
+            .inventory(tag, &Selection::Server, job)
+            .await?;
         storage::write_json(&cache, &manifest)?;
         Ok(manifest)
     }
@@ -146,11 +84,9 @@ impl Packs {
         self.layout.root.join("cache/blobs").join(&file.sha)
     }
     pub fn download(&self, manifest: &Manifest, path: &str, file: &PackFile) -> Result<Download> {
-        let mut url = url::Url::parse("https://raw.githubusercontent.com/")?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("Invalid raw URL"))?
-            .extend(["AuramMods", "Auram", &manifest.tag.sha])
-            .extend(file.source.as_deref().unwrap_or(path).split('/'));
+        let url = self
+            .repository
+            .raw_url(&manifest.tag.sha, file.source.as_deref().unwrap_or(path))?;
         Ok(Download {
             url: url.into(),
             target: self.blob_path(file),
@@ -164,27 +100,48 @@ impl Packs {
             .get(path)
             .with_context(|| format!("Pack is missing {path}"))?;
         let item = self.download(manifest, path, file)?;
+        if !Downloader::valid(&item).await? {
+            self.reuse_owned(
+                &self.layout.client(),
+                self.installed()?.as_ref(),
+                &item,
+                job,
+            )?;
+        }
         self.net.get(&item, job).await?;
         Ok(item.target)
     }
-    pub async fn client_manifest(&self, manifest: &Manifest, job: &Job) -> Result<Manifest> {
-        let mut ignore = ignore::gitignore::GitignoreBuilder::new("");
-        if manifest.files.contains_key(".packignore") {
-            for line in fs::read_to_string(self.file(manifest, ".packignore", job).await?)?.lines()
-            {
-                ignore.add_line(None, line)?;
+    fn reuse_owned(
+        &self,
+        root: &Path,
+        old: Option<&Manifest>,
+        download: &Download,
+        job: &Job,
+    ) -> Result<()> {
+        let Checksum::GitBlob(sha) = &download.checksum else {
+            return Ok(());
+        };
+        if let Some(old) = old {
+            for (path, previous) in &old.files {
+                job.check()?;
+                if previous.sha == *sha {
+                    let existing = storage::safe_join(root, path)?;
+                    if existing.is_file() && download.checksum.verify(&existing)? {
+                        storage::atomic_copy(&existing, &download.target)?;
+                        break;
+                    }
+                }
             }
         }
-        let ignore = ignore.build()?;
+        Ok(())
+    }
+    pub async fn client_manifest(&self, manifest: &Manifest, job: &Job) -> Result<Manifest> {
+        let selection = self.source().selection(&manifest.tag, job).await?;
         let mut result = manifest.clone();
-        result.files.retain(|path, _| {
-            let selected = ["mmc-pack.json", "instance.cfg", "icon-256.png"]
-                .contains(&path.as_str())
-                || path.starts_with("minecraft/");
-            selected
-                && !ignore.matched_path_or_any_parents(path, false).is_ignore()
-                && !runtime_or_userdata(path)
-        });
+        result.policy = CLIENT_POLICY;
+        result
+            .files
+            .retain(|path, _| selection.includes(path, false));
         if !result.files.contains_key("mmc-pack.json") {
             bail!("Pack manifest does not contain mmc-pack.json");
         }
@@ -202,9 +159,10 @@ impl Packs {
                 .tag
                 .clone()
         } else {
-            match self.latest().await {
+            match self.source().discover(job).await {
                 Ok(tag) => tag,
                 Err(error) => {
+                    job.check()?;
                     if let Some(installed) = old {
                         job.progress(
                             "pack",
@@ -218,15 +176,18 @@ impl Packs {
                 }
             }
         };
-        let full = self.manifest(tag, job).await?;
-        let desired = self.client_manifest(&full, job).await?;
-        self.reconcile(
+        let (desired, changed) = self
+            .source()
+            .client_target(tag, old.as_ref(), repair, job)
+            .await?;
+        self.reconcile_plan(
             &self.layout.client(),
             &self.layout.state("client-transaction"),
             old.as_ref(),
             &desired,
             job,
             false,
+            changed.as_ref(),
         )
         .await
     }
@@ -239,6 +200,21 @@ impl Packs {
         job: &Job,
         server: bool,
     ) -> Result<Manifest> {
+        self.reconcile_plan(root, transaction, old, desired, job, server, None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_plan(
+        &self,
+        root: &Path,
+        transaction: &Path,
+        old: Option<&Manifest>,
+        desired: &Manifest,
+        job: &Job,
+        server: bool,
+        touched: Option<&BTreeSet<String>>,
+    ) -> Result<Manifest> {
+        source::validate_inventory(desired)?;
         storage::recover(root, transaction)?;
         let mut next = desired.clone();
         next.files.clear();
@@ -252,10 +228,38 @@ impl Packs {
         for (relative, file) in &desired.files {
             job.check()?;
             let target = storage::safe_join(root, relative)?;
-            let previous = old.and_then(|m| m.files.get(relative));
-            if target.exists() {
+            let previous = old.and_then(|m| m.files.get(relative)).or_else(|| {
+                // On a case-insensitive filesystem a case-only rename is still owned.
+                old?.files.iter().find_map(|(path, file)| {
+                    if path != relative
+                        && source::normalized_path(path) == source::normalized_path(relative)
+                        && storage::safe_join(root, path).ok().is_some_and(|owned| {
+                            same_file::is_same_file(&target, owned).unwrap_or(false)
+                        })
+                    {
+                        Some(file)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if touched.is_some_and(|paths| !paths.contains(relative)) {
+                if let Some(previous) = previous {
+                    next.files.insert(relative.clone(), previous.clone());
+                }
+                continue;
+            }
+            let replaces_directory = target.is_dir()
+                && old.is_some_and(|m| {
+                    m.files
+                        .keys()
+                        .any(|path| path.starts_with(&format!("{relative}/")))
+                });
+            if target.exists() && !replaces_directory {
                 let valid = Checksum::GitBlob(file.sha.clone()).verify(&target)?;
-                if valid {
+                let case_rename =
+                    previous.is_some() && old.is_some_and(|m| !m.files.contains_key(relative));
+                if valid && source::mode_matches(&target, &file.mode)? && !case_rename {
                     next.files.insert(relative.clone(), file.clone());
                     continue;
                 }
@@ -285,13 +289,22 @@ impl Packs {
                     storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
                 }
             }
-            downloads.push(self.download(desired, relative, file)?);
+            let download = self.download(desired, relative, file)?;
+            // A rename can reuse a verified old managed file even after the blob cache was evicted.
+            if !Downloader::valid(&download).await? {
+                self.reuse_owned(root, old, &download, job)?;
+            }
+            downloads.push(download);
             changes.push((relative.clone(), Some(self.blob_path(file))));
             next.files.insert(relative.clone(), file.clone());
         }
         if let Some(old) = old {
             for (relative, file) in &old.files {
                 if desired.files.contains_key(relative) || mutable(relative, server) {
+                    continue;
+                }
+                if touched.is_some_and(|paths| !paths.contains(relative)) {
+                    next.files.insert(relative.clone(), file.clone());
                     continue;
                 }
                 let target = storage::safe_join(root, relative)?;
@@ -312,6 +325,22 @@ impl Packs {
             }
         }
         self.net.many(downloads, job).await?;
+        // Apply executable bits to private staging copies, keeping cached blobs immutable.
+        let staging = self.layout.state("pack-apply-staging");
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        for (path, source) in &mut changes {
+            job.check()?;
+            if let Some(blob) = source {
+                if let Some(file) = desired.files.get(path) {
+                    let staged = storage::safe_join(&staging, path)?;
+                    storage::atomic_copy(blob, &staged)?;
+                    source::set_mode(&staged, &file.mode)?;
+                    *blob = staged;
+                }
+            }
+        }
         job.check()?;
         job.progress("pack", "Applying verified files", 0, changes.len() as u64);
         let state = self.layout.state("pending-manifest.json");
@@ -347,6 +376,9 @@ fn runtime_or_userdata(path: &str) -> bool {
         "logs/",
         "crash-reports/",
         "cache/",
+        "lib/",
+        "data/",
+        "mod_data/",
         ".mixin.out/",
         "usercache.json",
         "usernamecache.json",
@@ -400,6 +432,7 @@ mod tests {
         PackFile {
             sha: hex::encode(hash.finalize()),
             size: bytes.len() as u64,
+            mode: regular_mode(),
             source: None,
         }
     }
@@ -413,10 +446,7 @@ mod tests {
     async fn update_reuses_blobs_and_preserves_worlds_and_unknown_files() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().into()).unwrap();
-        let packs = Packs {
-            net: Downloader::new(&layout).unwrap(),
-            layout: layout.clone(),
-        };
+        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
         let old_file = file(b"old");
         let new_file = file(b"new");
         storage::atomic_write(&packs.blob_path(&new_file), b"new").unwrap();
@@ -427,6 +457,7 @@ mod tests {
             .unwrap();
         let old = Manifest {
             schema: 1,
+            policy: 0,
             tag: PackTag {
                 name: "1".into(),
                 sha: "one".into(),
@@ -435,6 +466,7 @@ mod tests {
         };
         let desired = Manifest {
             schema: 1,
+            policy: 0,
             tag: PackTag {
                 name: "2".into(),
                 sha: "two".into(),
@@ -464,10 +496,7 @@ mod tests {
     async fn server_updates_preserve_locally_modified_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().into()).unwrap();
-        let packs = Packs {
-            net: Downloader::new(&layout).unwrap(),
-            layout: layout.clone(),
-        };
+        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
         let original = file(b"original");
         let updated = file(b"pack-update");
         storage::atomic_write(&packs.blob_path(&updated), b"pack-update").unwrap();
@@ -478,6 +507,7 @@ mod tests {
         .unwrap();
         let old = Manifest {
             schema: 1,
+            policy: 0,
             tag: PackTag {
                 name: "old".into(),
                 sha: "old".into(),
@@ -486,6 +516,7 @@ mod tests {
         };
         let desired = Manifest {
             schema: 1,
+            policy: 0,
             tag: PackTag {
                 name: "new".into(),
                 sha: "new".into(),

@@ -4,10 +4,7 @@ async fn main() -> anyhow::Result<()> {
     auram_core::java_bridge::entry();
     let root = std::env::temp_dir().join("auram-pack-inspection");
     let layout = Layout::new(root)?;
-    let packs = Packs {
-        net: Downloader::new(&layout)?,
-        layout,
-    };
+    let packs = Packs::new(layout.clone(), Downloader::new(&layout)?);
     let tag = packs.latest().await?;
     let full = packs.manifest(tag, &Job::default()).await?;
     let client = packs.client_manifest(&full, &Job::default()).await?;

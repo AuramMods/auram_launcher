@@ -1,0 +1,44 @@
+# Changelists and sparse pack updates
+
+Auram's schema-1 changelists drive normal client updates. The launcher reads the build advertised by `auram.json` on main, resolves that version's Git tag (including annotated/nested tags), then verifies and uses the metadata at that immutable commit. Unreleased changes on main never become the payload. Older repositories without `auram.json` retain paginated numeric/semantic tag discovery.
+
+The `changelist` field supplies the manifest path. Versions remain strings in installation identities, so legacy `1.0.7` baselines work alongside numeric builds. The chain follows `previousVersion` and verifies each resolved tag against `previousCommit`; `contentCommit` must be the release commit's parent. It is provenance rather than the download revision.
+
+The planner validates the entire chain before activation, keeping the newest operation for each path. It fetches upserts from the final target only. Renames reuse content by Git blob ID, including verified managed files when their cache objects were evicted. It never downloads intermediate jars or infers deletion from a failed HTTP request.
+
+## Sparse transport
+
+This implementation uses sparse HTTP retrieval and a persistent Git-object cache. It does not require a Git executable, clone repository history, or turn the live instance into a Git worktree. Root and immediate Minecraft trees identify selected directories before recursive requests; runtime/user-data folders, tooling, and server-only content are pruned from client traversal. Files use immutable, segment-encoded raw URLs. Git tree JSON is cached by object identity; file bytes use Git blob identities. A truncated recursive response falls back to complete non-recursive subtrees and never establishes absence.
+
+Server source inventories are separate and include `server_config.conf` and `server_files`, even when `.packignore` excludes them from clients. The server builder continues applying its inclusion rules, mod sidedness, dependencies, templates, and preservation policy.
+
+## Baselines, repair, and fallback
+
+The expected release inventory is cached separately from the instance's ownership/base-content inventory. The latter records managed paths and their last applied distribution hashes; it does not certify that user-writable disk files still match. Preserved settings retain their prior base identity, and unknown user files are not claimed or removed.
+
+Normal changelist updates inspect affected paths. **Repair** inspects the complete selected target, including files untouched by recent releases. Fresh installs, missing/invalid chains or caches, changed `.packignore` rules, different installation policies, divergent/downgrade histories, and chains longer than eight releases use complete sparse target reconciliation. Existing launcher installations perform this reconciliation once to establish the new policy baseline, reusing valid local content and runtime caches.
+
+All downloaded files are size/hash checked before activation. Git's blob SHA-1 includes its `blob <length>\0` header. Unsupported symlinks/submodules, unsafe destination names and case/Unicode-normalization collisions fail explicitly. Regular executable modes are applied to private staging copies without modifying shared cache objects.
+
+Transactions back up originals, delete obsolete owned files before installing replacements, handle file/directory transitions, and activate the manifest last. Unknown files blocking a transition cause rollback. Recovery removes staged files before restoring old parent files; it never recursively deletes user directories to make an update fit. Modified managed files also receive retained backups. Worlds, screenshots, local mods and shared Java/Mojang/Forge resources remain preserved.
+
+## Verification
+
+Run basic checks locally:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features qa -- -D warnings
+pnpm check
+pnpm build --no-bundle
+```
+
+Local HTTP fixtures cover skipped releases, final-only downloads, rename reuse with an empty cache, legacy baselines, tag pagination/peeling, truncated trees, missing/inconsistent/cyclic chains, policy/filter changes, case-only renames, failed downloads, and repair. Filesystem fixtures cover interrupted activation and transitions blocked by user data.
+
+An explicit live smoke test reads published metadata without downloading pack jar bodies:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --lib published_build145_chains_and_jar_rename_identities -- --ignored --nocapture
+```
+
+The live test resolves `139 → 145` through three manifests and verifies that `143 → 145`'s Auram, Imperium and Satiscraftory renames retain their exact blob IDs.

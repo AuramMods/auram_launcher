@@ -40,10 +40,7 @@ impl Core {
         let net = Downloader::new(&layout)?;
         let platform = Platform::current()?;
         Ok(Self {
-            packs: Packs {
-                layout: layout.clone(),
-                net: net.clone(),
-            },
+            packs: Packs::new(layout.clone(), net.clone()),
             runtime: Runtime {
                 layout: layout.clone(),
                 net: net.clone(),
@@ -163,6 +160,28 @@ async fn run_operation(
             )
         {
             bail!("Close Minecraft before changing its installation");
+        }
+        if matches!(
+            operation,
+            Operation::Install
+                | Operation::Repair
+                | Operation::Launch
+                | Operation::LaunchInstalled
+                | Operation::BuildServer
+                | Operation::ImportLegacy
+        ) {
+            // A prior activation can fail to roll back while Windows holds a file lock.
+            // Recover before reading version metadata, including the offline launch path.
+            storage::recover(
+                &core.layout.client(),
+                &core.layout.state("client-transaction"),
+            )?;
+        }
+        if matches!(operation, Operation::BuildServer | Operation::ImportLegacy) {
+            storage::recover(
+                &core.layout.server(),
+                &core.layout.state("server-transaction"),
+            )?;
         }
         match operation {
             Operation::Install => {

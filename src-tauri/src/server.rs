@@ -36,6 +36,7 @@ impl ServerConfig {
     fn manifest(&self, full: &Manifest) -> Result<Manifest> {
         let mut desired = Manifest {
             schema: 1,
+            policy: 0,
             tag: full.tag.clone(),
             files: BTreeMap::new(),
         };
@@ -267,6 +268,11 @@ fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<
         &root.join("eula.txt"),
         b"# Read https://aka.ms/MinecraftEULA before accepting in Auram.\neula=false\n",
     )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755))?;
+    }
     Ok(())
 }
 
@@ -518,9 +524,21 @@ fn local_file(path: &Path) -> Result<PackFile> {
         }
         hash.update(&buffer[..count]);
     }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if input.metadata()?.permissions().mode() & 0o111 != 0 {
+            "100755"
+        } else {
+            "100644"
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = "100644";
     Ok(PackFile {
         sha: hex::encode(hash.finalize()),
         size,
+        mode: mode.into(),
         source: None,
     })
 }

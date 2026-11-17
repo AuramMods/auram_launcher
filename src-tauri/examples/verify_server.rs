@@ -14,10 +14,7 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("auram-runtime-verification"));
     let layout = Layout::new(root)?;
-    let packs = Packs {
-        net: Downloader::new(&layout)?,
-        layout: layout.clone(),
-    };
+    let packs = Packs::new(layout.clone(), Downloader::new(&layout)?);
     let runtime = Runtime {
         net: packs.net.clone(),
         layout: layout.clone(),

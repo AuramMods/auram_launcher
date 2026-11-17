@@ -46,6 +46,8 @@ tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 ignore = "0.4"
+unicode-normalization = "0.1"
+same-file = "1"
 regex = "1"
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 
