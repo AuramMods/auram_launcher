@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 qa = []
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-plugin-opener", "dep:tauri-plugin-updater", "dep:tauri-plugin-process", "dep:tauri-plugin-single-instance"]
+desktop = ["dep:tauri", "dep:tauri-plugin-opener", "dep:tauri-plugin-updater", "dep:tauri-plugin-process", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-clipboard-manager"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -47,6 +47,7 @@ tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 ignore = "0.4"
 regex = "1"
+tauri-plugin-clipboard-manager = { version = "2", optional = true }
 
 [dev-dependencies]
 axum = "0.8"

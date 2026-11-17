@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import tempfile
 import time
 
 parser = argparse.ArgumentParser()
@@ -27,8 +28,8 @@ app = install / "Auram.app"
 if app.exists():
     shutil.rmtree(app)
 shutil.copytree(old / "Auram.app", app)
-data = session / "isolated-update-data"
-data.mkdir(exist_ok=True)
+data = Path(tempfile.mkdtemp(prefix="isolated-update-data-", dir=session))
+(session / "latest-updater-data.txt").write_text(str(data))
 log = data / "qa.log"
 log.write_text("")
 mode = {"valid": False}
@@ -75,14 +76,22 @@ def start():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 def stop(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    # Tauri's restart can launch through LaunchServices with a new process group.
+    # Terminate only the exact executable inside this explicitly isolated app copy.
+    executable = str(app / "Contents/MacOS/auram-launcher")
+    listing = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+    for line in listing.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[1] == executable:
+            try:
+                os.kill(int(parts[0]), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
+        process.terminate()
+        process.wait(timeout=5)
 
 process = None
 try:

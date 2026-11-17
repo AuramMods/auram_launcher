@@ -124,6 +124,11 @@ impl Layout {
         Self::new(root)
     }
     pub fn new(root: PathBuf) -> Result<Self> {
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()?.join(root)
+        };
         for name in [
             "cache",
             "downloads",
@@ -246,6 +251,7 @@ pub struct Settings {
     pub schema: u32,
     pub memory_mib: u64,
     pub microsoft_client_id: String,
+    pub browser_login: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -258,6 +264,7 @@ impl Default for Settings {
                 (memory / 2).clamp(2048, 8192)
             },
             microsoft_client_id: "cf95d5d7-7830-4ad4-a70e-d54e50e80b40".into(),
+            browser_login: false,
         }
     }
 }

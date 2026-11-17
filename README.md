@@ -26,7 +26,7 @@ Bundled production builds require `TAURI_SIGNING_PRIVATE_KEY` and its optional `
 
 ## Playing and managing files
 
-Install Auram, sign in with Microsoft through your system browser, then launch. Refresh credentials are stored in macOS Keychain or Windows Credential Manager. Account selection and sign-out are available in the launcher. Microsoft can require reauthentication after revocation or policy changes.
+Install Auram, choose Sign in with Microsoft, then click **Copy Code**. That click copies the displayed code and opens Microsoft in your browser in one action. Complete the first sign-in, then launch. No browser or clipboard action occurs before the click. Refresh credentials are stored in macOS Keychain or Windows Credential Manager. Account selection and sign-out are available in the launcher. Microsoft can require reauthentication after revocation or policy changes.
 
 Pack versions come from `AuramMods/Auram` tags. Downloads use immutable commit files verified with Git blob checksums. Only changed managed files are applied. Shared Java, Mojang assets, libraries, and Forge runtime files survive pack updates; downloads resume when the server supports ranges. Repair verifies files rather than trusting an installation marker. Unmanaged files are retained, and changed managed files are backed up before replacement. Transactions recover interrupted installations on the next start.
 
@@ -36,15 +36,15 @@ Minecraft stays running when its launcher window closes. The launcher remains in
 
 ## Servers
 
-Install a client pack first, then choose **Build server**. The builder uses that exact pack commit and `server_config.conf` inclusion, exclusion, whitelist, and template settings. It installs matching Forge server files and omits author-specific worlds/access lists. Rebuilding preserves world and user settings.
+Install a client pack first, then choose **Build server**. The builder uses that exact pack commit and `server_config.conf` inclusion, exclusion, whitelist, and template settings. It installs matching Forge server files, restores mandatory server-side dependencies mistakenly excluded by filename rules, and omits author-specific worlds/access lists. Rebuilding preserves world and user settings.
 
-Read the Minecraft EULA and explicitly accept it in the Server tab. Open the server folder and run `run.sh` on macOS or `run.bat` on Windows. The scripts use `JAVA_HOME`, available Java, or the launcher's managed Java on the same machine; a copied server requires Java 17 on its destination. Adjust `user_jvm_args.txt` for server memory.
+Read the Minecraft EULA and explicitly accept it in the Server tab. Open the server folder and run `run.sh` on macOS or `run.bat` on Windows. The scripts prefer the launcher's managed Java 17 on the same machine, then fall back to `JAVA_HOME` or available Java if that runtime is absent; a copied server requires Java 17 on its destination. Adjust `user_jvm_args.txt` for server memory.
 
 ## Microsoft application registration
 
-The default application ID is the registration previously used by Auram's `microshaft` package. It must allow personal Microsoft accounts, public native clients, and the system-browser redirect `http://localhost/oauth/callback`. Microsoft ignores the dynamically chosen port for registered localhost redirects. The authorization request uses PKCE with `XboxLive.signin offline_access`; no client secret belongs in the desktop app.
+The default application ID is the existing registration previously used by Auram's `microshaft` package. It supports device sign-in with `XboxLive.signin offline_access` without changing Entra. The code is needed when adding or reauthorizing an account; subsequent launches silently renew the stored refresh credentials.
 
-If that registration needs changes, update its native redirect settings in Entra. An independently registered replacement may require Minecraft service authorization. The application ID can be changed under advanced authentication settings. Authentication errors retain existing credentials on transient failures; account interaction remains necessary to prove real-account login and renewal.
+An optional advanced browser-callback mode implements authorization-code flow with PKCE. Enable it only for an authorized registration with the native redirect `http://localhost/oauth/callback` configured. The existing registration currently rejects that redirect, so it is not the default. An independently registered replacement may require Minecraft service authorization. No client secret belongs in the desktop app. Authentication errors retain credentials on transient failures; real-account login and renewal still require account interaction to exercise live.
 
 ## Releases
 

@@ -451,6 +451,14 @@ impl Runtime {
             game.extend(arguments(meta, "game", self.platform)?);
         }
         let mut output = jvm.into_iter().map(replace).collect::<Result<Vec<_>>>()?;
+        let vanilla_jar = format!("{}.jar", ready.versions.minecraft);
+        for argument in &mut output {
+            if let Some(ignore) = argument.strip_prefix("-DignoreList=") {
+                if !ignore.split(',').any(|entry| entry == vanilla_jar) {
+                    *argument = format!("{argument},{vanilla_jar}");
+                }
+            }
+        }
         if !output
             .iter()
             .any(|a| a == "-cp" || a == "-classpath" || a == "--class-path")
@@ -524,7 +532,9 @@ pub fn allowed(value: &Value, platform: Platform) -> bool {
             }
         }
         if let Some(arch) = rule["os"]["arch"].as_str() {
-            if !regex::Regex::new(arch).is_ok_and(|r| r.is_match(platform.arch())) {
+            if !regex::Regex::new(&format!("^(?:{arch})$"))
+                .is_ok_and(|r| r.is_match(platform.arch()))
+            {
                 continue;
             }
         }
@@ -858,5 +868,48 @@ mod tests {
             archive_link("jdk/legal/module/LICENSE", "../../license/LICENSE").unwrap(),
             "jdk/license/LICENSE"
         );
+    }
+    #[test]
+    fn forge_arguments_preserve_vanilla_exclusion_and_exact_architecture_rules() {
+        assert!(!allowed(
+            &json!({"rules":[{"action":"allow","os":{"arch":"x86"}}]}),
+            Platform::WindowsX64
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().join("World with spaces 世界")).unwrap();
+        let runtime = Runtime {
+            net: Downloader::new(&layout).unwrap(),
+            layout,
+            platform: Platform::MacArm,
+        };
+        let ready = Ready {
+            java: PathBuf::new(),
+            versions: Versions {
+                minecraft: "1.20.1".into(),
+                forge: "47.4.10".into(),
+            },
+            vanilla: json!({"libraries":[],"assetIndex":{"id":"5"},"arguments":{"jvm":["-cp","${classpath}"],"game":["--username","${auth_player_name}","--xuid","${auth_xuid}"]}}),
+            forge: json!({"mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher","arguments":{"jvm":["-DignoreList=forge-,${version_name}.jar"]}}),
+        };
+        let session = Credentials {
+            minecraft_token: "fixture-only".into(),
+            profile: Some(crate::auth::Profile {
+                name: "Player".into(),
+                uuid: "uuid".into(),
+                xuid: "xbox-user-id".into(),
+            }),
+            ..Default::default()
+        };
+        let args = runtime
+            .arguments(&ready, &session, &Settings::default())
+            .unwrap();
+        assert!(args.contains(&"-DignoreList=forge-,1.20.1-forge-47.4.10.jar,1.20.1.jar".into()));
+        assert_eq!(
+            args[args.iter().position(|arg| arg == "--xuid").unwrap() + 1],
+            "xbox-user-id"
+        );
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("World with spaces 世界")));
     }
 }

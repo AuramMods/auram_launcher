@@ -75,6 +75,33 @@ pub struct Auth {
     service_base: String,
     xbl_url: String,
     xsts_url: String,
+    device_url: String,
+    challenge: Arc<std::sync::Mutex<Option<DeviceChallenge>>>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceChallenge {
+    pub code: String,
+    pub verification_uri: String,
+    pub expires_at: i64,
+}
+struct ChallengeGuard(Arc<std::sync::Mutex<Option<DeviceChallenge>>>);
+impl Drop for ChallengeGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+#[derive(Deserialize)]
+struct DeviceCode {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    #[serde(default = "poll_interval")]
+    interval: u64,
+}
+fn poll_interval() -> u64 {
+    5
 }
 #[derive(Deserialize)]
 struct OAuthToken {
@@ -88,6 +115,8 @@ impl Auth {
             vault: Arc::new(NativeVault),
             gate: Arc::new(Mutex::new(())),
             token_url: TOKEN.into(),
+            device_url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode".into(),
+            challenge: Default::default(),
             service_base: "https://api.minecraftservices.com".into(),
             xbl_url: "https://user.auth.xboxlive.com/user/authenticate".into(),
             xsts_url: "https://xsts.auth.xboxlive.com/xsts/authorize".into(),
@@ -129,6 +158,92 @@ impl Auth {
             self.vault.save(&stored)?;
         }
         self.exchange(stored, &token.access_token, job).await
+    }
+    pub fn device_challenge(&self) -> Result<DeviceChallenge> {
+        let challenge = self
+            .challenge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("No Microsoft sign-in code is active")?;
+        if challenge.expires_at <= chrono::Utc::now().timestamp() {
+            bail!("The sign-in code expired. Start sign-in again");
+        }
+        Ok(challenge)
+    }
+    pub async fn sign_in_device(
+        &self,
+        client_id: &str,
+        job: &Job,
+        display: impl FnOnce(DeviceChallenge),
+    ) -> Result<Profile> {
+        let _guard = self.gate.lock().await;
+        let response = tokio::select! {_=job.cancel.cancelled()=>bail!("Sign-in cancelled"),response=self.client.post(&self.device_url).form(&[("client_id",client_id),("scope","XboxLive.signin offline_access")]).send()=>response?};
+        let code: DeviceCode = response.error_for_status()?.json().await?;
+        let uri = url::Url::parse(&code.verification_uri)?;
+        if uri.scheme() != "https"
+            || !matches!(
+                uri.host_str(),
+                Some(
+                    "microsoft.com"
+                        | "www.microsoft.com"
+                        | "login.microsoftonline.com"
+                        | "login.live.com"
+                )
+            )
+        {
+            bail!("Microsoft returned an unexpected verification URL");
+        }
+        let challenge = DeviceChallenge {
+            code: code.user_code,
+            verification_uri: code.verification_uri,
+            expires_at: chrono::Utc::now().timestamp() + code.expires_in as i64,
+        };
+        *self.challenge.lock().unwrap_or_else(|e| e.into_inner()) = Some(challenge.clone());
+        let _cleanup = ChallengeGuard(self.challenge.clone());
+        display(challenge);
+        job.progress(
+            "auth",
+            "Use Copy Code to open Microsoft, then finish signing in",
+            0,
+            0,
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(code.expires_in);
+        let mut interval = code.interval.max(1);
+        loop {
+            tokio::select! {_=job.cancel.cancelled()=>bail!("Sign-in cancelled"),_=tokio::time::sleep_until(deadline)=>bail!("Microsoft sign-in code expired"),_=tokio::time::sleep(Duration::from_secs(interval))=>{}}
+            let response = tokio::select! {_=job.cancel.cancelled()=>bail!("Sign-in cancelled"),_=tokio::time::sleep_until(deadline)=>bail!("Microsoft sign-in code expired"),response=self.client.post(&self.token_url).form(&[("client_id",client_id),("grant_type","urn:ietf:params:oauth:grant-type:device_code"),("device_code",&code.device_code)]).send()=>response?};
+            let status = response.status();
+            let value: Value = response.json().await?;
+            if status.is_success() {
+                let token: OAuthToken = serde_json::from_value(value)?;
+                let credentials = Credentials {
+                    client_id: client_id.into(),
+                    refresh_token: token
+                        .refresh_token
+                        .context("Microsoft did not issue a refresh token")?,
+                    ..Default::default()
+                };
+                self.vault.save(&credentials)?;
+                return self
+                    .exchange(credentials, &token.access_token, job)
+                    .await?
+                    .profile
+                    .context("Minecraft profile missing");
+            }
+            match value["error"].as_str().unwrap_or("authentication_failed") {
+                "authorization_pending" => {}
+                "slow_down" => interval = (interval + 5).min(60),
+                "authorization_declined" | "access_denied" => {
+                    bail!("Microsoft sign-in was declined")
+                }
+                "expired_token" => bail!("Microsoft sign-in code expired"),
+                error => bail!(
+                    "Microsoft sign-in failed: {error} (HTTP {})",
+                    status.as_u16()
+                ),
+            }
+        }
     }
     pub async fn sign_in(
         &self,
@@ -403,6 +518,7 @@ mod tests {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let counter = refreshes.clone();
         let router=Router::new()
+            .route("/device",post(||async {Json(json!({"device_code":"private-device-secret","user_code":"TEST-CODE","verification_uri":"https://microsoft.com/devicelogin","expires_in":30,"interval":1}))}))
             .route("/token",post(move|| {let counter=counter.clone();async move {counter.fetch_add(1,Ordering::SeqCst);Json(json!({"access_token":"msa","refresh_token":"rotated"}))}}))
             .route("/xbl",post(||async {Json(json!({"Token":"xbl"}))}))
             .route("/xsts",post(||async {Json(json!({"Token":"xsts","DisplayClaims":{"xui":[{"uhs":"hash","xid":"xbox-id"}]}}))}))
@@ -443,6 +559,20 @@ mod tests {
         assert_eq!(vault.load().unwrap().unwrap().refresh_token, "rotated");
         auth.sign_out().await.unwrap();
         assert!(vault.load().unwrap().is_none());
+        auth.xbl_url = format!("{}/xbl", auth.service_base);
+        auth.device_url = format!("{}/device", auth.service_base);
+        let displayed = std::sync::atomic::AtomicBool::new(false);
+        let profile = auth
+            .sign_in_device("client", &job, |challenge| {
+                assert_eq!(challenge.code, "TEST-CODE");
+                displayed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert!(displayed.load(Ordering::SeqCst));
+        assert_eq!(profile.name, "Player");
+        assert!(auth.device_challenge().is_err());
+        assert_eq!(vault.load().unwrap().unwrap().refresh_token, "rotated");
         server.abort();
     }
     #[tokio::test]

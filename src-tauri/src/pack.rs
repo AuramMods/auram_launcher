@@ -259,7 +259,19 @@ impl Packs {
                     next.files.insert(relative.clone(), file.clone());
                     continue;
                 }
-                if mutable(relative, server) || (previous.is_none() && old.is_some()) {
+                let modified_server_config = server
+                    && ["config/", "defaultconfigs/"]
+                        .iter()
+                        .any(|prefix| relative.starts_with(prefix))
+                    && previous.is_none_or(|file| {
+                        !Checksum::GitBlob(file.sha.clone())
+                            .verify(&target)
+                            .unwrap_or(false)
+                    });
+                if modified_server_config
+                    || mutable(relative, server)
+                    || (previous.is_none() && old.is_some())
+                {
                     if let Some(previous) = previous {
                         next.files.insert(relative.clone(), previous.clone());
                     }
@@ -284,6 +296,14 @@ impl Packs {
                 }
                 let target = storage::safe_join(root, relative)?;
                 if target.exists() {
+                    if server
+                        && ["config/", "defaultconfigs/"]
+                            .iter()
+                            .any(|prefix| relative.starts_with(prefix))
+                        && !Checksum::GitBlob(file.sha.clone()).verify(&target)?
+                    {
+                        continue;
+                    }
                     if !Checksum::GitBlob(file.sha.clone()).verify(&target)? {
                         storage::atomic_copy(&target, &storage::safe_join(&backup, relative)?)?;
                     }
@@ -438,6 +458,54 @@ mod tests {
         assert_eq!(
             fs::read(layout.runtime().join("assets/objects/unchanged")).unwrap(),
             b"asset"
+        );
+    }
+    #[tokio::test]
+    async fn server_updates_preserve_locally_modified_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let packs = Packs {
+            net: Downloader::new(&layout).unwrap(),
+            layout: layout.clone(),
+        };
+        let original = file(b"original");
+        let updated = file(b"pack-update");
+        storage::atomic_write(&packs.blob_path(&updated), b"pack-update").unwrap();
+        storage::atomic_write(
+            &layout.server().join("config/settings.toml"),
+            b"my-settings",
+        )
+        .unwrap();
+        let old = Manifest {
+            schema: 1,
+            tag: PackTag {
+                name: "old".into(),
+                sha: "old".into(),
+            },
+            files: BTreeMap::from([("config/settings.toml".into(), original)]),
+        };
+        let desired = Manifest {
+            schema: 1,
+            tag: PackTag {
+                name: "new".into(),
+                sha: "new".into(),
+            },
+            files: BTreeMap::from([("config/settings.toml".into(), updated)]),
+        };
+        packs
+            .reconcile(
+                &layout.server(),
+                &layout.state("server-tx"),
+                Some(&old),
+                &desired,
+                &Job::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(layout.server().join("config/settings.toml")).unwrap(),
+            b"my-settings"
         );
     }
 }

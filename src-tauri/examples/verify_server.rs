@@ -8,7 +8,11 @@ use auram_core::{
 };
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let layout = Layout::new(std::env::temp_dir().join("auram-runtime-verification"))?;
+    let root = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("auram-runtime-verification"));
+    let layout = Layout::new(root)?;
     let packs = Packs {
         net: Downloader::new(&layout)?,
         layout: layout.clone(),

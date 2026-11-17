@@ -12,11 +12,12 @@ import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import emblem from '../assets/icon.png';
 import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
-type Settings = {schema:number;memoryMib:number;microsoftClientId:string};
+type Settings = {schema:number;memoryMib:number;microsoftClientId:string;browserLogin:boolean};
 type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;busy:boolean;game:{running:boolean;pid:number|null;lastExit:string|null};legacyAvailable:boolean;serverReady:boolean;eulaAccepted:boolean;dataPath:string};
 type JobProgress = {operation:string;message:string;completed:number;total:number;bytes:number;totalBytes:number};
 type Operation = 'install'|'repair'|'launch'|'signIn'|'signOut'|'buildServer'|'importLegacy';
@@ -29,6 +30,8 @@ function App() {
   const [active,setActive]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
   const [settings,setSettings]=React.useState<Settings|null>(null);
+  const [challenge,setChallenge]=React.useState<{code:string;verificationUri:string;expiresAt:number}|null>(null);
+  const [codeCopied,setCodeCopied]=React.useState(false);
   const [advanced,setAdvanced]=React.useState(false);
   const [updateStatus,setUpdateStatus]=React.useState('');
   const refresh=React.useCallback(async()=>{const next=await invoke<Status>('get_status');setStatus(next);setSettings(previous=>previous??next.settings);return next;},[]);
@@ -36,15 +39,16 @@ function App() {
     let disposed=false;
     refresh().then(()=>invoke<string>('update_launcher',{manual:false}).then(setUpdateStatus).catch(e=>setUpdateStatus(String(e)))).catch(e=>setError(String(e)));
     const subscription=listen<JobProgress>('progress',event=>{if(!disposed)setProgress(event.payload);});
+    const challengeSubscription=listen<{code:string;verificationUri:string;expiresAt:number}>('device-challenge',event=>{if(!disposed){setCodeCopied(false);setChallenge(event.payload);}});
     const interval=setInterval(()=>{refresh().catch(()=>{});},1500);
-    return ()=>{disposed=true;clearInterval(interval);void subscription.then(unlisten=>unlisten());};
+    return ()=>{disposed=true;clearInterval(interval);void subscription.then(unlisten=>unlisten());void challengeSubscription.then(unlisten=>unlisten());};
   },[refresh]);
   const busy=active||!!status?.busy;
   async function run(operation:Operation) {
     setActive(true);setError('');setNotice('');setProgress(null);
     try {await invoke('run_operation',{operation});await refresh();setNotice(operation==='launch'?'Minecraft started. Auram will keep your game log.':operation==='buildServer'?'Server files are ready. Open the server folder to start it.':operation==='signIn'?'Signed in. Your session will refresh automatically.':'All set.');}
     catch(e){setError(String(e));}
-    finally {setActive(false);setProgress(null);}
+    finally {setActive(false);setProgress(null);setChallenge(null);}
   }
   async function action(name:string,args?:Record<string,unknown>) {try {setError('');await invoke(name,args);await refresh();}catch(e){setError(String(e));}}
   async function save() {if(settings){await action('save_settings',{settings});setNotice('Settings saved.');}}
@@ -86,11 +90,18 @@ function App() {
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
           <Card><CardHeader><CardTitle>Game memory</CardTitle><CardDescription>Leave enough memory available for your operating system.</CardDescription></CardHeader><CardContent><div className="memory-value">{((settings?.memoryMib??4096)/1024).toFixed(1)} <span>GiB</span></div><Slider aria-label="Game memory in MiB" min={1024} max={32768} step={512} value={[settings?.memoryMib??4096]} disabled={busy} onValueChange={([memoryMib])=>setSettings(current=>current?{...current,memoryMib}:current)}/><div className="slider-labels"><span>1 GiB</span><span>32 GiB</span></div><Button className="mt-5" disabled={busy||!settings} onClick={()=>void save()}>Save preferences</Button></CardContent></Card>
           <div className="detail-grid mt-5"><Card><CardHeader><CardTitle>Files & diagnostics</CardTitle><CardDescription>Repair checks your managed files and downloads only what is missing or damaged.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>void action('open_folder',{folder:'data'})}><FolderOpen/>Data folder</Button><Button variant="outline" onClick={()=>void action('open_folder',{folder:'logs'})}>Logs</Button><Button variant="secondary" disabled={busy||running||!installed} onClick={()=>void run('repair')}><RefreshCw/>Repair installation</Button></CardContent></Card><Card><CardHeader><CardTitle>Launcher updates</CardTitle><CardDescription>New launcher builds install automatically on startup.</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={busy} onClick={()=>void updateLauncher()}><RefreshCw/>Check for updates</Button><p className="mt-3 text-xs text-muted-foreground" role="status">{updateStatus||`Installed: Build ${status?.build??'…'}`}</p></CardContent></Card></div>
-          <button className="text-action mt-6" onClick={()=>setAdvanced(!advanced)}>{advanced?'Hide':'Show'} advanced authentication settings</button>{advanced&&<Card className="mt-3"><CardContent className="pt-5"><Label htmlFor="client-id">Microsoft application ID</Label><Input id="client-id" value={settings?.microsoftClientId??''} onChange={event=>setSettings(current=>current?{...current,microsoftClientId:event.target.value}:current)} className="mt-2"/><p className="text-xs text-muted-foreground mt-2">Changing the application ID requires signing in again.</p><Button className="mt-3" disabled={busy} onClick={()=>void save()}>Save</Button></CardContent></Card>}
+          <button className="text-action mt-6" onClick={()=>setAdvanced(!advanced)}>{advanced?'Hide':'Show'} advanced authentication settings</button>{advanced&&<Card className="mt-3"><CardContent className="pt-5"><Label htmlFor="client-id">Microsoft application ID</Label><Input id="client-id" value={settings?.microsoftClientId??''} onChange={event=>setSettings(current=>current?{...current,microsoftClientId:event.target.value}:current)} className="mt-2"/><p className="text-xs text-muted-foreground mt-2">Changing the application ID requires signing in again.</p><div className="mt-4 flex items-center justify-between gap-4"><Label htmlFor="browser-login">Use a configured browser callback</Label><Switch id="browser-login" checked={settings?.browserLogin??false} onCheckedChange={browserLogin=>setSettings(current=>current?{...current,browserLogin}:current)}/></div><p className="text-xs text-muted-foreground mt-2">Enable only for an application registration with the desktop callback configured. The existing Auram registration uses the code flow with automatic session renewal.</p><Button className="mt-3" disabled={busy} onClick={()=>void save()}>Save</Button></CardContent></Card>}
         </>}
       </main>
       <footer className="activity-bar" aria-live="polite">{busy?<><LoaderCircle className="animate-spin text-violet-300" size={15}/><div className="activity-content"><div className="activity-text"><span>{progress?.message??'Getting things ready…'}</span>{progress?.totalBytes? <span>{bytes(progress.bytes)} / {bytes(progress.totalBytes)}</span>:percent!==null?<span>{Math.round(percent)}%</span>:null}</div><Progress value={percent??undefined} className={percent===null?'indeterminate':''}/></div><Button size="sm" variant="ghost" onClick={()=>void action('cancel_operation')}>Cancel</Button></>:<><span className="status-dot on"/><span>{running?'Minecraft is running. Closing this window keeps your game open.':'Ready when you are.'}</span><span className="activity-right">AURAM / {status?.pack?.name??'NEW INSTALLATION'}</span></>}</footer>
     </div>
+    <Dialog open={challenge!==null} onOpenChange={open=>{if(!open){setChallenge(null);void invoke('cancel_operation');}}}>
+      <DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Sign in with Microsoft</DialogTitle><DialogDescription>Copy your code, then enter it on Microsoft’s sign-in page. Auram will remember your session securely.</DialogDescription></DialogHeader>
+      <div className="rounded-lg border border-zinc-800 bg-black p-6 text-center"><code className="select-all text-3xl font-medium tracking-[.2em] text-violet-200">{challenge?.code}</code></div>
+      <p className="text-xs text-muted-foreground">The button copies this code and opens your browser in one action. Complete sign-in there, then return to Auram.</p>
+      <DialogFooter><Button variant="ghost" onClick={()=>{setChallenge(null);void invoke('cancel_operation');}}>Cancel</Button><Button onClick={async()=>{try{await invoke('copy_code_and_open');setCodeCopied(true);}catch(e){setError(String(e));}}}>{codeCopied?<Check/>:<ArrowRight/>}{codeCopied?'Copy Code again':'Copy Code'}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>;
 }
 document.documentElement.classList.add('dark');

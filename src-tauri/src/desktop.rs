@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 pub struct Core {
@@ -142,6 +143,7 @@ async fn run_operation(
     backend: tauri::State<'_, Backend>,
 ) -> Result<(), String> {
     let core = backend.core()?;
+    let challenge_app = app.clone();
     let emit = Arc::new(move |progress: Progress| {
         let _ = app.emit("progress", progress);
     });
@@ -188,12 +190,20 @@ async fn run_operation(
                     .await?;
             }
             Operation::SignIn => {
-                let id = core.settings().microsoft_client_id;
-                core.auth
-                    .sign_in(&id, job, |url| {
-                        tauri_plugin_opener::open_url(url, None::<&str>).map_err(Into::into)
-                    })
-                    .await?;
+                let settings = core.settings();
+                if settings.browser_login {
+                    core.auth
+                        .sign_in(&settings.microsoft_client_id, job, |url| {
+                            tauri_plugin_opener::open_url(url, None::<&str>).map_err(Into::into)
+                        })
+                        .await?;
+                } else {
+                    core.auth
+                        .sign_in_device(&settings.microsoft_client_id, job, move |challenge| {
+                            let _ = challenge_app.emit("device-challenge", challenge);
+                        })
+                        .await?;
+                }
             }
             Operation::SignOut => core.auth.sign_out().await?,
             Operation::BuildServer => server::build(&core.packs, &core.runtime, job).await?,
@@ -215,6 +225,20 @@ async fn run_operation(
     }
     .await;
     result.map_err(|e| format!("{e:#}"))
+}
+#[tauri::command]
+fn copy_code_and_open(app: tauri::AppHandle, backend: tauri::State<Backend>) -> Result<(), String> {
+    let challenge = backend
+        .core()?
+        .auth
+        .device_challenge()
+        .map_err(|e| e.to_string())?;
+    app.clipboard()
+        .write_text(challenge.code)
+        .map_err(|e| e.to_string())?;
+    app.opener()
+        .open_url(challenge.verification_uri, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 fn cancel_operation(backend: tauri::State<Backend>) -> Result<(), String> {
@@ -282,6 +306,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -305,6 +330,7 @@ pub fn run() {
             retry_initialize,
             run_operation,
             cancel_operation,
+            copy_code_and_open,
             save_settings,
             open_folder,
             set_server_eula,

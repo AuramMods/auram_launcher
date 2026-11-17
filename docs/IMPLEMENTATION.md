@@ -1,15 +1,27 @@
-# Tauri migration progress
+# Native launcher implementation
 
-The implementation follows committed cycles: foundation; persistence/migration; downloads; pack reconciliation/runtime cache; authentication; game runtime; server builder; UI/updater/releases; integrated verification/publication.
+The Flutter/Dart implementation and bundled ZIP were replaced with Tauri 2, a Rust core, React/TypeScript, pnpm, and an OLED-black shadcn interface.
 
-The Flutter source remains as migration reference until the replacement passes integrated verification. No production installation is modified by development runs.
+## Behavior
 
-Current cycle: native foundation. Production release is not yet configured.
+- Pack tags resolve to immutable GitHub commits. File manifests and Git blob hashes support incremental, verified updates without removing shared runtime caches or user worlds.
+- Downloads use persistent partial files, range/validator handling, bounded concurrency, cancellation, retries, and checksum verification.
+- Atomic writes, installation journals, rollback, retained backups, and restartable legacy import preserve existing installations.
+- The existing Microsoft registration supports device sign-in with offline access. The user explicitly chose to retain this registration rather than change Entra. Sign-in displays a code; **Copy Code** copies it and opens Microsoft in one action. Refresh credentials remain in native credential storage and renew silently. Optional PKCE callback mode is available for appropriately configured registrations.
+- Managed Java 17, official Forge installers, platform-specific native libraries, Java argument files, and redacted process output handle game/runtime setup.
+- Server builds use pack inclusion/exclusion settings and mod sidedness metadata, restore required common libraries excluded by filename rules, preserve user configuration/worlds, and generate scripts preferring managed Java 17.
+- Commit-count versions, a non-forced release branch update, signed startup updates, and two-platform GitHub Actions builds implement distribution. Updater private keys stay outside Git and in repository Actions secrets.
 
-Persistence/download cycle: added non-destructive legacy import, development isolation, cross-platform safe paths, atomic JSON, rollback journals, job cancellation/serialization, verified resumable downloads and bounded queues. Recovery, migration, Git blob hashing, range support, ignored ranges and 416 responses are covered by isolated tests.
+## Verification evidence
 
-Runtime/server/UI cycle: native Java 17 archive and checksum pins; safe ZIP extraction with internal links materialized as independent files; official Forge client/server installation; persistent Mojang assets; architecture-specific LWJGL selection; Java argument files and redacted process logging; real pack-driven server exclusions/inclusions; explicit server EULA state; typed desktop operations and OLED-black shadcn interface. Live isolated Java/Forge client provisioning and complete pack 1.0.7 server build succeeded. Microsoft user interaction, Windows execution, updater transition, and release publication remain outstanding.
+- Native ARM64 packaged UI: OLED rendering, navigation, settings persistence, device code presentation, cancellation, and recoverable missing-update errors exercised.
+- Real pack 1.0.7 metadata and hashes verified. Official Java 17 / Forge 47.4.10 client provisioned. Repeating provisioning transferred zero download body bytes.
+- Isolated signed updater: rejected a mismatched signature, then installed Build 23 over Build 22 and restarted into the exact newer commit. Both builds came from real commits; production data was excluded.
+- Rust tests cover refresh rotation/concurrency, revoked credentials, device challenge lifecycle, download corruption/ranges/cancellation/deduplication, path/archive safety, migration, transaction rollback, configuration preservation, launch arguments and server dependencies.
+- Real temporary Git remote tests cover reachable commit counts, release retries, unpublished local work and rejection of divergent release pushes.
+- Windows and macOS CI passed for committed Build 23. The latest Copy Code/server refinements require a final two-platform run.
+- The real pack server reached Minecraft's ready state in an isolated directory. Fresh-directory startup and shutdown verification is the current live check.
 
-Release cycle: commit-derived build metadata, fast-forward release command with real-remote tests, two-target CI/build matrix, draft-only artifact aggregation/publication, signed updater downloads with safe retry state, and startup update checks. Updater private key is stored outside Git and in repository Actions secrets. Local Xcode 27 rejected stripped Rust proc-macro dylibs; release builds explicitly retain build-tool symbols to avoid the reproduced LINKEDIT alignment failure.
+## Distribution and interactive limits
 
-Hardening verification: eighteen Rust tests now cover changed validators, malformed content ranges, corrupt-body retries, duplicate cache destinations, actual apply-failure rollback, revoked authentication, and archive-link traversal. A reproducible macOS QA harness rejects a mismatched update signature and checks the restarted binary's exact commit after a valid signed update. Published builds omit the QA feature.
+Full real-account Minecraft authentication/launch requires the account owner's interaction; protocol behavior and the real registration's device challenge have been exercised without reading private account credentials. macOS distribution currently uses ad-hoc signing, with mandatory updater signatures; Apple notarization and Windows Authenticode credentials are not configured in CI. Initial installation may require an OS trust confirmation. Publication and endpoint verification remain the final work items.

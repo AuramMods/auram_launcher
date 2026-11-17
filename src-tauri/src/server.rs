@@ -151,6 +151,8 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     )?)
     .context("Invalid server_config.conf")?;
     let mut desired = config.manifest(&full)?;
+    filter_sided_mods(packs, &full, &config, &mut desired, job).await?;
+    resolve_dependencies(packs, &full, &mut desired, job).await?;
     let versions = Versions::read(&packs.layout.client())?;
     let java = runtime.java(job).await?;
     let installer = runtime.installer(&versions, job).await?;
@@ -182,15 +184,6 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
             &[],
         )
         .await?;
-        let java_quote = format!("'{}'", java.to_string_lossy().replace('\'', "'\\''"));
-        let java_windows = java.to_string_lossy().replace('%', "%%");
-        storage::atomic_write(&staging.join("run.sh"),format!("#!/bin/sh\nset -eu\ncd -- \"$(dirname -- \"$0\")\"\nif [ -n \"${{JAVA_HOME:-}}\" ]; then JAVA=\"$JAVA_HOME/bin/java\"; elif command -v java >/dev/null 2>&1; then JAVA=java; else JAVA={java_quote}; fi\nexec \"$JAVA\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/unix_args.txt nogui \"$@\"\n",versions.minecraft,versions.forge).as_bytes())?;
-        storage::atomic_write(&staging.join("run.bat"),format!("@echo off\r\ncd /d \"%~dp0\"\r\nset \"JAVA={java_windows}\"\r\nif defined JAVA_HOME set \"JAVA=%JAVA_HOME%\\bin\\java.exe\"\r\nif not exist \"%JAVA%\" set \"JAVA=java\"\r\n\"%JAVA%\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/win_args.txt nogui %*\r\n",versions.minecraft,versions.forge).as_bytes())?;
-        storage::atomic_write(&staging.join("user_jvm_args.txt"), b"-Xms512M\n-Xmx4G\n")?;
-        storage::atomic_write(
-            &staging.join("eula.txt"),
-            b"# Read https://aka.ms/MinecraftEULA before accepting in Auram.\neula=false\n",
-        )?;
         runtime::snapshot_tree(&staging, &staging.join(".verified.json"), &[])?;
         if cache.exists() {
             fs::remove_dir_all(&cache)?;
@@ -198,6 +191,8 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
         fs::create_dir_all(cache.parent().context("Server cache parent missing")?)?;
         fs::rename(staging, &cache)?;
     }
+    write_start_scripts(&cache, &java, &versions)?;
+    runtime::snapshot_tree(&cache, &snapshot, &[])?;
     for entry in walkdir::WalkDir::new(&cache).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -246,6 +241,261 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     );
     Ok(())
 }
+fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<()> {
+    let java_quote = format!("'{}'", java.to_string_lossy().replace('\'', "'\\''"));
+    let java_windows = java.to_string_lossy().replace('%', "%%");
+    storage::atomic_write(&root.join("run.sh"),format!("#!/bin/sh\nset -eu\ncd -- \"$(dirname -- \"$0\")\"\nJAVA={java_quote}\nif [ ! -x \"$JAVA\" ]; then if [ -n \"${{JAVA_HOME:-}}\" ]; then JAVA=\"$JAVA_HOME/bin/java\"; else JAVA=java; fi; fi\nexec \"$JAVA\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/unix_args.txt nogui \"$@\"\n",versions.minecraft,versions.forge).as_bytes())?;
+    storage::atomic_write(&root.join("run.bat"),format!("@echo off\r\ncd /d \"%~dp0\"\r\nset \"JAVA={java_windows}\"\r\nif not exist \"%JAVA%\" if defined JAVA_HOME set \"JAVA=%JAVA_HOME%\\bin\\java.exe\"\r\nif not exist \"%JAVA%\" set \"JAVA=java\"\r\n\"%JAVA%\" @user_jvm_args.txt @libraries/net/minecraftforge/forge/{}-{}/win_args.txt nogui %*\r\n",versions.minecraft,versions.forge).as_bytes())?;
+    storage::atomic_write(
+        &root.join("user_jvm_args.txt"),
+        format!(
+            "-Xms512M\n-Xmx{}M\n",
+            storage::Settings::default().memory_mib
+        )
+        .as_bytes(),
+    )?;
+    storage::atomic_write(
+        &root.join("eula.txt"),
+        b"# Read https://aka.ms/MinecraftEULA before accepting in Auram.\neula=false\n",
+    )?;
+    Ok(())
+}
+
+#[derive(Default, Clone)]
+struct ModMetadata {
+    ids: Vec<String>,
+    required: Vec<String>,
+    client_only: bool,
+}
+fn mod_metadata(path: &Path) -> Result<ModMetadata> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
+    let forge = archive
+        .file_names()
+        .any(|name| name == "META-INF/mods.toml");
+    if !forge {
+        if let Ok(mut entry) = archive.by_name("fabric.mod.json") {
+            if entry.size() > 2 * 1024 * 1024 {
+                bail!("Mod metadata is too large");
+            }
+            let mut text = String::new();
+            entry.read_to_string(&mut text)?;
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            return Ok(ModMetadata {
+                ids: value["id"]
+                    .as_str()
+                    .map(|id| vec![id.into()])
+                    .unwrap_or_default(),
+                client_only: value["environment"] == "client",
+                ..Default::default()
+            });
+        }
+        return Ok(ModMetadata::default());
+    }
+    let mut entry = archive.by_name("META-INF/mods.toml")?;
+    if entry.size() > 2 * 1024 * 1024 {
+        bail!("Mod metadata is too large");
+    }
+    let mut text = String::new();
+    entry.read_to_string(&mut text)?;
+    parse_mod_metadata(&text)
+}
+fn parse_mod_metadata(text: &str) -> Result<ModMetadata> {
+    let metadata: toml::Value = toml::from_str(text)?;
+    let mut result = ModMetadata::default();
+    for value in metadata
+        .get("mods")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(id) = value.get("modId").and_then(toml::Value::as_str) {
+            result.ids.push(id.into());
+        }
+    }
+    for deps in metadata
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|table| table.values())
+    {
+        for dep in deps.as_array().into_iter().flatten() {
+            if dep.get("mandatory").and_then(toml::Value::as_bool) != Some(true) {
+                continue;
+            }
+            if dep.get("side").and_then(toml::Value::as_str) == Some("CLIENT") {
+                continue;
+            }
+            if let Some(id) = dep.get("modId").and_then(toml::Value::as_str) {
+                if !["minecraft", "forge", "java"].contains(&id) {
+                    result.required.push(id.into());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+async fn filter_sided_mods(
+    packs: &Packs,
+    full: &Manifest,
+    config: &ServerConfig,
+    desired: &mut Manifest,
+    job: &Job,
+) -> Result<()> {
+    let mut client_ids = std::collections::BTreeSet::<String>::new();
+    for path in [
+        "minecraft/config/mods_optimizer/mods-database.json",
+        "minecraft/config/mods_optimizer/mods-database-override.json",
+    ] {
+        if !full.files.contains_key(path) {
+            continue;
+        }
+        let value: serde_json::Value = storage::read_json(&packs.file(full, path, job).await?)?;
+        for side in ["both", "server"] {
+            for id in value[side]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
+                client_ids.remove(id);
+            }
+        }
+        for id in value["client"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            client_ids.insert(id.into());
+        }
+    }
+    let downloads = desired
+        .files
+        .iter()
+        .filter(|(path, _)| path.starts_with("mods/") && path.ends_with(".jar"))
+        .map(|(path, file)| packs.download(desired, path, file))
+        .collect::<Result<Vec<_>>>()?;
+    packs.net.many(downloads, job).await?;
+    let mut exclude = Vec::new();
+    for (path, file) in &desired.files {
+        if !path.starts_with("mods/") || !path.ends_with(".jar") {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or("");
+        if config
+            .whitelist
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let metadata = mod_metadata(&packs.blob_path(file))?;
+        // This client transformation service links Forge's display window before sided metadata exists.
+        let early_display = name
+            .to_ascii_lowercase()
+            .starts_with("simplecustomearlyloading-");
+        if early_display
+            || metadata.client_only
+            || (!metadata.ids.is_empty() && metadata.ids.iter().all(|id| client_ids.contains(id)))
+        {
+            exclude.push(path.clone());
+        }
+    }
+    for path in exclude {
+        desired.files.remove(&path);
+    }
+    Ok(())
+}
+
+async fn resolve_dependencies(
+    packs: &Packs,
+    full: &Manifest,
+    desired: &mut Manifest,
+    job: &Job,
+) -> Result<()> {
+    let mut metadata = BTreeMap::<String, ModMetadata>::new();
+    let mut attempted = std::collections::BTreeSet::new();
+    loop {
+        let downloads = desired
+            .files
+            .iter()
+            .filter(|(path, _)| path.starts_with("mods/") && path.ends_with(".jar"))
+            .map(|(path, file)| packs.download(desired, path, file))
+            .collect::<Result<Vec<_>>>()?;
+        packs.net.many(downloads, job).await?;
+        let mut included = std::collections::BTreeSet::new();
+        let mut required = std::collections::BTreeSet::new();
+        for (path, file) in &desired.files {
+            if !path.starts_with("mods/") || !path.ends_with(".jar") {
+                continue;
+            }
+            let value = metadata
+                .entry(file.sha.clone())
+                .or_insert(mod_metadata(&packs.blob_path(file))?);
+            included.extend(value.ids.iter().cloned());
+            required.extend(value.required.iter().cloned());
+        }
+        let needed = required
+            .difference(&included)
+            .filter(|id| !attempted.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if needed.is_empty() {
+            break;
+        }
+        let mut changed = false;
+        for id in needed {
+            attempted.insert(id.clone());
+            let mut candidates = full
+                .files
+                .iter()
+                .filter(|(path, _)| {
+                    path.starts_with("minecraft/mods/")
+                        && path.ends_with(".jar")
+                        && !desired
+                            .files
+                            .contains_key(path.strip_prefix("minecraft/").unwrap_or(path))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(path, _)| {
+                !path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .replace('-', "_")
+                    .starts_with(&id.replace('-', "_"))
+            });
+            for (source, file) in candidates {
+                job.check()?;
+                if !metadata.contains_key(&file.sha) {
+                    let path = packs.file(full, source, job).await?;
+                    metadata.insert(file.sha.clone(), mod_metadata(&path)?);
+                }
+                if metadata[&file.sha].ids.contains(&id) {
+                    let mut value = file.clone();
+                    value.source = Some(source.clone());
+                    desired.files.insert(
+                        source.strip_prefix("minecraft/").unwrap_or(source).into(),
+                        value,
+                    );
+                    job.progress(
+                        "server",
+                        format!("Including {id}: required by a server mod"),
+                        0,
+                        0,
+                    );
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn local_file(path: &Path) -> Result<PackFile> {
     let mut input = fs::File::open(path)?;
     let size = input.metadata()?.len();
@@ -299,5 +549,28 @@ mod tests {
             "server_files/server.properties"
         );
         assert!(relative_resource("../../outside", "minecraft/").is_err());
+    }
+    #[test]
+    fn mandatory_server_dependencies_override_overbroad_filename_exclusions() {
+        let metadata = parse_mod_metadata(
+            r#"[[mods]]
+modId="ae2"
+[[dependencies.ae2]]
+modId="guideme"
+mandatory=true
+side="BOTH"
+[[dependencies.ae2]]
+modId="client_helper"
+mandatory=true
+side="CLIENT"
+[[dependencies.ae2]]
+modId="optional"
+mandatory=false
+side="BOTH"
+"#,
+        )
+        .unwrap();
+        assert_eq!(metadata.ids, vec!["ae2"]);
+        assert_eq!(metadata.required, vec!["guideme"]);
     }
 }

@@ -468,4 +468,51 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.abort();
     }
+    #[tokio::test]
+    async fn cancellation_retains_a_flushable_partial_for_the_next_run() {
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                let body = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(Vec::from(b"hel".as_slice()))
+                })
+                .chain(futures_util::stream::pending());
+                axum::body::Body::from_stream(body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().into()).unwrap();
+        let net = Downloader::new(&layout).unwrap();
+        let counter = net.clone();
+        let job = Job::default();
+        let running = job.clone();
+        let item = Download {
+            url: format!("http://{address}/slow"),
+            target: temp.path().join("unfinished"),
+            size: Some(6),
+            checksum: Checksum::GitBlob("ce013625030ba8dba906f756967f9e9ca394464a".into()),
+        };
+        let task = tokio::spawn(async move { net.get(&item, &running).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while counter.transferred_bytes() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        job.cancel.cancel();
+        assert!(task.await.unwrap().is_err());
+        let partial = fs::read_dir(counter.partial_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "part"))
+            .unwrap();
+        assert_eq!(fs::read(partial).unwrap(), b"hel");
+        server.abort();
+    }
 }
