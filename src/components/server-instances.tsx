@@ -1,6 +1,6 @@
 import React from 'react';
 import {invoke} from '@tauri-apps/api/core';
-import {ArrowUpFromLine,ChevronRight,FolderOpen,HardDrive,LoaderCircle,Play,Plus,RefreshCw,Server,ShieldCheck,Terminal,Trash2,Wifi} from 'lucide-react';
+import {ArrowUpFromLine,FolderOpen,HardDrive,LoaderCircle,Play,Plus,RefreshCw,Server,ShieldCheck,Terminal,Trash2,Wifi} from 'lucide-react';
 import {Button} from './ui/button';
 import {Input} from './ui/input';
 import {Label} from './ui/label';
@@ -121,7 +121,7 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
     {servers.length===0?<div className="servers-empty"><Server/><h2>No servers yet</h2><p>Add a local directory or connect your hosted server over SFTP.</p><Button variant="outline" onClick={add} disabled={disabled}><Plus/>Add your first server</Button></div>:<ul className="server-list" aria-label="Saved servers">{servers.map(server=>{
       const primary=deploymentAction(server.knownVersion,targetVersion);
       const Icon=server.target.kind==='local'?HardDrive:Wifi;
-      return <li className="server-row" key={server.id}><button className="server-open" onClick={()=>details(server)} disabled={disabled} aria-label={`Open ${server.name}`}><span className="server-icon"><Icon size={20}/></span><span className="server-identity"><strong>{server.name}</strong><span className="server-address">{serverAddress(server.target)}</span><span className="server-version">{server.knownVersion?`Auram ${server.knownVersion.version}`:'Unknown version'}{server.lastError&&<span className="server-check-error"> · Last check failed</span>}</span></span><ChevronRight size={16}/></button><div className="server-row-actions">
+      return <li className="server-row" key={server.id}><button className="server-open" onClick={()=>details(server)} disabled={disabled} aria-label={`Open ${server.name}`}><span className="server-icon"><Icon size={20}/></span><span className="server-identity"><strong>{server.name}</strong><span className="server-address">{serverAddress(server.target)}</span><span className="server-version">{server.knownVersion?`Auram ${server.knownVersion.version}`:'Unknown version'}{server.lastError&&<span className="server-check-error"> · Last check failed</span>}</span></span></button><div className="server-row-actions">
         {server.target.kind==='local'&&(server.knownVersion||serverActive(server.id))&&
           <Button variant={primary.current?'default':'outline'} disabled={disabled&&!serverActive(server.id)} onClick={()=>startOrOpen(server)}
             aria-label={`${serverActive(server.id)?'Open console':'Start server'} · ${server.name}`}>
