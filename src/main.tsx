@@ -13,6 +13,7 @@ import { ServerInstances } from '@/components/server-instances';
 import { ServerConsole } from '@/components/server-console';
 import { DataLocationSettings } from '@/components/data-location';
 import { GameMemoryCard } from '@/components/game-memory';
+import { PackAtmosphere, PackHeadline } from '@/components/pack-atmosphere';
 import type { AutomaticMemory, MemoryPreferences } from '@/lib/game-memory';
 import type { LocalServerAction, LocalServerStatus, ServerInstance } from '@/lib/server-instances';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
@@ -159,8 +160,9 @@ function App() {
         {tab==='play'&&<>
           <div className="page-heading"><div><span className="eyebrow">THE WORLD IS YOURS</span><h1>Welcome to Auram<span>.</span></h1><p>A world of magic, machines, and everything in between.</p></div></div>
           <section className="pack-panel" aria-labelledby="pack-title">
+            <PackAtmosphere paused={running}/>
             <div className="pack-top"><div className="pack-symbol"><img src={emblem} alt="Auram emblem"/></div><Badge variant="outline" className="text-zinc-400 border-zinc-800"><span className="status-dot on"/> {installed?'INSTALLED':'READY TO INSTALL'}</Badge></div>
-            <div className="pack-heading"><span className="eyebrow">THE AURAM MODPACK</span><h2 id="pack-title">Make something<br/>extraordinary.</h2><p>Your world. Your way. Everything you need, kept up to date.</p></div>
+            <div className="pack-heading"><span className="eyebrow">THE AURAM MODPACK</span><PackHeadline paused={running}/><p>Your world. Your way. Everything you need, kept up to date.</p></div>
             {beforeInstall&&<DataLocationSettings beforeInstall disabled={busy||running}
               allowPickerWhileBusy={browseDuringStartup} onBusyChange={onLocationBusyChange}
               onError={showError} onNotice={showNotice}/>}

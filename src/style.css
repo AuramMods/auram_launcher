@@ -97,3 +97,33 @@
 .game-memory-warnings{display:grid;gap:5px;margin:9px 0 0;padding:0;list-style:none;color:#e3be8d;font-size:12px}
 .game-memory-warnings li{display:flex;align-items:baseline;gap:7px}
 .game-memory-warnings svg{position:relative;top:2px;flex-shrink:0}
+
+.pack-panel{position:relative;isolation:isolate}
+.pack-panel> :not(.pack-atmosphere){position:relative;z-index:1}
+.pack-atmosphere{position:absolute;inset:0 0 auto;height:min(100%,25rem);pointer-events:none;overflow:hidden;background:radial-gradient(ellipse at 82% 27%,#301745 0%,#190d28 32%,transparent 68%);mask-image:linear-gradient(#000 36%,transparent 100%)}
+.pack-aurora{position:absolute;inset:0;mask-image:linear-gradient(90deg,transparent 16%,#000 73%)}
+.pack-sparks{position:absolute;inset:0}
+.pack-sparks i{position:absolute;width:2px;height:2px;border-radius:50%;background:#e9d4ff;box-shadow:0 0 8px 2px #ad77e291;opacity:.55}
+.pack-sparks i:nth-child(1){left:67%;top:24%}
+.pack-sparks i:nth-child(2){left:81%;top:15%;width:3px;height:3px}
+.pack-sparks i:nth-child(3){left:89%;top:32%}
+.pack-sparks i:nth-child(4){left:76%;top:43%;width:3px;height:3px}
+.pack-sparks i:nth-child(5){left:94%;top:50%}
+.pack-sparks i:nth-child(6){left:58%;top:35%}
+.pack-atmosphere[data-animated=true] .pack-sparks i{animation:auram-spark-drift 6s ease-in-out infinite alternate;animation-delay:calc(var(--spark-index,0) * -1.3s)}
+.pack-sparks i:nth-child(2n){--spark-index:2}
+.pack-sparks i:nth-child(3n){--spark-index:3}
+.pack-sparks i:nth-child(5){--spark-index:5}
+@keyframes auram-spark-drift{0%{transform:translateY(5px);opacity:.27}100%{transform:translateY(-7px);opacity:.85}}
+
+@media(hover:hover) and (pointer:fine){
+  .nav-item,.server-row,.installation-actions .installation-tile{transition:background-color 180ms ease,border-color 180ms ease,box-shadow 200ms ease}
+  .server-row:hover,.installation-actions .installation-tile:not(:disabled):hover{border-color:#574168;box-shadow:inset 0 0 22px #7b45af1a}
+  .nav-item:not(.selected):hover{background:#130e19;border-color:#2e2138}
+  .pack-symbol img{transition:filter 200ms ease,transform 200ms ease}
+  .pack-symbol:hover img{transform:scale(1.09);filter:drop-shadow(0 0 5px #bf83e8aa)}
+  .play-button{position:relative;overflow:hidden}
+  .play-button::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(105deg,transparent 33%,#fff5 49%,transparent 67%);transform:translateX(-110%)}
+  .play-button:not(:disabled):hover::after{animation:auram-button-glint 640ms ease-out}
+}
+@keyframes auram-button-glint{to{transform:translateX(110%)}}
