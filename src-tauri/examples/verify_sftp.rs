@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
     }
     let temp = tempfile::tempdir()?;
     let layout = Layout::new(temp.path().into())?;
-    let packs = Packs::new(layout.clone(), Downloader::new(&layout)?);
+    let packs = Packs::legacy_fixture(layout.clone(), Downloader::new(&layout)?);
     if std::env::args().any(|arg| arg == "--credential-store") {
         settings.save(
             &layout,

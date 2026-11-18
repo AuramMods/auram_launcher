@@ -1,14 +1,14 @@
-# Changelists and sparse pack updates
+# Pack bundles and sparse Git updates
 
-Auram's schema-1 changelists drive normal client updates. The launcher reads the build advertised by `auram.json` on main, resolves that version's Git tag (including annotated/nested tags), then verifies and uses the metadata at that immutable commit. Unreleased changes on main never become the payload. Older repositories without `auram.json` retain paginated numeric/semantic tag discovery.
+The launcher verifies a signed release catalog that contains the exact pinned commit, complete target inventory, release history and immutable archive locations. The pack maintainer builds that catalog and its partial archives locally. Ordinary bundle updates use release asset URLs and need zero GitHub REST calls. See the [distribution contract](PACK_DISTRIBUTION_CONTRACT.md).
 
-The `changelist` field supplies the manifest path. Versions remain strings in installation identities, so legacy `1.0.7` baselines work alongside numeric builds. The chain follows `previousVersion` and verifies each resolved tag against `previousCommit`; `contentCommit` must be the release commit's parent. It is provenance rather than the download revision.
+With a usable baseline, the launcher composes the final target first. It removes objects already present in verified caches or managed files and counts the distinct archives needed for the remaining objects. Cached archives do not count. Eight or fewer required archives use the bundle route. A split release may require several archives. A metadata-only change can require zero. Independent large files avoid loading superseded jars, while a small grouped archive can contain a few extra members. `state/last-pack-transfer.json` records archive body bytes, unpacked bytes and additional unpacked member bytes for diagnosis.
 
-The planner validates the entire chain before activation, keeping the newest operation for each path. It fetches upserts from the final target only. Renames reuse content by Git blob ID, including verified managed files when their cache objects were evicted. It never downloads intermediate jars or infers deletion from a failed HTTP request.
+Older builds that lack catalogs keep the pinned GitHub HTTP path. The launcher resolves the advertised release's tag, checks schema-1 changelist provenance, and fetches final blobs from the immutable commit. It handles annotated tags, legacy versions such as `1.0.7`, and paginated tag discovery. If a signed catalog references an absent archive, verified raw files from that same signed commit can supply the delta. An unsupported signed format, invalid signature or corrupt archive fails with a retryable error.
 
 ## Sparse transport
 
-This implementation uses sparse HTTP retrieval and a persistent Git-object cache. It does not require a Git executable, clone repository history, or turn the live instance into a Git worktree. Root and immediate Minecraft trees identify selected directories before recursive requests; runtime/user-data folders, tooling, and server-only content are pruned from client traversal. Files use immutable, segment-encoded raw URLs. Git tree JSON is cached by object identity; file bytes use Git blob identities. A truncated recursive response falls back to complete non-recursive subtrees and never establishes absence.
+Fresh installs, unknown baselines, missing history routes and updates requiring more than eight uncached archives use one private shallow Git object cache. The launcher retrieves the pinned tree without its file bodies and batches only selected missing blobs. It ships the transport on macOS and Windows and works without a Git account. An explicitly configured Git executable can use saved credentials in the same cache. Git transport failure can fall back to verified raw files while preserving the exact pinned commit.
 
 Server source inventories are separate and include `server_config.conf` and `server_files`, even when `.packignore` excludes them from clients. The server builder continues applying its inclusion rules, mod sidedness, dependencies, templates, and preservation policy.
 
@@ -22,11 +22,11 @@ All downloader clones share cooldowns per origin. Parallel file downloads pause 
 
 The expected release inventory is cached separately from the instance's ownership/base-content inventory. The latter records managed paths and their last applied distribution hashes; it does not certify that user-writable disk files still match. Preserved settings retain their prior base identity, and unknown user files are not claimed or removed.
 
-Normal changelist updates inspect affected paths. **Repair** inspects the complete selected target, including files untouched by recent releases. Fresh installs, missing/invalid chains or caches, changed `.packignore` rules, different installation policies, divergent/downgrade histories, and chains longer than eight releases use complete sparse target reconciliation. Existing launcher installations perform this reconciliation once to establish the new policy baseline, reusing valid local content and runtime caches.
+Incremental updates inspect the affected managed paths. **Repair** inspects the complete selected target, including files untouched by recent releases. Repair can fetch missing content from Git for the same installed version while leaving other files in place.
 
 All downloaded files are size/hash checked before activation. Git's blob SHA-1 includes its `blob <length>\0` header. Unsupported symlinks/submodules, unsafe destination names and case/Unicode-normalization collisions fail explicitly. Regular executable modes are applied to private staging copies without modifying shared cache objects.
 
-Transactions back up originals, delete obsolete owned files before installing replacements, handle file/directory transitions, and activate the manifest last. Unknown files blocking a transition cause rollback. Recovery removes staged files before restoring old parent files; it never recursively deletes user directories to make an update fit. Modified managed files also receive retained backups. Worlds, screenshots, local mods and shared Java/Mojang/Forge resources remain preserved.
+Full replacement stages `mods`, `config`, `scripts` and `kubejs` on the destination volume before activation. Custom files inside those folders move with the originals to `.auram-backups/<transaction>/original` in the instance. To restore a custom file, close Minecraft or the server and copy the needed file from that backup. Client metadata and other pack paths still follow ordinary ownership rules. Worlds, screenshots, options, resource and shader packs, server properties, EULA and access lists are preserved. The manifest activates last. Interrupted replacements roll back from retained originals.
 
 ## Explicit force reinstall
 
@@ -47,7 +47,9 @@ pnpm check
 pnpm build --no-bundle
 ```
 
-Local HTTP fixtures cover skipped releases, final-only downloads, rename reuse with an empty cache, legacy baselines, tag pagination/peeling, truncated trees, missing/inconsistent/cyclic chains, policy/filter changes, case-only renames, failed downloads, and repair. Filesystem fixtures cover interrupted activation and transitions blocked by user data.
+Local HTTP and Git fixtures cover the archive boundary, signature and extraction failures, exact Git object requests, skipped releases, rename reuse, legacy baselines, truncated trees and repair. Filesystem fixtures cover interrupted activation and transitions blocked by user data.
+
+For real committed versions, build the catalogs locally in the pack checkout. Build the headless example with `cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features qa --example verify_pack_delivery --locked`, then invoke `python3 scripts/verify_pack_delivery.py <pack-repo> <catalog-parent> <example-binary>`. The fixture uses versions 139, 141, 159 and 161, or 145 for `--legacy`. `--public` uses the public endpoint for the final 159-to-161 update. `--boundary` repackages the same committed files into eight and nine local archives using a disposable fixture key. `--runtime-cache` can reuse an earlier isolated runtime cache to measure warm revalidation. All writes stay inside the temporary QA root.
 
 Rate-limit fixtures cover reset/HTTP-date headers and clock skew, primary/secondary limits, transient metadata failures, permission errors, shared metadata/file cooldowns, gradual recovery, independent origins, cancellation, partial-file resume, bounded retries, and suppression of full-inventory fallback after a rate limit.
 

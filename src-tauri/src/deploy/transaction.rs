@@ -340,6 +340,10 @@ pub async fn apply(
                 uploads.push((target,action.payload.clone(),action.file.clone(),action.path.clone()));
             }
         }
+        let sources = uploads.iter().filter_map(|(_, path, file, _)| path.as_ref().zip(file.as_ref()))
+            .map(|(path, file)| packs.download(&plan.payload, path, file))
+            .collect::<Result<Vec<_>>>()?;
+        packs.ensure_source_downloads(&plan.payload, sources, Some(&plan.payload), job).await?;
         for (target,_,_,_) in &uploads {
             let mut parent=target.rsplit_once('/').unwrap().0;
             while parent!=staging_root {

@@ -62,6 +62,20 @@ fn remove_owned(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn file_or_missing(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 pub(super) fn recover(root: &Path) -> Result<bool> {
     let pointer = storage::safe_join(root, JOURNAL)?;
     let Some(journal) = storage::read_optional::<Journal>(&pointer)? else {
@@ -73,10 +87,19 @@ pub(super) fn recover(root: &Path) -> Result<bool> {
     let workspace = work(root, &journal.id)?;
     let allowed = directories(journal.server);
     let mut names = std::collections::BTreeSet::new();
-    for saved in &journal.paths {
+    for (index, saved) in journal.paths.iter().enumerate() {
         storage::safe_join(root, &saved.relative)?;
+        let key = source::normalized_path(&saved.relative);
+        let reserved = key
+            .split('/')
+            .next()
+            .is_some_and(|part| part.starts_with(".auram-") || part == ".git");
         if !names.insert(saved.relative.clone())
             || saved.directory && !allowed.contains(&saved.relative)
+            || reserved
+                && (saved.relative != ".auram-manifest.json"
+                    || index + 1 != journal.paths.len()
+                    || !saved.install)
         {
             bail!("Invalid scoped replacement path");
         }
@@ -84,13 +107,29 @@ pub(super) fn recover(root: &Path) -> Result<bool> {
     for saved in journal.paths.iter().rev() {
         let original = storage::safe_join(&workspace.join("original"), &saved.relative)?;
         let target = storage::safe_join(root, &saved.relative)?;
-        if original.try_exists()? {
-            remove_owned(&target)?;
+        let original_exists = if saved.directory {
+            original.try_exists()?
+        } else {
+            file_or_missing(&original)?
+        };
+        if saved.existed && original_exists {
+            if saved.directory {
+                remove_owned(&target)?;
+            } else if target.is_dir() {
+                // An ordinary managed file may have become a directory. Only
+                // remove it when all of its staged descendants have rolled back.
+                fs::remove_dir(&target)?;
+            }
             fs::create_dir_all(target.parent().context("Replacement path has no parent")?)?;
             fs::rename(&original, &target)
                 .context("Restore the retained original replacement path")?;
         } else if !saved.existed {
-            remove_owned(&target)?;
+            if saved.directory {
+                remove_owned(&target)?;
+            } else if file_or_missing(&target)? {
+                fs::remove_file(&target)?;
+                storage::remove_empty_parents(root, &target);
+            }
         } else if !target.try_exists()? {
             bail!("Replacement recovery cannot find the original {}; retained recovery state was left intact",saved.relative);
         }
@@ -170,7 +209,7 @@ fn apply_checked(
         "Staging verified replacement folders",
         entries.len(),
     );
-    for (path, file) in entries {
+    crate::local_work::map(&entries, |&(path, file)| {
         job.check()?;
         let source = blob_root.join(&file.sha);
         if source.metadata()?.len() != file.size
@@ -182,16 +221,21 @@ fn apply_checked(
         storage::atomic_copy(&source, &staged)?;
         source::set_mode(&staged, &file.mode)?;
         progress.complete();
-    }
-    for (relative, source) in changes
+        Ok(())
+    })?;
+    let mut outside = changes
         .iter()
         .filter(|(p, _)| !inside(p, server) && p != ".auram-manifest.json")
-    {
+        .collect::<Vec<_>>();
+    outside.sort_by_key(|(path, source)| {
+        (
+            source.is_some(),
+            std::cmp::Reverse(path.matches('/').count()),
+        )
+    });
+    for (relative, source) in outside {
         job.check()?;
         let target = storage::safe_join(root, relative)?;
-        if target.is_dir() {
-            bail!("A directory blocks replacement of managed file {relative}");
-        }
         if let Some(source) = source {
             let staged = storage::safe_join(&workspace.join("stage"), relative)?;
             storage::atomic_copy(source, &staged)?;
@@ -206,7 +250,7 @@ fn apply_checked(
         }
         journal.paths.push(Saved {
             relative: relative.clone(),
-            existed: target.try_exists()?,
+            existed: file_or_missing(&target)?,
             directory: false,
             install: source.is_some(),
         });
@@ -240,10 +284,20 @@ fn apply_checked(
             if saved.install {
                 checkpoint(&format!("before-activate-{index}"))?;
                 let staged = storage::safe_join(&workspace.join("stage"), &saved.relative)?;
+                if !saved.directory && target.is_dir() {
+                    fs::remove_dir(&target).with_context(|| {
+                        format!(
+                            "A directory containing other files blocks {}",
+                            saved.relative
+                        )
+                    })?;
+                }
                 fs::create_dir_all(target.parent().unwrap())?;
                 fs::rename(staged, &target)
                     .with_context(|| format!("Activate {}", saved.relative))?;
                 checkpoint(&format!("after-activate-{index}"))?;
+            } else if saved.existed {
+                storage::remove_empty_parents(root, &target);
             }
             job.progress(
                 "pack-apply",

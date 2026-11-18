@@ -21,7 +21,7 @@ Only these payload directories are deployed:
 
 The launcher also maintains `auram.json`, `.auram-deploy.json` (managed-file ownership), and `.auram-deploy/` (transaction journals/backups). It does **not** deploy worlds, `server.properties`, EULA state, operator/whitelist/ban lists, Java, Forge libraries, startup scripts, `defaultconfigs`, schematics, or arbitrary other local folders. A new remote host therefore needs its own matching Java/Forge server runtime. Required Forge changes are reported, but runtime replacement is outside this operation. User-specific local edits are not silently imported: the payload comes from the selected built pack's recorded, verified distribution baseline.
 
-The remote `auram.json` version is authoritative. A matching selected version is an immediate no-op, including legacy numeric version files without a commit field. Otherwise the version resolves through its immutable tag. The schema-1 changelist parser validates skipped releases, `previousVersion`, `previousCommit`, provenance and final path operations. The old pack's server inclusion rules translate distribution paths into their server destinations. Saved ownership metadata is used when it matches the remote version. Only final changed/added/deleted server paths are planned; intermediate release bodies are never uploaded.
+The remote `auram.json` supplies the baseline. A matching selected version is an immediate no-op, including legacy numeric version files without a commit field. The launcher reconstructs the previous server profile through signed release history or legacy schema-1 changelists. Saved ownership metadata is used when it matches the remote version. Only final changed, added and deleted server paths enter the plan. The eight-archive threshold applies to acquiring missing pack content on the launcher. The SFTP destination receives the verified files through ordinary SFTP.
 
 **Inspection never recursively walks the server or hashes remote payload files.** Unchanged configuration and unrelated custom files are untouched during a changelist update. Incoming replacements and deletions retain original backups, including locally edited files at paths changed/deleted by the release. A version file is not a full integrity/repair check: manual damage to an otherwise current server does not trigger a scan.
 
@@ -59,7 +59,7 @@ docker run --rm -d --name auram-sftp-qa -p 127.0.0.1::22 \
 docker port auram-sftp-qa
 # Substitute the reported local port.
 AURAM_SFTP_TEST_PORT=65252 cargo run --manifest-path src-tauri/Cargo.toml \
-  --no-default-features --example verify_sftp
+  --no-default-features --features qa --example verify_sftp
 docker stop auram-sftp-qa
 ```
 
@@ -76,7 +76,7 @@ python3 scripts/fixtures/sftp_latency_proxy.py --upstream-port 65252 --delay-ms 
   --limit-file "$PWD/.qa/sftp-limit"
 # In another shell:
 AURAM_SFTP_TEST_PORT=1427 cargo run --manifest-path src-tauri/Cargo.toml \
-  --locked --no-default-features --example bench_sftp_small_files -- 128
+  --locked --no-default-features --features qa --example bench_sftp_small_files -- 128
 ```
 
 To simulate a limit imposed during transfer, start without a limit file and add `AURAM_SFTP_BENCH_LIMIT_FILE="$PWD/.qa/sftp-limit"` to that benchmark command. After establishing twenty connections, the harness writes a limit of three; the proxy drops excess existing transports. Verify the JSON result reports twenty initial connections, three remaining connections and matching uploaded bodies. For an initial connection cap, write `3` to the limit file before starting the benchmark without `AURAM_SFTP_BENCH_LIMIT_FILE`. This fixture does not connect to production servers.
@@ -85,7 +85,7 @@ To simulate a limit imposed during transfer, start without a limit file and add 
 
 ```sh
 AURAM_SFTP_TEST_PORT=1427 cargo run --manifest-path src-tauri/Cargo.toml \
-  --locked --no-default-features --example bench_sftp_activation -- 64
+  --locked --no-default-features --features qa --example bench_sftp_activation -- 64
 ```
 
 With the same loopback OpenSSH fixture, twenty connections and 10 ms added latency per proxy direction, 64 tiny removals took **29.25 s before / 2.12 s after** for activation; complete deployment took **30.57 s / 3.46 s**. These are fixture measurements, not a guarantee for a hosting provider.

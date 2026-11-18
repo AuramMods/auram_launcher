@@ -136,6 +136,7 @@ pub(super) async fn catalog(packs: &Packs, tag: &PackTag, job: &Job) -> Result<O
     if packs.repository.distribution.is_none() {
         return Ok(None);
     }
+    super::source::oid(&tag.sha)?;
     if let Some(catalog) = packs.catalogs.lock().unwrap().get(&tag.sha).cloned() {
         if catalog.target.name != tag.name {
             bail!("Pack tag identity mismatch");
@@ -414,13 +415,23 @@ pub(super) async fn prepare(
     let Some(catalog) = catalog(packs, &manifest.tag, job).await? else {
         return Ok(Prepared::Legacy);
     };
+    let entries = catalog
+        .files
+        .iter()
+        .map(|(path, entry)| (entry.sha.as_str(), (path, entry)))
+        .collect::<BTreeMap<_, _>>();
     let mut wanted = BTreeMap::new();
     for download in downloads {
         let Checksum::GitBlob(oid) = &download.checksum else {
             return Ok(Prepared::Legacy);
         };
-        let Some((name, entry)) = catalog.files.iter().find(|(_, file)| &file.sha == oid) else {
-            return Ok(Prepared::Legacy);
+        let Some(&(name, entry)) = entries.get(oid.as_str()) else {
+            // Generated Forge runtime files and the local server version marker
+            // are already verified and cached by the dedicated runtime builder.
+            if manifest.policy == 0 && Downloader::valid(download).await? {
+                continue;
+            }
+            bail!("Requested pack object is absent from the signed target catalog");
         };
         if Downloader::valid(download).await?
             && Checksum::Sha256(entry.sha256.clone()).verify(&download.target)?
@@ -457,6 +468,7 @@ pub(super) async fn prepare(
             .iter()
             .map(|id| bundle_download(packs, id, &catalog))
             .collect::<Result<Vec<_>>>()?;
+        let before = packs.net.transferred_bytes();
         if let Err(error) = packs
             .net
             .many_named(downloads, job, "Partial pack bundles")
@@ -472,16 +484,35 @@ pub(super) async fn prepare(
             }
             return Err(error);
         }
+        let downloaded = packs.net.transferred_bytes() - before;
+        let wanted_bytes = wanted.values().map(|entry| entry.size).sum::<u64>();
         let packs = packs.clone();
         let catalog = catalog.clone();
         let job = job.clone();
         local_work::blocking(move || {
-            let progress=local_work::Progress::new(&job,"Verifying partial pack bundles",ids.len());
-            let mut archive_bytes=0;let mut unpacked=0;
-            for id in ids {let (a,b)=extract(&packs,&id,&catalog,&job)?;archive_bytes+=a;unpacked+=b;progress.complete();}
-            storage::write_json(&packs.layout.state("last-pack-transfer.json"),&serde_json::json!({"strategy":"bundles","archiveBytes":archive_bytes,"unpackedBytes":unpacked,"requiredBundles":required}))?;
-            Ok(())
-        }).await?;
+            let progress =
+                local_work::Progress::new(&job, "Verifying partial pack bundles", ids.len());
+            let mut archive_bytes = 0;
+            let mut unpacked = 0;
+            for id in ids {
+                let (archive, extracted) = extract(&packs, &id, &catalog, &job)?;
+                archive_bytes += archive;
+                unpacked += extracted;
+                progress.complete();
+            }
+            storage::write_json(
+                &packs.layout.state("last-pack-transfer.json"),
+                &serde_json::json!({
+                    "strategy": "bundles",
+                    "archiveBytes": archive_bytes,
+                    "archiveBodyBytes": downloaded,
+                    "unpackedBytes": unpacked,
+                    "additionalUnpackedBytes": unpacked.saturating_sub(wanted_bytes),
+                    "requiredBundles": required,
+                }),
+            )
+        })
+        .await?;
         return Ok(Prepared::Bundles);
     }
     job.detail("pack-files", "Preparing the pinned sparse Git snapshot");

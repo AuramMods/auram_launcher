@@ -215,6 +215,14 @@ impl Layout {
             bail!("Unsupported client reset schema");
         }
         let client = safe_join(&self.root, "client")?;
+        let retained = safe_join(&self.root, "client/.auram-backups")?;
+        if retained.try_exists()? {
+            let destination = safe_join(
+                &self.root,
+                &format!("backups/client-folders-{:016x}", rand::random::<u64>()),
+            )?;
+            fs::rename(retained, destination).context("Retain earlier pack folder backups")?;
+        }
         remove_reset_directory(&client).context(
             "Delete the client pack; close Minecraft and any programs using its files, then retry",
         )?;
@@ -509,7 +517,7 @@ pub fn transact(
     apply
 }
 
-fn remove_empty_parents(root: &Path, file: &Path) {
+pub(crate) fn remove_empty_parents(root: &Path, file: &Path) {
     let mut current = file.parent();
     while let Some(parent) = current.filter(|p| *p != root && p.starts_with(root)) {
         if fs::remove_dir(parent).is_err() {
@@ -580,6 +588,13 @@ mod tests {
         for path in &retained {
             atomic_write(path, b"retained").unwrap();
         }
+        atomic_write(
+            &layout
+                .client()
+                .join(".auram-backups/example/original/mods/old.jar"),
+            b"retained snapshot",
+        )
+        .unwrap();
         layout.begin_client_reset().unwrap();
         // Simulate application termination partway through deletion.
         fs::remove_file(layout.game().join("mods/custom.jar")).unwrap();
@@ -593,6 +608,20 @@ mod tests {
         for path in retained {
             assert_eq!(fs::read(path).unwrap(), b"retained");
         }
+        let folder_backup = fs::read_dir(restarted.root.join("backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("client-folders-")
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(folder_backup.join("example/original/mods/old.jar")).unwrap(),
+            b"retained snapshot"
+        );
         atomic_write(&restarted.game().join("fresh.txt"), b"new installation").unwrap();
         restarted.resume_client_reset().unwrap();
         assert_eq!(

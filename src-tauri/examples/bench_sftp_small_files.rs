@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     }
     let temp = tempfile::tempdir()?;
     let layout = Layout::new(temp.path().into())?;
-    let packs = Packs::new(layout.clone(), Downloader::new(&layout)?);
+    let packs = Packs::legacy_fixture(layout.clone(), Downloader::new(&layout)?);
     let mut manifest = Manifest {
         schema: 1,
         policy: 0,

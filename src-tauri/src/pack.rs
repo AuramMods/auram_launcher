@@ -68,7 +68,17 @@ struct InspectedFile {
     download: Option<Download>,
     change: Option<FileChange>,
 }
+#[derive(Clone, Copy)]
+enum ReconcileScope {
+    Client,
+    Server,
+    Runtime,
+}
 impl Packs {
+    pub(crate) async fn recover_scoped_pack(&self, root: &Path) -> Result<bool> {
+        let root = root.to_owned();
+        local_work::blocking(move || replacement::recover(&root)).await
+    }
     pub async fn server_changelists(
         &self,
         version: &str,
@@ -88,9 +98,6 @@ impl Packs {
             let count = catalog
                 .route(&tag)
                 .context("No signed server update route")?;
-            if count > 8 {
-                bail!("Server is more than eight release transitions behind; use scoped full replacement");
-            }
             let previous = catalog
                 .at(&tag)
                 .context("Signed history cannot reconstruct the previous server profile")?;
@@ -159,8 +166,36 @@ impl Packs {
             catalog_misses: Default::default(),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn legacy_fixture(layout: Layout, net: Downloader) -> Self {
+    #[cfg(feature = "qa")]
+    pub fn with_qa_origin(
+        layout: Layout,
+        net: Downloader,
+        origin: &str,
+        fixture_key: Option<&str>,
+    ) -> Result<Self> {
+        let endpoint = url::Url::parse(origin)?;
+        if endpoint.scheme() != "http"
+            || endpoint.host_str() != Some("127.0.0.1")
+            || endpoint.path() != "/"
+            || endpoint.username() != ""
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            bail!("The isolated pack fixture must use a loopback HTTP origin");
+        }
+        let origin = origin.trim_end_matches('/');
+        let mut packs = Self::new(layout, net);
+        packs.repository.api = format!("{origin}/api");
+        packs.repository.raw = format!("{origin}/raw");
+        packs.repository.git = format!("{origin}/git");
+        packs.repository.distribution = Some(format!("{origin}/releases"));
+        if let Some(key) = fixture_key {
+            packs.repository.pack_key = format!("{}\n{key}", packs.repository.pack_key);
+        }
+        Ok(packs)
+    }
+    #[cfg(any(test, feature = "qa"))]
+    pub fn legacy_fixture(layout: Layout, net: Downloader) -> Self {
         let mut packs = Self::new(layout, net);
         packs.repository.distribution = None;
         packs
@@ -258,6 +293,21 @@ impl Packs {
             .await?;
         self.net.get(&item, job).await?;
         Ok(item.target)
+    }
+    pub(crate) async fn ensure_source_downloads(
+        &self,
+        manifest: &Manifest,
+        downloads: Vec<Download>,
+        baseline: Option<&Manifest>,
+        job: &Job,
+    ) -> Result<()> {
+        if downloads.is_empty() {
+            return Ok(());
+        }
+        distribution_source::prepare(self, manifest, &downloads, baseline, job).await?;
+        self.net
+            .many_named(downloads, job, "Verified pack source files")
+            .await
     }
     fn reuse_owned(
         &self,
@@ -364,12 +414,15 @@ impl Packs {
         discovery_timeout: Option<std::time::Duration>,
     ) -> Result<Manifest> {
         let layout = self.layout.clone();
-        tokio::task::spawn_blocking(move || layout.resume_client_reset()).await??;
         job.phase("pack-plan", "Read pack", false);
-        storage::recover(
-            &self.layout.client(),
-            &self.layout.state("client-transaction"),
-        )?;
+        let recover_job = job.clone();
+        local_work::blocking(move || {
+            layout.resume_client_reset()?;
+            recover_job.detail("pack-plan", "Checking installation recovery state");
+            replacement::recover(&layout.client())?;
+            storage::recover(&layout.client(), &layout.state("client-transaction"))
+        })
+        .await?;
         let old = self.installed()?;
         let tag = if repair {
             old.as_ref()
@@ -393,7 +446,7 @@ impl Packs {
             old.as_ref(),
             &desired,
             job,
-            false,
+            ReconcileScope::Client,
             changed.as_ref(),
             ("pack-files", "pack-apply"),
         )
@@ -433,7 +486,11 @@ impl Packs {
             old,
             desired,
             job,
-            server,
+            if server {
+                ReconcileScope::Server
+            } else {
+                ReconcileScope::Client
+            },
             None,
             if server {
                 ("server-files", "server-apply")
@@ -457,7 +514,7 @@ impl Packs {
             old,
             desired,
             job,
-            true,
+            ReconcileScope::Runtime,
             None,
             ("destination-files", "destination-apply"),
         )
@@ -471,18 +528,22 @@ impl Packs {
         old: Option<&Manifest>,
         desired: &Manifest,
         job: &Job,
-        server: bool,
+        scope: ReconcileScope,
         touched: Option<&BTreeSet<String>>,
         phases: (&str, &str),
     ) -> Result<Manifest> {
-        let recover_root = root.to_owned();
-        let recovered = local_work::blocking(move || replacement::recover(&recover_root)).await?;
+        let server = !matches!(scope, ReconcileScope::Client);
+        let recovered = self.recover_scoped_pack(root).await?;
         let recovered_baseline = if recovered {
             storage::read_optional::<Manifest>(&root.join(".auram-manifest.json"))?
         } else {
             None
         };
-        let old = recovered_baseline.as_ref().or(old);
+        let old = if recovered {
+            recovered_baseline.as_ref()
+        } else {
+            old
+        };
         job.phase(
             phases.0,
             if server { "Server files" } else { "Pack files" },
@@ -516,9 +577,15 @@ impl Packs {
             if server { "Server files" } else { "Pack files" },
             true,
         );
-        let prepared = distribution_source::prepare(self, desired, &downloads, old, job).await?;
+        let prepared = if matches!(scope, ReconcileScope::Runtime) {
+            distribution_source::Prepared::Legacy
+        } else {
+            distribution_source::prepare(self, desired, &downloads, old, job).await?
+        };
         let replace = prepared == distribution_source::Prepared::Sparse
-            && old.is_none_or(|m| m.tag.sha != desired.tag.sha);
+            && old.is_none_or(|m| {
+                m.tag.sha != desired.tag.sha || m.schema != 1 || m.policy != desired.policy
+            });
         if replace {
             distribution_source::prepare_replacement(self, desired, root, old, server, job).await?;
             next.files

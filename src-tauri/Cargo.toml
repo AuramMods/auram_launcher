@@ -70,6 +70,22 @@ tempfile = "3"
 ed25519-dalek = "2"
 blake2 = "0.10"
 
+[[example]]
+name = "verify_pack_delivery"
+required-features = ["qa"]
+
+[[example]]
+name = "verify_sftp"
+required-features = ["qa"]
+
+[[example]]
+name = "bench_sftp_small_files"
+required-features = ["qa"]
+
+[[example]]
+name = "bench_sftp_activation"
+required-features = ["qa"]
+
 # Keep pnpm dev's integrity checks representative of packaged performance.
 [profile.dev.package.sha1]
 opt-level = 3

@@ -177,8 +177,12 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     )?)
     .context("Invalid server_config.conf")?;
     let mut desired = config.manifest(&full)?;
-    let metadata = filter_sided_mods(packs, &full, &config, &mut desired, job).await?;
-    resolve_dependencies(packs, &full, &mut desired, metadata, job).await?;
+    let root = packs.layout.server();
+    packs.recover_scoped_pack(&root).await?;
+    let old: Option<Manifest> = storage::read_optional(&root.join(".auram-manifest.json"))?;
+    let metadata =
+        filter_sided_mods(packs, &full, &config, &mut desired, old.as_ref(), job).await?;
+    resolve_dependencies(packs, &full, &mut desired, metadata, old.as_ref(), job).await?;
     let payload = desired.clone();
     let versions = Versions::read(&packs.layout.client())?;
     let java = runtime.java(job).await?;
@@ -278,8 +282,6 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     let file = local_file(&marker)?;
     storage::atomic_copy(&marker, &packs.blob_path(&file))?;
     desired.files.insert("auram.json".into(), file);
-    let old: Option<Manifest> =
-        storage::read_optional(&packs.layout.server().join(".auram-manifest.json"))?;
     packs
         .reconcile(
             &packs.layout.server(),
@@ -457,6 +459,7 @@ async fn filter_sided_mods(
     full: &Manifest,
     config: &ServerConfig,
     desired: &mut Manifest,
+    baseline: Option<&Manifest>,
     job: &Job,
 ) -> Result<BTreeMap<String, ModMetadata>> {
     let mut client_ids = std::collections::BTreeSet::<String>::new();
@@ -493,7 +496,9 @@ async fn filter_sided_mods(
         .filter(|(path, _)| path.starts_with("mods/") && path.ends_with(".jar"))
         .map(|(path, file)| packs.download(desired, path, file))
         .collect::<Result<Vec<_>>>()?;
-    packs.net.many(downloads, job).await?;
+    packs
+        .ensure_source_downloads(desired, downloads, baseline, job)
+        .await?;
     let mut metadata_cache = BTreeMap::new();
     load_mod_metadata(packs, desired, &mut metadata_cache, job).await?;
     let mut exclude = Vec::new();
@@ -532,6 +537,7 @@ async fn resolve_dependencies(
     full: &Manifest,
     desired: &mut Manifest,
     mut metadata: BTreeMap<String, ModMetadata>,
+    baseline: Option<&Manifest>,
     job: &Job,
 ) -> Result<()> {
     let mut attempted = std::collections::BTreeSet::new();
@@ -546,7 +552,9 @@ async fn resolve_dependencies(
             })
             .map(|(path, file)| packs.download(desired, path, file))
             .collect::<Result<Vec<_>>>()?;
-        packs.net.many(downloads, job).await?;
+        packs
+            .ensure_source_downloads(desired, downloads, baseline, job)
+            .await?;
         load_mod_metadata(packs, desired, &mut metadata, job).await?;
         let mut included = std::collections::BTreeSet::new();
         let mut required = std::collections::BTreeSet::new();

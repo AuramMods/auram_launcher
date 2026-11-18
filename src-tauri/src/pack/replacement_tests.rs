@@ -252,3 +252,57 @@ fn forged_directory_scope_and_traversal_cannot_mutate_other_folders() {
         );
     }
 }
+
+#[test]
+fn scoped_replacement_handles_owned_path_transitions_and_keeps_unknown_contents() {
+    for blocked in [false, true] {
+        let f = Fixture::new(false);
+        let changes = vec![
+            ("minecraft/extension".into(), f.changes[0].1.clone()),
+            ("minecraft/other/new.txt".into(), f.changes[0].1.clone()),
+            ("minecraft/extension/old.txt".into(), None),
+            ("minecraft/other".into(), None),
+        ];
+        storage::atomic_write(&f.root.join("minecraft/extension/old.txt"), b"owned").unwrap();
+        storage::atomic_write(&f.root.join("minecraft/other"), b"owned file").unwrap();
+        if blocked {
+            storage::atomic_write(&f.root.join("minecraft/extension/user.txt"), b"user").unwrap();
+        }
+        let outcome = apply(
+            &f.root,
+            &f.desired,
+            &f.desired,
+            &changes,
+            &f.blobs,
+            false,
+            &Job::default(),
+        );
+        if blocked {
+            assert!(outcome.is_err());
+            assert_eq!(
+                fs::read(f.root.join("minecraft/extension/old.txt")).unwrap(),
+                b"owned"
+            );
+            assert_eq!(
+                fs::read(f.root.join("minecraft/extension/user.txt")).unwrap(),
+                b"user"
+            );
+            assert_eq!(
+                fs::read(f.root.join("minecraft/other")).unwrap(),
+                b"owned file"
+            );
+            f.assert_state(false, false);
+        } else {
+            outcome.unwrap();
+            assert_eq!(
+                fs::read(f.root.join("minecraft/extension")).unwrap(),
+                b"new managed metadata"
+            );
+            assert_eq!(
+                fs::read(f.root.join("minecraft/other/new.txt")).unwrap(),
+                b"new managed metadata"
+            );
+            f.assert_state(false, true);
+        }
+    }
+}

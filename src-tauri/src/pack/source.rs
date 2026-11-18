@@ -620,7 +620,7 @@ impl<'a> Source<'a> {
     }
 }
 
-fn oid(value: &str) -> Result<()> {
+pub(super) fn oid(value: &str) -> Result<()> {
     if value.len() != 40 || !value.bytes().all(|c| c.is_ascii_hexdigit()) {
         bail!("Invalid Git object ID");
     }
@@ -641,11 +641,19 @@ pub(super) fn validate_inventory(manifest: &Manifest) -> Result<()> {
     let mut names = BTreeSet::new();
     for (path, file) in &manifest.files {
         oid(&file.sha)?;
+        repo_path(path)?;
         storage::safe_join(Path::new(""), path)?;
         if !matches!(file.mode.as_str(), "100644" | "100755") {
             bail!("Unsupported Git file mode at {path}");
         }
         let key = normalized_path(path);
+        if key
+            .split('/')
+            .next()
+            .is_some_and(|part| part.starts_with(".auram-") || part == ".git")
+        {
+            bail!("Pack path overlaps launcher state: {path}");
+        }
         if !names.insert(key) {
             bail!("Case-insensitive destination collision: {path}");
         }

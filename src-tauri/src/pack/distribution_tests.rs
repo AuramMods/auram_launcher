@@ -106,6 +106,14 @@ impl Fixture {
         );
     }
     fn bundle(&self, catalog: &mut Catalog, oids: Vec<String>) {
+        self.bundle_named(catalog, oids, |oid| format!("objects/{oid}"));
+    }
+    fn bundle_named(
+        &self,
+        catalog: &mut Catalog,
+        oids: Vec<String>,
+        name: impl Fn(&str) -> String,
+    ) {
         let mut data = std::io::Cursor::new(Vec::new());
         let mut members = BTreeMap::new();
         {
@@ -115,10 +123,7 @@ impl Fixture {
                 let body = self.git.object_bytes(&entry.sha);
                 assert_eq!(hex::encode(sha2::Sha256::digest(&body)), entry.sha256);
                 archive
-                    .start_file(
-                        format!("objects/{oid}"),
-                        zip::write::SimpleFileOptions::default(),
-                    )
+                    .start_file(name(&oid), zip::write::SimpleFileOptions::default())
                     .unwrap();
                 archive.write_all(&body).unwrap();
                 members.insert(
@@ -184,6 +189,40 @@ impl Fixture {
             pack_ignore_before: Some(String::new()),
         }];
     }
+}
+
+#[tokio::test]
+async fn signed_archive_with_invalid_member_fails_without_git_fallback_or_activation() {
+    let f = Fixture::new().await;
+    let mut catalog = f.git.catalog.clone();
+    let base = f.baseline(&catalog);
+    f.linked(&mut catalog, &base);
+    let oids = catalog
+        .files
+        .values()
+        .map(|entry| entry.sha.clone())
+        .collect();
+    f.bundle_named(&mut catalog, oids, |oid| format!("../{oid}"));
+    f.publish(&catalog);
+    let packs = &f.git.packs;
+    let root = packs.layout.client();
+    storage::write_json(&root.join(".auram-manifest.json"), &base).unwrap();
+    storage::atomic_write(&root.join("minecraft/saves/world/level.dat"), b"original").unwrap();
+    let error = packs.update(false, &Job::default()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("archive") || format!("{error:#}").contains("member"));
+    assert_eq!(packs.installed().unwrap().unwrap().tag.sha, base.tag.sha);
+    assert_eq!(
+        fs::read(root.join("minecraft/saves/world/level.dat")).unwrap(),
+        b"original"
+    );
+    assert_eq!(f.git.requests.load(Ordering::SeqCst), 0);
+    assert!(f
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|path| !path.contains("/raw/")));
 }
 
 #[tokio::test]
@@ -278,6 +317,59 @@ async fn missing_distributions_are_cached_but_permission_and_signature_errors_do
         .requests
         .iter()
         .all(|p| p.starts_with("/releases/")));
+}
+
+#[tokio::test]
+async fn unsupported_signed_catalog_reports_compatibility_without_rest_fallback() {
+    let f = Fixture::new().await;
+    let mut future = f.git.catalog.clone();
+    future.schema = 100;
+    f.publish(&future);
+    let error = f
+        .git
+        .packs
+        .source()
+        .discover(&Job::default())
+        .await
+        .unwrap_err();
+    assert!(error
+        .downcast_ref::<distribution::UnsupportedDistribution>()
+        .is_some());
+    assert_eq!(f.state.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn runtime_only_reconciliation_never_replaces_managed_pack_folders() {
+    let f = Fixture::new().await;
+    let catalog = &f.git.catalog;
+    f.publish(catalog);
+    let packs = &f.git.packs;
+    let root = packs.layout.server();
+    fs::create_dir_all(root.join("mods")).unwrap();
+    fs::write(root.join("mods/custom.jar"), b"preserve").unwrap();
+    let file = &catalog.files["mmc-pack.json"];
+    storage::atomic_write(
+        &packs.layout.root.join("cache/blobs").join(&file.sha),
+        b"{}\n",
+    )
+    .unwrap();
+    let mut runtime = catalog.manifest();
+    runtime.files = BTreeMap::from([("run.sh".into(), file.file())]);
+    let job = Job::default();
+    packs
+        .reconcile_server_runtime(
+            &root,
+            &packs.layout.state("runtime-only"),
+            None,
+            &runtime,
+            &job,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read(root.join("mods/custom.jar")).unwrap(), b"preserve");
+    assert_eq!(fs::read(root.join("run.sh")).unwrap(), b"{}\n");
+    assert_eq!(f.git.requests.load(Ordering::SeqCst), 0);
+    assert!(f.state.lock().unwrap().requests.is_empty());
 }
 
 #[tokio::test]
@@ -503,6 +595,13 @@ async fn server_baseline_and_jar_rename_are_reconstructed_from_signed_history_wi
                     after: Some(jar),
                 },
             ),
+            (
+                "minecraft/config/a.toml".into(),
+                Change {
+                    before: None,
+                    after: Some(catalog.files["minecraft/config/a.toml"].clone()),
+                },
+            ),
         ]),
     }];
     let oids = catalog.files.values().map(|f| f.sha.clone()).collect();
@@ -549,4 +648,76 @@ async fn server_baseline_and_jar_rename_are_reconstructed_from_signed_history_wi
         .server_changelists(&old.name, &"f".repeat(40), &target, &job)
         .await
         .is_err());
+
+    // Drive the same version inspection, stage and activate functions used by
+    // SFTP, with a disposable directory implementing the destination protocol.
+    use crate::{
+        deploy,
+        server::{ServerConfig, ServerVersion},
+    };
+    let payload = ServerConfig::default()
+        .manifest(&catalog.manifest())
+        .unwrap();
+    let version = |tag: &PackTag| ServerVersion {
+        schema: 1,
+        version: tag.name.clone(),
+        commit: tag.sha.clone(),
+        minecraft: "1.20.1".into(),
+        forge: "47.4.10".into(),
+    };
+    storage::write_json(&packs.layout.state("server-deploy-payload.json"), &payload).unwrap();
+    storage::write_json(&packs.layout.server().join("auram.json"), &version(&target)).unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let root = remote.path();
+    storage::write_json(&root.join("auram.json"), &version(&old)).unwrap();
+    let jar = &payload.files["mods/a.jar"];
+    storage::atomic_write(
+        &root.join("mods/old.jar.client"),
+        &f.git.object_bytes(&jar.sha),
+    )
+    .unwrap();
+    storage::atomic_write(&root.join("server.properties"), b"motd=Preserve").unwrap();
+    let remote = deploy::local::LocalRemote::new(root.to_owned()).unwrap();
+    let plan = deploy::inspect(packs, &remote, &job).await.unwrap();
+    assert_eq!((plan.changelists, plan.renames, plan.uploads), (1, 1, 1));
+    fs::remove_file(packs.blob_path(&payload.files["config/a.toml"])).unwrap();
+    for id in catalog.bundles.keys() {
+        fs::remove_file(
+            packs
+                .layout
+                .root
+                .join("cache/pack-bundles")
+                .join(format!("{id}.zip")),
+        )
+        .unwrap();
+    }
+    deploy::apply(packs, &remote, plan, &job).await.unwrap();
+    assert!(!root.join("mods/old.jar.client").exists());
+    assert_eq!(
+        fs::read(root.join("mods/a.jar.client")).unwrap(),
+        f.git.object_bytes(&jar.sha)
+    );
+    assert_eq!(
+        fs::read(root.join("config/a.toml")).unwrap(),
+        b"enabled=true\n"
+    );
+    assert_eq!(
+        fs::read(root.join("server.properties")).unwrap(),
+        b"motd=Preserve"
+    );
+    assert_eq!(
+        deploy::read_version(&remote).await.unwrap().unwrap().commit,
+        target.sha
+    );
+    assert_eq!(f.git.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|path| path.ends_with(".zip"))
+            .count(),
+        2
+    );
 }
