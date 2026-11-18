@@ -12,6 +12,12 @@ This implementation uses sparse HTTP retrieval and a persistent Git-object cache
 
 Server source inventories are separate and include `server_config.conf` and `server_files`, even when `.packignore` excludes them from clients. The server builder continues applying its inclusion rules, mod sidedness, dependencies, templates, and preservation policy.
 
+## Rate limits and retries
+
+Metadata and file requests both retry transient connection failures, HTTP 408/5xx responses, and rate limits, with a maximum of five attempts per request. GitHub's HTTP 403 rate limits are recognized from the response headers or rate-limit message; ordinary permission failures and missing files still fail immediately. Backoff grows exponentially and includes random jitter. `Retry-After` (seconds or an HTTP date) and exhausted `X-RateLimit-Reset` times are honored without the old 60-second cap. A secondary limit without retry timing starts with a one-minute wait and doubles on repeated failures, following [GitHub's retry guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api).
+
+All downloader clones share cooldowns per origin. Parallel file downloads pause together, then requests to that origin are spaced 250 ms apart for a one-minute recovery period. Other origins and already verified cache files remain usable. The existing progress bar shows the retry countdown, and cancellation interrupts the wait. Partial files and their resume validators are retained. A rate-limited changelist does not trigger a more expensive full-inventory fallback. Startup retains its bounded remote check and can still offer the installed pack when the service is unavailable; explicit retries respect the outstanding cooldown.
+
 ## Baselines, repair, and fallback
 
 The expected release inventory is cached separately from the instance's ownership/base-content inventory. The latter records managed paths and their last applied distribution hashes; it does not certify that user-writable disk files still match. Preserved settings retain their prior base identity, and unknown user files are not claimed or removed.
@@ -42,6 +48,8 @@ pnpm build --no-bundle
 ```
 
 Local HTTP fixtures cover skipped releases, final-only downloads, rename reuse with an empty cache, legacy baselines, tag pagination/peeling, truncated trees, missing/inconsistent/cyclic chains, policy/filter changes, case-only renames, failed downloads, and repair. Filesystem fixtures cover interrupted activation and transitions blocked by user data.
+
+Rate-limit fixtures cover reset/HTTP-date headers and clock skew, primary/secondary limits, transient metadata failures, permission errors, shared metadata/file cooldowns, gradual recovery, independent origins, cancellation, partial-file resume, bounded retries, and suppression of full-inventory fallback after a rate limit.
 
 An explicit live smoke test reads published metadata without downloading pack jar bodies:
 

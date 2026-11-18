@@ -14,6 +14,9 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+mod retry;
+use retry::{RetryPolicy, RetryableStatus, ATTEMPTS};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
 pub enum Checksum {
@@ -86,6 +89,7 @@ pub struct Downloader {
     pub client: reqwest::Client,
     partial_dir: PathBuf,
     transferred: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    retry: std::sync::Arc<RetryPolicy>,
 }
 impl Downloader {
     pub fn new(layout: &Layout) -> Result<Self> {
@@ -97,16 +101,55 @@ impl Downloader {
                 .build()?,
             partial_dir: layout.root.join("downloads"),
             transferred: Default::default(),
+            retry: Default::default(),
         })
     }
     pub fn transferred_bytes(&self) -> u64 {
         self.transferred.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub async fn json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let response = self.client.get(url).send().await?.error_for_status()?;
+        self.json_with_job(url, &Job::default()).await
+    }
+    pub async fn json_with_job<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        job: &Job,
+    ) -> Result<T> {
+        for attempt in 0..ATTEMPTS {
+            self.retry.wait(url, job, None).await?;
+            let result = self.json_attempt(url, attempt, job).await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    job.check()?;
+                    if !retry::transient(&error) || attempt + 1 == ATTEMPTS {
+                        return Err(error).with_context(|| format!("Read metadata {url}"));
+                    }
+                    self.retry.after_error(&error, attempt, job).await?;
+                }
+            }
+        }
+        unreachable!()
+    }
+    async fn json_attempt<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        attempt: u32,
+        job: &Job,
+    ) -> Result<T> {
+        let response = tokio::select! {
+            _=job.cancel.cancelled()=>bail!("Operation cancelled"),
+            response=self.client.get(url).send()=>response?,
+        };
+        let response = self.retry.response(url, response, attempt, job).await?;
         let mut data = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = tokio::select! {
+                _=job.cancel.cancelled()=>bail!("Operation cancelled"),
+                chunk=stream.next()=>chunk,
+            };
+            let Some(chunk) = next else { break };
             data.extend_from_slice(&chunk?);
             if data.len() > 32 * 1024 * 1024 {
                 bail!("Metadata response is too large");
@@ -180,10 +223,12 @@ impl Downloader {
             ));
             let part = self.partial_dir.join(format!("{key}.part"));
             let meta = self.partial_dir.join(format!("{key}.json"));
-            for attempt in 0..5 {
+            for attempt in 0..ATTEMPTS {
                 job.check()?;
                 task.state(TaskState::Checking, attempt + 1);
-                let result = self.attempt(download, &part, &meta, job, &task).await;
+                let result = self
+                    .attempt(download, &part, &meta, job, &task, attempt)
+                    .await;
                 match result {
                     Ok(()) => {
                         task.complete(false);
@@ -193,18 +238,16 @@ impl Downloader {
                         if job.cancel.is_cancelled() {
                             bail!("Operation cancelled");
                         }
-                        if let Some(status) = error.downcast_ref::<PermanentStatus>() {
-                            bail!("Download failed: HTTP {} ({})", status.0, download.url);
+                        if retry::permanent_status(&error) {
+                            return Err(error)
+                                .with_context(|| format!("Download {}", download.url));
                         }
-                        if attempt == 4 {
-                            return Err(error).with_context(|| format!("Download {}", download.url));
+                        if attempt + 1 == ATTEMPTS {
+                            return Err(error)
+                                .with_context(|| format!("Download {}", download.url));
                         }
-                        let delay = error
-                            .downcast_ref::<RetryAfter>()
-                            .map(|e| e.0)
-                            .unwrap_or(Duration::from_millis(400 * (1 << attempt)));
                         task.state(TaskState::Retrying, attempt + 1);
-                        tokio::select! {_=job.cancel.cancelled()=>bail!("Operation cancelled"),_=tokio::time::sleep(delay)=>{}}
+                        self.retry.after_error(&error, attempt, job).await?;
                     }
                 }
             }
@@ -223,7 +266,9 @@ impl Downloader {
         meta: &Path,
         job: &Job,
         task: &TaskTicket,
+        attempt: u32,
     ) -> Result<()> {
+        self.retry.wait(&download.url, job, Some(task)).await?;
         let previous = storage::read_optional::<Partial>(meta)?.unwrap_or_default();
         let offset = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
         let mut request = self
@@ -243,19 +288,10 @@ impl Downloader {
             let _ = fs::remove_file(meta);
             bail!("Restarting unsatisfiable partial download");
         }
-        if status.as_u16() == 429 || status.is_server_error() || status.as_u16() == 408 {
-            let seconds = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2)
-                .min(60);
-            return Err(RetryAfter(Duration::from_secs(seconds)).into());
-        }
-        if !status.is_success() {
-            return Err(PermanentStatus(status.as_u16()).into());
-        }
+        let response = self
+            .retry
+            .response(&download.url, response, attempt, job)
+            .await?;
         let append = status.as_u16() == 206 && offset > 0 && previous.url == download.url;
         if status.as_u16() == 206 {
             let content_range = response
@@ -345,26 +381,9 @@ impl Downloader {
         Ok(())
     }
 }
-#[derive(Debug)]
-struct PermanentStatus(u16);
-impl std::fmt::Display for PermanentStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HTTP {}", self.0)
-    }
-}
-impl std::error::Error for PermanentStatus {}
-#[derive(Debug)]
-struct RetryAfter(Duration);
-impl std::fmt::Display for RetryAfter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Server requested retry")
-    }
-}
-impl std::error::Error for RetryAfter {}
-
 /// Classify failures of actual requests, never infer connectivity from a probe.
 pub(crate) fn unavailable(error: &anyhow::Error) -> bool {
-    if error.downcast_ref::<RetryAfter>().is_some() {
+    if error.downcast_ref::<RetryableStatus>().is_some() {
         return true;
     }
     error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
@@ -372,7 +391,7 @@ pub(crate) fn unavailable(error: &anyhow::Error) -> bool {
             || error.is_timeout()
             || error.is_body()
             || error.status().is_some_and(|status| {
-                status.is_server_error() || [403, 408, 429].contains(&status.as_u16())
+                status.is_server_error() || [408, 429].contains(&status.as_u16())
             })
     })
 }

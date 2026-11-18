@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Responses {
     bodies: BTreeMap<String, Vec<u8>>,
+    limited: BTreeSet<String>,
     requests: Vec<String>,
     delay: std::time::Duration,
 }
@@ -64,16 +65,20 @@ impl Fixture {
                 let mut state = state.lock().unwrap();
                 let path = uri.path_and_query().unwrap().as_str().to_string();
                 state.requests.push(path.clone());
-                let (status, body) = match state.bodies.get(&path) {
-                    Some(body) => (StatusCode::OK, body.clone()),
-                    None => (StatusCode::NOT_FOUND, Vec::new()),
+                let (status, body) = if state.limited.contains(&path) {
+                    (StatusCode::TOO_MANY_REQUESTS, b"rate limited".to_vec())
+                } else {
+                    match state.bodies.get(&path) {
+                        Some(body) => (StatusCode::OK, body.clone()),
+                        None => (StatusCode::NOT_FOUND, Vec::new()),
+                    }
                 };
                 (status, body, state.delay)
             };
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            (status, body)
+            (status, [("retry-after", "0")], body)
         }
         let router = Router::new().fallback(get(serve)).with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1385,6 +1390,66 @@ async fn published_build145_chains_and_jar_rename_identities() {
         println!("Verified unchanged blob for {old} → {new}: {}", after.sha);
     }
     println!("Live 139 → 145: 3 changelists, {} selected paths, metadata bodies {} bytes, zero jar-body downloads",paths.len(),packs.net.transferred_bytes());
+}
+
+#[tokio::test]
+async fn exhausted_changelist_rate_limits_do_not_trigger_a_full_inventory() {
+    let f = Fixture::new().await;
+    let base = f.snapshot(
+        "139",
+        files(&[("minecraft/mods/a.jar", "old")]),
+        None,
+        Some(vec![]),
+    );
+    f.install(&base).await;
+    let target = f.snapshot(
+        "145",
+        files(&[("minecraft/mods/b.jar", "new")]),
+        Some(&base),
+        Some(vec![
+            "-minecraft/mods/a.jar".into(),
+            "+minecraft/mods/b.jar".into(),
+        ]),
+    );
+    f.latest(&target);
+    let limited = format!("/api/git/commits/{}", target.sha);
+    let minecraft = {
+        let mut state = f.state.lock().unwrap();
+        state.limited.insert(limited.clone());
+        state.requests.clear();
+        let root: Value =
+            serde_json::from_slice(&state.bodies[&format!("/api/git/trees/{}", target.sha)])
+                .unwrap();
+        root["tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == "minecraft")
+            .unwrap()["sha"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let error = f
+        .packs
+        .update_required(false, &Job::default(), None)
+        .await
+        .unwrap_err();
+    assert!(crate::download::unavailable(&error));
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag.sha, base.sha);
+    let state = f.state.lock().unwrap();
+    assert_eq!(
+        state
+            .requests
+            .iter()
+            .filter(|path| *path == &limited)
+            .count(),
+        5
+    );
+    assert!(!state
+        .requests
+        .iter()
+        .any(|path| path.starts_with(&format!("/api/git/trees/{minecraft}"))));
 }
 
 #[tokio::test]

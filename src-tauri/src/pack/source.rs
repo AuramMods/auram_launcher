@@ -158,11 +158,7 @@ impl<'a> Source<'a> {
             .await
     }
     async fn json<T: serde::de::DeserializeOwned>(&self, url: &str, job: &Job) -> Result<T> {
-        job.check()?;
-        tokio::select! {
-            _=job.cancel.cancelled()=>bail!("Operation cancelled"),
-            result=self.packs.net.json(url)=>result,
-        }
+        self.packs.net.json_with_job(url, job).await
     }
     pub(super) async fn resolve(&self, name: &str, job: &Job) -> Result<PackTag> {
         if version(name).is_none() {
@@ -473,6 +469,9 @@ impl<'a> Source<'a> {
                             storage::write_json(&self.snapshot(&tag.sha), &manifest)?;
                             return Ok((manifest, Some(paths)));
                         }
+                        // A rate limit/outage is not a broken changelist. Starting
+                        // a full inventory would just consume more API requests.
+                        Err(error) if crate::download::unavailable(&error) => return Err(error),
                         Err(error) => {
                             job.check()?;
                             job.progress("pack",format!("Changelist unavailable ({error}); reconciling the selected target files"),0,0);

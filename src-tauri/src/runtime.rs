@@ -233,7 +233,10 @@ impl Runtime {
         } else {
             let manifest: Value = self
                 .net
-                .json("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+                .json_with_job(
+                    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+                    job,
+                )
                 .await?;
             let entry = manifest["versions"]
                 .as_array()
