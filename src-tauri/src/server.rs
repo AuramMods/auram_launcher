@@ -670,7 +670,7 @@ mod tests {
         use std::io::Write;
         let temp = tempfile::tempdir().unwrap();
         let layout = crate::storage::Layout::new(temp.path().into()).unwrap();
-        let packs = Packs::new(
+        let packs = Packs::legacy_fixture(
             layout.clone(),
             crate::download::Downloader::new(&layout).unwrap(),
         );

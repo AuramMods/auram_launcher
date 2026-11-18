@@ -11,6 +11,14 @@ use std::{
 };
 
 pub const MAX_METADATA: usize = 32 * 1024 * 1024;
+#[derive(Debug)]
+pub struct UnsupportedDistribution;
+impl std::fmt::Display for UnsupportedDistribution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Unsupported signed pack distribution schema/policy")
+    }
+}
+impl std::error::Error for UnsupportedDistribution {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
@@ -43,10 +51,13 @@ pub struct Change {
     pub after: Option<Entry>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Transition {
     pub target: PackTag,
     pub base: Option<PackTag>,
     pub changes: BTreeMap<String, Change>,
+    #[serde(default)]
+    pub pack_ignore_before: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -153,18 +164,72 @@ impl Envelope {
             bail!("Pack metadata is too large");
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(&self.payload)?;
-        let key =
-            minisign_verify::PublicKey::decode(public_key).context("Read pack verification key")?;
         let signature =
             minisign_verify::Signature::decode(&self.signature).context("Read pack signature")?;
-        key.verify(&bytes, &signature, false)
-            .context("Invalid pack metadata signature")?;
+        let mut trusted = false;
+        for line in public_key
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("untrusted comment:"))
+        {
+            let key = minisign_verify::PublicKey::from_base64(line)
+                .context("Read pack verification key")?;
+            if key.verify(&bytes, &signature, false).is_ok() {
+                trusted = true;
+                break;
+            }
+        }
+        if !trusted {
+            bail!("Invalid pack metadata signature");
+        }
+        let version: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if version["schema"].as_u64() != Some(1)
+            || version["policy"].as_u64() != Some(policy().version as u64)
+        {
+            return Err(UnsupportedDistribution.into());
+        }
         let catalog: Catalog = serde_json::from_slice(&bytes)?;
         catalog.validate()?;
         Ok(catalog)
     }
 }
 impl Catalog {
+    /// Derive a prior complete snapshot only from already verified reversible
+    /// history. No GitHub tree/tag/commit API lookups are necessary.
+    pub fn at(&self, tag: &PackTag) -> Option<Self> {
+        let mut value = self.clone();
+        if tag.name == value.target.name && tag.sha == value.target.sha {
+            return Some(value);
+        }
+        for (index, link) in self.history.iter().enumerate() {
+            for (path, change) in &link.changes {
+                if let Some(before) = &change.before {
+                    value.files.insert(path.clone(), before.clone());
+                } else {
+                    value.files.remove(path);
+                }
+            }
+            let base = link.base.as_ref()?;
+            value.pack_ignore = link.pack_ignore_before.clone()?;
+            value.target = base.clone();
+            if tag.name == base.name && tag.sha == base.sha {
+                value.history = self.history[index + 1..].to_vec();
+                return Some(value);
+            }
+        }
+        None
+    }
+    pub fn route(&self, tag: &PackTag) -> Option<usize> {
+        if self.target.name == tag.name && self.target.sha == tag.sha {
+            return Some(0);
+        }
+        self.history.iter().enumerate().find_map(|(i, link)| {
+            link.base
+                .as_ref()
+                .filter(|b| b.name == tag.name && b.sha == tag.sha)
+                .map(|_| i + 1)
+        })
+    }
     pub fn manifest(&self) -> Manifest {
         Manifest {
             schema: 1,
@@ -325,6 +390,12 @@ mod tests {
         let catalog = envelope.verify(public_key).unwrap();
         assert_eq!(catalog.target.name, "7");
         assert!(envelope.verify(include_str!("../../pack.pub")).is_err());
+        assert!(
+            envelope
+                .verify(&format!("{}\n{public_key}", include_str!("../../pack.pub")))
+                .is_ok(),
+            "rotation must accept a retained key as well as the new primary key"
+        );
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(&envelope.payload)
             .unwrap();

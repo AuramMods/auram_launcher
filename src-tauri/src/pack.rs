@@ -12,6 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 pub mod distribution;
+mod distribution_source;
+#[cfg(test)]
+mod distribution_tests;
+pub mod git_transport;
+mod replacement;
 mod source;
 pub use source::Repository;
 use source::{Selection, Source, CLIENT_POLICY};
@@ -47,6 +52,8 @@ pub struct Packs {
     pub layout: Layout,
     pub net: Downloader,
     repository: Repository,
+    catalogs: std::sync::Arc<std::sync::Mutex<BTreeMap<String, distribution::Catalog>>>,
+    catalog_misses: std::sync::Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>>,
 }
 type FileChange = (String, Option<PathBuf>);
 struct Reconciliation {
@@ -68,6 +75,62 @@ impl Packs {
         target: &PackTag,
         job: &Job,
     ) -> Result<(Manifest, BTreeSet<String>, usize)> {
+        if let Some(catalog) = distribution_source::catalog(self, target, job).await? {
+            let tag = std::iter::once(&catalog.target)
+                .chain(catalog.history.iter().filter_map(|link| link.base.as_ref()))
+                .find(|tag| tag.name == version)
+                .context("Signed distribution history does not reach the server version")?
+                .clone();
+            if !commit.is_empty() && commit != tag.sha {
+                bail!("Remote version commit disagrees with signed release history");
+            }
+            let count = catalog
+                .route(&tag)
+                .context("No signed server update route")?;
+            if count > 8 {
+                bail!("Server is more than eight release transitions behind; use scoped full replacement");
+            }
+            let previous = catalog
+                .at(&tag)
+                .context("Signed history cannot reconstruct the previous server profile")?;
+            previous.validate()?;
+            let base = previous.manifest();
+            let config = previous
+                .files
+                .get("server_config.conf")
+                .context("Previous pack has no server configuration")?;
+            let path = self.layout.root.join("cache/blobs").join(&config.sha);
+            if !path.is_file()
+                || !Checksum::GitBlob(config.sha.clone()).verify(&path)?
+                || !Checksum::Sha256(config.sha256.clone()).verify(&path)?
+            {
+                distribution_source::sparse(
+                    self,
+                    &previous,
+                    &BTreeMap::from([("server_config.conf".into(), config.clone())]),
+                    job,
+                )
+                .await?;
+            }
+            let config: crate::server::ServerConfig =
+                toml::from_str(&tokio::fs::read_to_string(path).await?)
+                    .context("Read the signed previous server configuration")?;
+            let changed = base
+                .files
+                .keys()
+                .chain(catalog.files.keys())
+                .filter(|path| {
+                    base.files.get(*path)
+                        != catalog
+                            .files
+                            .get(*path)
+                            .map(distribution::Entry::file)
+                            .as_ref()
+                })
+                .cloned()
+                .collect();
+            return Ok((config.manifest(&base)?, changed, count));
+        }
         let tag = self.source().resolve(version, job).await?;
         if !commit.is_empty() && commit != tag.sha {
             bail!("Remote version commit disagrees with its immutable pack tag");
@@ -91,7 +154,15 @@ impl Packs {
             layout,
             net,
             repository: Repository::default(),
+            catalogs: Default::default(),
+            catalog_misses: Default::default(),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn legacy_fixture(layout: Layout, net: Downloader) -> Self {
+        let mut packs = Self::new(layout, net);
+        packs.repository.distribution = None;
+        packs
     }
     fn source(&self) -> Source<'_> {
         Source::new(self)
@@ -106,6 +177,9 @@ impl Packs {
         self.source().discover(&Job::default()).await
     }
     pub async fn manifest(&self, tag: PackTag, job: &Job) -> Result<Manifest> {
+        if let Some(catalog) = distribution_source::catalog(self, &tag, job).await? {
+            return Ok(catalog.manifest());
+        }
         let cache = self
             .layout
             .state(&format!("pack-server-source-1-{}.json", tag.sha));
@@ -125,6 +199,16 @@ impl Packs {
     pub fn blob_path(&self, file: &PackFile) -> PathBuf {
         self.layout.root.join("cache/blobs").join(&file.sha)
     }
+    fn signed_checksum(&self, manifest: &Manifest, path: &str, file: &PackFile) -> Option<String> {
+        self.catalogs
+            .lock()
+            .unwrap()
+            .get(&manifest.tag.sha)?
+            .files
+            .get(file.source.as_deref().unwrap_or(path))
+            .filter(|entry| entry.sha == file.sha)
+            .map(|entry| entry.sha256.clone())
+    }
     pub fn download(&self, manifest: &Manifest, path: &str, file: &PackFile) -> Result<Download> {
         let url = self
             .repository
@@ -143,8 +227,15 @@ impl Packs {
             .get(path)
             .with_context(|| format!("Pack is missing {path}"))?;
         let item = self.download(manifest, path, file)?;
+        let sha256 = self.signed_checksum(manifest, path, file);
         job.check()?;
-        if Downloader::valid(&item).await? {
+        if Downloader::valid(&item).await?
+            && sha256.as_ref().is_none_or(|hash| {
+                Checksum::Sha256(hash.clone())
+                    .verify(&item.target)
+                    .unwrap_or(false)
+            })
+        {
             return Ok(item.target);
         }
         self.reuse_owned(
@@ -153,6 +244,17 @@ impl Packs {
             &item,
             job,
         )?;
+        if Downloader::valid(&item).await?
+            && sha256.as_ref().is_none_or(|hash| {
+                Checksum::Sha256(hash.clone())
+                    .verify(&item.target)
+                    .unwrap_or(false)
+            })
+        {
+            return Ok(item.target);
+        }
+        distribution_source::prepare(self, manifest, std::slice::from_ref(&item), None, job)
+            .await?;
         self.net.get(&item, job).await?;
         Ok(item.target)
     }
@@ -222,6 +324,8 @@ impl Packs {
         timeout: std::time::Duration,
     ) -> Result<crate::startup::PackPreparation> {
         use crate::startup::{PackPreparation, PackState};
+        let root = self.layout.client();
+        local_work::blocking(move || replacement::recover(&root)).await?;
         if self.installed()?.is_none() {
             return Ok(PackPreparation {
                 state: PackState::NotInstalled,
@@ -370,6 +474,14 @@ impl Packs {
         touched: Option<&BTreeSet<String>>,
         phases: (&str, &str),
     ) -> Result<Manifest> {
+        let recover_root = root.to_owned();
+        let recovered = local_work::blocking(move || replacement::recover(&recover_root)).await?;
+        let recovered_baseline = if recovered {
+            storage::read_optional::<Manifest>(&root.join(".auram-manifest.json"))?
+        } else {
+            None
+        };
+        let old = recovered_baseline.as_ref().or(old);
         job.phase(
             phases.0,
             if server { "Server files" } else { "Pack files" },
@@ -383,7 +495,7 @@ impl Packs {
         let inspect_job = job.clone();
         let inspect_touched = touched.cloned();
         let Reconciliation {
-            manifest: next,
+            manifest: mut next,
             downloads,
             changes,
         } = local_work::blocking(move || {
@@ -403,6 +515,34 @@ impl Packs {
             if server { "Server files" } else { "Pack files" },
             true,
         );
+        let prepared = distribution_source::prepare(self, desired, &downloads, old, job).await?;
+        let replace = prepared == distribution_source::Prepared::Sparse
+            && old.is_none_or(|m| m.tag.sha != desired.tag.sha);
+        if replace {
+            distribution_source::prepare_replacement(self, desired, root, old, server, job).await?;
+            next.files
+                .retain(|path, _| !replacement::inside(path, server));
+            next.files.extend(
+                desired
+                    .files
+                    .iter()
+                    .filter(|(path, _)| replacement::inside(path, server))
+                    .map(|(p, f)| (p.clone(), f.clone())),
+            );
+            job.phase(phases.1, "Replace pack folders", false);
+            let root = root.to_owned();
+            let desired = desired.clone();
+            let committed = next.clone();
+            let blob_root = self.layout.root.join("cache/blobs");
+            let job = job.clone();
+            local_work::blocking(move || {
+                replacement::apply(
+                    &root, &desired, &committed, &changes, &blob_root, server, &job,
+                )
+            })
+            .await?;
+            return Ok(next);
+        }
         self.net
             .many_named(
                 downloads,
@@ -535,7 +675,11 @@ impl Packs {
                                 .any(|path| path.starts_with(&format!("{relative}/")))
                         });
                     if target.exists() && !replaces_directory {
-                        let valid = Checksum::GitBlob(file.sha.clone()).verify(&target)?;
+                        let valid =
+                            Checksum::GitBlob(file.sha.clone()).verify(&target)?
+                                && self.signed_checksum(desired, relative, file).is_none_or(
+                                    |hash| Checksum::Sha256(hash).verify(&target).unwrap_or(false),
+                                );
                         let case_rename = previous.is_some()
                             && old.is_some_and(|m| !m.files.contains_key(relative));
                         if valid && source::mode_matches(&target, &file.mode)? && !case_rename {
@@ -724,7 +868,7 @@ mod tests {
     async fn update_reuses_blobs_and_preserves_worlds_and_unknown_files() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().into()).unwrap();
-        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
+        let packs = Packs::legacy_fixture(layout.clone(), Downloader::new(&layout).unwrap());
         let old_file = file(b"old");
         let new_file = file(b"new");
         storage::atomic_write(&packs.blob_path(&new_file), b"new").unwrap();
@@ -774,7 +918,7 @@ mod tests {
     async fn failed_or_cancelled_parallel_inspection_never_activates_partial_changes() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().into()).unwrap();
-        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
+        let packs = Packs::legacy_fixture(layout.clone(), Downloader::new(&layout).unwrap());
         let original = file(b"original");
         let updated = file(b"updated");
         storage::atomic_write(&packs.blob_path(&updated), b"updated").unwrap();
@@ -841,7 +985,7 @@ mod tests {
     async fn server_updates_preserve_locally_modified_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().into()).unwrap();
-        let packs = Packs::new(layout.clone(), Downloader::new(&layout).unwrap());
+        let packs = Packs::legacy_fixture(layout.clone(), Downloader::new(&layout).unwrap());
         let original = file(b"original");
         let updated = file(b"pack-update");
         storage::atomic_write(&packs.blob_path(&updated), b"pack-update").unwrap();

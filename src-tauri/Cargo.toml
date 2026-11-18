@@ -50,6 +50,7 @@ ignore = "0.4"
 unicode-normalization = "0.1"
 same-file = "1"
 minisign-verify = "=0.3.0"
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 regex = "1"
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
@@ -62,6 +63,8 @@ libloading = "0.8"
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+ed25519-dalek = "2"
+blake2 = "0.10"
 
 # Keep pnpm dev's integrity checks representative of packaged performance.
 [profile.dev.package.sha1]

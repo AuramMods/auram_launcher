@@ -13,14 +13,20 @@ pub(super) const CLIENT_POLICY: u32 = 1;
 
 #[derive(Clone)]
 pub struct Repository {
-    api: String,
-    raw: String,
+    pub(super) api: String,
+    pub(super) raw: String,
+    pub(super) distribution: Option<String>,
+    pub(super) git: String,
+    pub(super) pack_key: String,
 }
 impl Default for Repository {
     fn default() -> Self {
         Self {
             api: "https://api.github.com/repos/AuramMods/Auram".into(),
             raw: "https://raw.githubusercontent.com/AuramMods/Auram/".into(),
+            distribution: Some("https://github.com/AuramMods/Auram/releases".into()),
+            git: "https://github.com/AuramMods/Auram.git".into(),
+            pack_key: include_str!("../../pack.pub").into(),
         }
     }
 }
@@ -164,6 +170,9 @@ impl<'a> Source<'a> {
         if version(name).is_none() {
             bail!("Invalid pack release tag: {name}");
         }
+        if let Some(catalog) = super::distribution_source::named(self.packs, name, job).await? {
+            return Ok(catalog.target);
+        }
         let reference: Ref = self.api(&format!("/git/ref/tags/{name}"), job).await?;
         let mut object = reference.object;
         let mut seen = BTreeSet::new();
@@ -189,6 +198,9 @@ impl<'a> Source<'a> {
     }
     pub(super) async fn discover(&self, job: &Job) -> Result<PackTag> {
         job.progress("pack", "Checking the published pack build", 0, 0);
+        if let Some(catalog) = super::distribution_source::latest(self.packs, job).await? {
+            return Ok(catalog.target);
+        }
         let hint: Result<Release> = self
             .json(
                 self.packs
@@ -386,6 +398,9 @@ impl<'a> Source<'a> {
         Ok(Some(release))
     }
     pub(super) async fn selection(&self, tag: &PackTag, job: &Job) -> Result<Selection> {
+        if let Some(catalog) = super::distribution_source::catalog(self.packs, tag, job).await? {
+            return super::distribution_source::selection(&catalog);
+        }
         let mut builder = ignore::gitignore::GitignoreBuilder::new("");
         if let Some(bytes) = self.bytes(tag, ".packignore", job).await? {
             for line in std::str::from_utf8(&bytes)?.lines() {
@@ -453,6 +468,28 @@ impl<'a> Source<'a> {
         repair: bool,
         job: &Job,
     ) -> Result<(Manifest, Option<BTreeSet<String>>)> {
+        if let Some(catalog) = super::distribution_source::catalog(self.packs, &tag, job).await? {
+            let selection = super::distribution_source::selection(&catalog)?;
+            let mut manifest = catalog.manifest();
+            manifest.policy = CLIENT_POLICY;
+            manifest
+                .files
+                .retain(|path, _| selection.includes(path, false));
+            let touched = if repair {
+                None
+            } else {
+                installed.filter(|m| m.policy == CLIENT_POLICY).map(|old| {
+                    old.files
+                        .keys()
+                        .chain(manifest.files.keys())
+                        .filter(|path| old.files.get(*path) != manifest.files.get(*path))
+                        .cloned()
+                        .collect()
+                })
+            };
+            storage::write_json(&self.snapshot(&tag.sha), &manifest)?;
+            return Ok((manifest, touched));
+        }
         let selection = self.selection(&tag, job).await?;
         if !repair {
             if let Some(base) = installed.filter(|m| m.policy == CLIENT_POLICY) {

@@ -92,6 +92,8 @@ impl Fixture {
         packs.repository = Repository {
             api: format!("http://{addr}/api"),
             raw: format!("http://{addr}/raw/"),
+            distribution: None,
+            ..Repository::default()
         };
         Self {
             state,

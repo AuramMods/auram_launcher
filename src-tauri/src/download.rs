@@ -92,6 +92,80 @@ pub struct Downloader {
     retry: std::sync::Arc<RetryPolicy>,
 }
 impl Downloader {
+    /// Read-only smart-Git POSTs cannot use HTTP Range. Retry complete responses,
+    /// retaining the private response and already indexed immutable Git objects.
+    pub(crate) async fn git_post(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        target: &Path,
+        limit: u64,
+        job: &Job,
+    ) -> Result<()> {
+        let mut task = job.task(&target.to_string_lossy(), "Git object batch", None);
+        for attempt in 0..ATTEMPTS {
+            self.retry.wait(url, job, Some(&task)).await?;
+            task.state(TaskState::Checking, attempt + 1);
+            let result = async {
+                let request = self
+                    .client
+                    .post(url)
+                    .header("Git-Protocol", "version=2")
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-git-upload-pack-request",
+                    )
+                    .body(body.clone());
+                let response = tokio::select! {
+                    _=job.cancel.cancelled()=>bail!("Operation cancelled"),
+                    response=request.send()=>response?,
+                };
+                let response = self.retry.response(url, response, attempt, job).await?;
+                let mut file = tokio::fs::File::create(target).await?;
+                let total = response.content_length();
+                let mut stream = response.bytes_stream();
+                let mut received = 0u64;
+                loop {
+                    let next = tokio::select! {
+                        _=job.cancel.cancelled()=>bail!("Operation cancelled"),
+                        next=stream.next()=>next,
+                    };
+                    let Some(chunk) = next else { break };
+                    let chunk = chunk?;
+                    received = received
+                        .checked_add(chunk.len() as u64)
+                        .context("Git response overflow")?;
+                    if received > limit {
+                        bail!("Git response exceeds the requested object bound");
+                    }
+                    file.write_all(&chunk).await?;
+                    self.transferred
+                        .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    task.transfer(received, total, chunk.len() as u64);
+                }
+                file.flush().await?;
+                file.sync_all().await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    task.complete(false);
+                    return Ok(());
+                }
+                Err(error) => {
+                    job.check()?;
+                    if !retry::transient(&error) || attempt + 1 == ATTEMPTS {
+                        task.fail(&format!("{error:#}"));
+                        return Err(error);
+                    }
+                    task.state(TaskState::Retrying, attempt + 1);
+                    self.retry.after_error(&error, attempt, job).await?;
+                }
+            }
+        }
+        unreachable!()
+    }
     pub fn new(layout: &Layout) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()

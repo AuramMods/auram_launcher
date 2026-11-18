@@ -267,7 +267,7 @@ pub(crate) fn payload(packs: &Packs, name: &str, files: &[(&str, &[u8])]) -> Man
 fn packs() -> (tempfile::TempDir, Packs) {
     let t = tempfile::tempdir().unwrap();
     let l = Layout::new(t.path().into()).unwrap();
-    let p = Packs::new(l.clone(), Downloader::new(&l).unwrap());
+    let p = Packs::legacy_fixture(l.clone(), Downloader::new(&l).unwrap());
     (t, p)
 }
 fn baseline(remote: &DiskRemote, manifest: &Manifest, name: &str) {
