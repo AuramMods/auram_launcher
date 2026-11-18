@@ -102,7 +102,7 @@ public class MacCompatibilityProbe {
         &[],
     )
     .await?;
-    for memory in [1024, 9216, 9728, 20480] {
+    for memory in [4096, 9216, 11264, 12288, 20480] {
         let mut arguments = launch_options::jvm_arguments(memory)?;
         arguments.extend([
             "-XstartOnFirstThread".into(),

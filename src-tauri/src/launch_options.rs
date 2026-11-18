@@ -1,5 +1,5 @@
-//! Auram's original automatic RAM policy and G1 tuning.
-use anyhow::Result;
+//! Auram's memory preferences, automatic RAM policy and G1 tuning.
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 const MIB: u64 = 1024 * 1024;
@@ -37,14 +37,51 @@ pub fn automatic_memory() -> &'static AutomaticMemory {
         AutomaticMemory::from_system_bytes(system.total_memory())
     })
 }
-pub(crate) fn automatic_memory_mib() -> u64 {
-    automatic_memory().maximum_mib
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemoryPreferences {
+    pub automatic: bool,
+    pub manual_heap_gib: Option<u8>,
+}
+impl Default for MemoryPreferences {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            manual_heap_gib: None,
+        }
+    }
+}
+impl MemoryPreferences {
+    pub fn validate(self) -> Result<()> {
+        let profiles = Profiles::load()?;
+        match self.manual_heap_gib {
+            Some(gib) if !profiles.supports(gib) => bail!(
+                "Choose a heap size between {} and {} GB",
+                profiles.manual_minimum_gib,
+                profiles.manual_maximum_gib
+            ),
+            None if !self.automatic => bail!("Choose a manual heap size"),
+            _ => Ok(()),
+        }
+    }
+
+    fn effective_mib(self, automatic_mib: u64, profiles: &Profiles) -> u64 {
+        if self.automatic {
+            return automatic_mib;
+        }
+        self.manual_heap_gib
+            .filter(|&heap| profiles.supports(heap))
+            .map_or(automatic_mib, |heap| u64::from(heap) * 1024)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Profiles {
-    high_memory_above_mib: u64,
+    manual_minimum_gib: u8,
+    manual_maximum_gib: u8,
+    high_memory_at_mib: u64,
     low: Profile,
     high: Profile,
 }
@@ -55,19 +92,36 @@ struct Profile {
     flags: Vec<String>,
 }
 
+impl Profiles {
+    fn load() -> Result<Self> {
+        Ok(serde_json::from_str(include_str!("../jvm-profiles.json"))?)
+    }
+    fn supports(&self, heap_gib: u8) -> bool {
+        (self.manual_minimum_gib..=self.manual_maximum_gib).contains(&heap_gib)
+    }
+    fn arguments(self, maximum_mib: u64) -> Vec<String> {
+        let profile = if maximum_mib >= self.high_memory_at_mib {
+            self.high
+        } else {
+            self.low
+        };
+        let mut arguments = vec![
+            format!("-Xmx{maximum_mib}M"),
+            format!("-Xms{}M", maximum_mib.min(profile.initial_memory_mib)),
+        ];
+        arguments.extend(profile.flags);
+        arguments
+    }
+}
+
 pub fn jvm_arguments(memory_mib: u64) -> Result<Vec<String>> {
-    let profiles: Profiles = serde_json::from_str(include_str!("../jvm-profiles.json"))?;
-    let profile = if memory_mib > profiles.high_memory_above_mib {
-        profiles.high
-    } else {
-        profiles.low
-    };
-    let mut arguments = vec![
-        format!("-Xmx{memory_mib}M"),
-        format!("-Xms{}M", memory_mib.min(profile.initial_memory_mib)),
-    ];
-    arguments.extend(profile.flags);
-    Ok(arguments)
+    Ok(Profiles::load()?.arguments(memory_mib))
+}
+
+pub fn configured_jvm_arguments(preferences: MemoryPreferences) -> Result<Vec<String>> {
+    let profiles = Profiles::load()?;
+    let maximum_mib = preferences.effective_mib(automatic_memory().maximum_mib, &profiles);
+    Ok(profiles.arguments(maximum_mib))
 }
 
 #[cfg(test)]
@@ -76,9 +130,11 @@ mod tests {
 
     #[test]
     fn heap_profiles_retain_original_tuning_and_valid_initial_bounds() {
-        for memory in [1024, 8192, 9216, 9728, 12288, 20480, 32768] {
+        for memory in [
+            1024, 4096, 9216, 10240, 11264, 12287, 12288, 20480, 21504, 32768,
+        ] {
             let arguments = jvm_arguments(memory).unwrap();
-            let high = memory > 9216;
+            let high = memory >= 12288;
             assert_eq!(arguments[0], format!("-Xmx{memory}M"));
             assert_eq!(
                 arguments[1],
@@ -129,6 +185,36 @@ mod tests {
                 assert!(arguments.contains(&"-XX:G1MixedGCLiveThresholdPercent=85".into()));
                 assert!(arguments.contains(&"-XX:G1RSetUpdatingPauseTimePercent=5".into()));
             }
+        }
+    }
+
+    #[test]
+    fn saved_manual_heap_is_used_only_in_manual_mode() {
+        let profiles = Profiles::load().unwrap();
+        for heap in 4..=32 {
+            let manual = MemoryPreferences {
+                automatic: false,
+                manual_heap_gib: Some(heap),
+            };
+            assert!(manual.validate().is_ok());
+            assert_eq!(
+                manual.effective_mib(20480, &profiles),
+                u64::from(heap) * 1024
+            );
+            let auto = MemoryPreferences {
+                automatic: true,
+                ..manual
+            };
+            assert_eq!(auto.effective_mib(9216, &profiles), 9216);
+            assert_eq!(auto.effective_mib(20480, &profiles), 20480);
+        }
+        for heap in [None, Some(3), Some(33)] {
+            let manual = MemoryPreferences {
+                automatic: false,
+                manual_heap_gib: heap,
+            };
+            assert!(manual.validate().is_err());
+            assert_eq!(manual.effective_mib(20480, &profiles), 20480);
         }
     }
 

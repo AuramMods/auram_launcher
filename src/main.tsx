@@ -12,6 +12,8 @@ import { SidebarAccount } from '@/components/sidebar-account';
 import { ServerInstances } from '@/components/server-instances';
 import { ServerConsole } from '@/components/server-console';
 import { DataLocationSettings } from '@/components/data-location';
+import { GameMemoryCard } from '@/components/game-memory';
+import type { AutomaticMemory, MemoryPreferences } from '@/lib/game-memory';
 import type { LocalServerAction, LocalServerStatus, ServerInstance } from '@/lib/server-instances';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { createStartupTask, type PackPreparation } from '@/lib/startup';
@@ -24,8 +26,8 @@ import emblem from '../assets/icon.png';
 import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
-type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
-type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
+type AuthSettings = {microsoftClientId:string;browserLogin:boolean};
+type Settings = AuthSettings & {memory:MemoryPreferences};
 type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];localServers:LocalServerStatus[];dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer';
 function App() {
@@ -39,7 +41,7 @@ function App() {
   const [serverErrors,setServerErrors]=React.useState<Partial<Record<string,string>>>({});
   const [confirmReinstall,setConfirmReinstall]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
-  const [settings,setSettings]=React.useState<Settings|null>(null);
+  const [settings,setSettings]=React.useState<AuthSettings|null>(null);
   const [challenge,setChallenge]=React.useState<{code:string;verificationUri:string;expiresAt:number}|null>(null);
   const [codeCopied,setCodeCopied]=React.useState(false);
   const [advanced,setAdvanced]=React.useState(false);
@@ -47,7 +49,16 @@ function App() {
   const [packPreparation,setPackPreparation]=React.useState<PackPreparation>({state:'pending',version:null,message:null,detail:null});
   const lastProgress=React.useRef<Pick<JobProgress,'jobId'|'revision'>|null>(null);
   const receiveProgress=React.useCallback((next:JobProgress)=>{if(isNewerProgress(next,lastProgress.current)){lastProgress.current=next;setProgress(next);}},[]);
-  const refresh=React.useCallback(async()=>{const next=await invoke<Status>('get_status');setStatus(next);setSettings(previous=>previous??next.settings);if(next.progress)receiveProgress(next.progress);return next;},[receiveProgress]);
+  const refresh = React.useCallback(async () => {
+    const next = await invoke<Status>('get_status');
+    setStatus(next);
+    setSettings(previous => previous ?? {
+      microsoftClientId: next.settings.microsoftClientId,
+      browserLogin: next.settings.browserLogin,
+    });
+    if (next.progress) receiveProgress(next.progress);
+    return next;
+  }, [receiveProgress]);
   const acceptPreparation=React.useCallback((next:PackPreparation)=>{
     setPackPreparation(next);
     if(next.state==='failed')showError(next.message??'Pack preparation failed. Retry the update.');
@@ -174,7 +185,8 @@ function App() {
           onOpenFolder={()=>void action('open_server_instance',{id:consoleServer.id})}/>}
         {tab==='settings'&&<>
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
-          <Card><CardHeader><div className="flex items-center justify-between"><CardTitle>Game memory</CardTitle><Badge variant="outline">Automatic</Badge></div><CardDescription>Auram selects its original memory preset for your computer.</CardDescription></CardHeader><CardContent><div className="memory-value">{memory?(memory.maximumMib/1024).toFixed(1):'…'} <span>GiB</span></div>{memory?<><p className="text-xs text-muted-foreground"><span className="text-violet-200">{memory.profile} tuning</span> · {(memory.initialMib/1024).toFixed(1)} GiB initial allocation. {memory.systemMemoryMib!==null?`${(memory.systemMemoryMib/1024).toFixed(1)} GiB system memory detected.`:'System memory detection unavailable; using the low-memory preset.'}</p><p className="mt-2 text-xs text-muted-foreground">9 GiB maximum on systems with up to {memory.highSystemMemoryAboveMib/1024} GiB of RAM; 20 GiB maximum above that.</p></>:<p className="text-xs text-muted-foreground">Detecting system memory…</p>}</CardContent></Card>
+          <GameMemoryCard automaticMemory={memory??null} preferences={status?.settings.memory??null} disabled={busy}
+            onSave={preferences=>action('save_memory_preferences',{preferences})}/>
           <div className="detail-grid mt-5"><Card><CardHeader><CardTitle>Files & diagnostics</CardTitle><CardDescription>Repair checks your managed files and downloads only what is missing or damaged.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>void action('open_folder',{folder:'data'})}><FolderOpen/>Data folder</Button><Button variant="outline" onClick={()=>void action('open_folder',{folder:'logs'})}>Logs</Button><Button variant="secondary" disabled={busy||running||!installed} onClick={()=>void run('repair')}><RefreshCw/>Repair installation</Button></CardContent></Card><Card><CardHeader><CardTitle>Launcher updates</CardTitle><CardDescription>New launcher builds install automatically on startup.</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={busy} onClick={()=>void updateLauncher()}><RefreshCw/>Check for updates</Button><p className="mt-3 text-xs text-muted-foreground" role="status">{updateStatus||`Installed: Build ${status?.build??'…'}`}</p></CardContent></Card></div>
           <DataLocationSettings disabled={busy||running} onBusyChange={value=>{if(value)setProgress(null);setActive(value);}} onError={showError} onNotice={showNotice}/>
           <button className="text-action mt-6" onClick={()=>setAdvanced(!advanced)}>{advanced?'Hide':'Show'} advanced authentication settings</button>{advanced&&<Card className="mt-3"><CardContent className="pt-5"><Label htmlFor="client-id">Microsoft application ID</Label><Input id="client-id" value={settings?.microsoftClientId??''} onChange={event=>setSettings(current=>current?{...current,microsoftClientId:event.target.value}:current)} className="mt-2"/><p className="text-xs text-muted-foreground mt-2">Changing the application ID requires signing in again.</p><div className="mt-4 flex items-center justify-between gap-4"><Label htmlFor="browser-login">Use a configured browser callback</Label><Switch id="browser-login" checked={settings?.browserLogin??false} onCheckedChange={browserLogin=>setSettings(current=>current?{...current,browserLogin}:current)}/></div><p className="text-xs text-muted-foreground mt-2">Enable only for an application registration with the desktop callback configured. The existing Auram registration uses the code flow with automatic session renewal.</p><Button className="mt-3" disabled={busy} onClick={()=>void save()}>Save</Button></CardContent></Card>}

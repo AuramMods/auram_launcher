@@ -3,6 +3,7 @@ use crate::{
     download::Downloader,
     game::{Game, GameStatus},
     jobs::{Jobs, PhaseSpec, Progress},
+    launch_options::MemoryPreferences,
     pack::{PackTag, Packs},
     runtime::{Platform, Runtime, Versions},
     server,
@@ -66,6 +67,18 @@ impl Core {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+    fn update_settings(&self, apply: impl FnOnce(&mut Settings)) -> Result<(), String> {
+        if self.jobs.busy() {
+            return Err("Wait for the current operation to finish".into());
+        }
+        let mut current = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = current.clone();
+        apply(&mut next);
+        storage::write_json(&self.layout.state("settings.json"), &next)
+            .map_err(|error| error.to_string())?;
+        *current = next;
+        Ok(())
     }
 }
 pub struct Backend(Mutex<Result<Arc<Core>, String>>, tokio::sync::Mutex<()>);
@@ -424,20 +437,33 @@ fn cancel_operation(backend: tauri::State<Backend>) -> Result<(), String> {
     backend.core()?.jobs.cancel();
     Ok(())
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthSettings {
+    microsoft_client_id: String,
+    browser_login: bool,
+}
 #[tauri::command]
-fn save_settings(settings: Settings, backend: tauri::State<Backend>) -> Result<(), String> {
-    let core = backend.core()?;
-    if core.jobs.busy() {
-        return Err("Wait for the current operation to finish".into());
-    }
+fn save_settings(settings: AuthSettings, backend: tauri::State<Backend>) -> Result<(), String> {
     if settings.microsoft_client_id.trim().is_empty() {
         return Err("Microsoft application ID is required".into());
     }
-    storage::write_json(&core.layout.state("settings.json"), &settings)
-        .map_err(|e| e.to_string())?;
-    *core.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
-    Ok(())
+    backend.core()?.update_settings(|current| {
+        current.microsoft_client_id = settings.microsoft_client_id;
+        current.browser_login = settings.browser_login;
+    })
 }
+#[tauri::command]
+fn save_memory_preferences(
+    preferences: MemoryPreferences,
+    backend: tauri::State<Backend>,
+) -> Result<(), String> {
+    preferences.validate().map_err(|error| error.to_string())?;
+    backend
+        .core()?
+        .update_settings(|settings| settings.memory = preferences)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum Folder {
@@ -496,6 +522,7 @@ pub fn run() {
             cancel_operation,
             copy_code_and_open,
             save_settings,
+            save_memory_preferences,
             crate::desktop_location::get_data_location,
             crate::desktop_location::choose_data_directory,
             crate::desktop_location::change_data_location,

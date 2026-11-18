@@ -529,7 +529,9 @@ impl Runtime {
         {
             output.push("-XstartOnFirstThread".into());
         }
-        output.extend(crate::launch_options::jvm_arguments(settings.memory_mib)?);
+        output.extend(crate::launch_options::configured_jvm_arguments(
+            settings.memory,
+        )?);
         output.extend(crate::game_branding::jvm_arguments(&self.layout.game())?);
         output.push(
             ready.forge["mainClass"]

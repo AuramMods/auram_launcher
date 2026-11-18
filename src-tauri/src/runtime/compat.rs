@@ -240,7 +240,10 @@ mod tests {
                 ..Default::default()
             };
             let settings = Settings {
-                memory_mib: 20480,
+                memory: crate::launch_options::MemoryPreferences {
+                    automatic: false,
+                    manual_heap_gib: Some(20),
+                },
                 ..Settings::default()
             };
             let args = runtime.arguments(&ready, &session, &settings).unwrap();

@@ -1,5 +1,10 @@
 {
-  "highMemoryAboveMib": 9216,
+  "manualMinimumGib": 4,
+  "manualMaximumGib": 32,
+  "recommendedMinimumGib": 9,
+  "recommendedMaximumGib": 20,
+  "estimatedOffHeapGib": 2,
+  "highMemoryAtMib": 12288,
   "low": {
     "label": "Low memory",
     "initialMemoryMib": 9216,

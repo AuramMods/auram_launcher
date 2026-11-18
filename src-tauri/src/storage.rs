@@ -356,9 +356,7 @@ pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Resu
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub schema: u32,
-    // Derived per machine. Ignore legacy/manual JSON and never persist it again.
-    #[serde(skip, default = "crate::launch_options::automatic_memory_mib")]
-    pub memory_mib: u64,
+    pub memory: crate::launch_options::MemoryPreferences,
     pub microsoft_client_id: String,
     pub browser_login: bool,
 }
@@ -366,7 +364,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             schema: 1,
-            memory_mib: crate::launch_options::automatic_memory_mib(),
+            memory: Default::default(),
             microsoft_client_id: "cf95d5d7-7830-4ad4-a70e-d54e50e80b40".into(),
             browser_login: false,
         }
@@ -531,7 +529,7 @@ pub(crate) fn remove_empty_parents(root: &Path, file: &Path) {
 mod tests {
     use super::*;
     #[test]
-    fn legacy_or_incoming_memory_settings_cannot_override_automatic_selection() {
+    fn old_heap_settings_keep_the_new_automatic_default() {
         for old_memory in [
             serde_json::json!(1024),
             serde_json::json!(32768),
@@ -540,10 +538,7 @@ mod tests {
             let settings:Settings=serde_json::from_value(serde_json::json!({
                 "schema":1,"memoryMib":old_memory,"microsoftClientId":"existing-client","browserLogin":true
             })).unwrap();
-            assert_eq!(
-                settings.memory_mib,
-                crate::launch_options::automatic_memory().maximum_mib
-            );
+            assert_eq!(settings.memory, Default::default());
             assert_eq!(settings.microsoft_client_id, "existing-client");
             assert!(settings.browser_login);
             let persisted = serde_json::to_value(&settings).unwrap();
@@ -551,11 +546,31 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<Settings>(persisted)
                     .unwrap()
-                    .memory_mib,
-                settings.memory_mib
+                    .memory,
+                settings.memory
             );
         }
     }
+    #[test]
+    fn memory_preferences_round_trip_with_auth_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let settings = Settings {
+            memory: crate::launch_options::MemoryPreferences {
+                automatic: false,
+                manual_heap_gib: Some(10),
+            },
+            microsoft_client_id: "existing-client".into(),
+            browser_login: true,
+            ..Settings::default()
+        };
+        write_json(&path, &settings).unwrap();
+        let loaded: Settings = read_json(&path).unwrap();
+        assert_eq!(loaded.memory, settings.memory);
+        assert_eq!(loaded.microsoft_client_id, settings.microsoft_client_id);
+        assert!(loaded.browser_login);
+    }
+
     #[test]
     fn client_reset_resumes_after_restart_and_cannot_replay_old_files() {
         let temp = tempfile::tempdir().unwrap();
