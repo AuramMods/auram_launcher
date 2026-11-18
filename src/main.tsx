@@ -173,7 +173,7 @@ function App() {
       </nav>
       <div className="sidebar-bottom"><div className="sidebar-meta">{running&&<div className="local-label"><span className="status-dot on"/>MINECRAFT RUNNING</div>}<span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div><SidebarAccount account={status?.account??null} disabled={busy||!status} onSignIn={()=>void run('signIn')} onSignOut={()=>void run('signOut')}/></div>
     </aside>
-    <div className={`workspace ${busy?'is-working':''}`}>
+    <div className={`workspace${consoleServer?' console-workspace':''}${busy?' is-working':''}`}>
       <main>
         {tab==='play'&&<>
           <section className="pack-panel" aria-labelledby="pack-title">
