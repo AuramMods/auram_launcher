@@ -1,7 +1,8 @@
 //! Windows Java 17's stock launcher converts UTF-16 arguments through the legacy
 //! ANSI codepage. Use the verified runtime's own JLI in a UTF-8 manifested process.
 //! A private stdin pipe carries arguments, including credentials, without files or
-//! the Windows command-line length limit. macOS retains its first-thread launcher.
+//! the Windows command-line length limit. The macOS game uses a first-thread
+//! native app helper, and other macOS Java commands use the stock launcher.
 use anyhow::Result;
 use std::path::Path;
 use tokio::{
@@ -22,6 +23,28 @@ pub fn command(java: &Path, arguments: &[String]) -> Result<(Command, Option<Vec
         let mut command = Command::new(java);
         command.args(arguments);
         Ok((command, None))
+    }
+}
+
+pub fn game_command(
+    java: &Path,
+    arguments: &[String],
+    data: &Path,
+    #[cfg(target_os = "macos")] glfw: &Path,
+) -> Result<(Command, Option<Vec<u8>>)> {
+    #[cfg(target_os = "macos")]
+    return crate::mac_game_helper::command(java, arguments, data, glfw);
+    #[cfg(windows)]
+    {
+        let _ = data;
+        let mut command = Command::new(helper(java)?);
+        command.arg("--auram-game-pipe");
+        Ok((command, Some(serde_json::to_vec(arguments)?)))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = data;
+        command(java, arguments)
     }
 }
 
@@ -57,15 +80,21 @@ pub fn entry() {
     #[cfg(windows)]
     {
         let mode = std::env::args().nth(1).unwrap_or_default();
-        if mode != "--auram-java-pipe" && mode != "--auram-java-cli" {
+        if !matches!(
+            mode.as_str(),
+            "--auram-game-pipe" | "--auram-java-pipe" | "--auram-java-cli"
+        ) {
             return;
         }
         let result = (|| -> Result<i32> {
-            let args = if mode == "--auram-java-pipe" {
-                serde_json::from_reader(std::io::stdin().lock())?
-            } else {
+            let args = if mode == "--auram-java-cli" {
                 std::env::args().skip(2).collect::<Vec<String>>()
+            } else {
+                serde_json::from_reader(std::io::stdin().lock())?
             };
+            if mode == "--auram-game-pipe" {
+                game_identity()?;
+            }
             launch(args)
         })();
         match result {
@@ -76,6 +105,21 @@ pub fn entry() {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn game_identity() -> Result<()> {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let id = "art.arcane.auram.game"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
+    anyhow::ensure!(
+        result >= 0,
+        "Set Auram game taskbar identity failed (HRESULT {result:#x})"
+    );
+    Ok(())
 }
 
 #[cfg(windows)]

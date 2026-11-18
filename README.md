@@ -2,7 +2,7 @@
 
 Native Tauri 2 launcher for the Auram Minecraft 1.20.1 Forge pack. Supports Apple Silicon macOS and Windows x64. React, TypeScript, shadcn/ui, Rust, and pnpm; no Flutter/Dart installation is needed.
 
-The desktop icon keeps the original purple Auram mark on an OLED-black background. `pnpm icons` regenerates the native desktop icons from `assets/app-icon.svg`.
+The launcher icon uses the purple Auram mark on an OLED-black background. The game uses the pack's purple unicorn and its own native application identity. `pnpm icons` regenerates both icon sets. See [native game branding](docs/GAME_BRANDING.md).
 
 ## Development
 

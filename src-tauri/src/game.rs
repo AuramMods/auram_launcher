@@ -54,6 +54,16 @@ impl Game {
             .iter()
             .position(|arg| arg == main)
             .context("Game main class argument missing")?;
+        #[cfg(target_os = "macos")]
+        let (arguments, main_position, glfw) = {
+            let path = crate::mac_game_helper::prepare_glfw(runtime, ready)?;
+            let mut arguments = arguments;
+            arguments.insert(
+                main_position,
+                format!("-Dorg.lwjgl.glfw.libname={}", path.display()),
+            );
+            (arguments, main_position + 1, path)
+        };
         let argument_path = runtime.layout.state("launch-jvm.args");
         storage::atomic_write(
             &argument_path,
@@ -63,7 +73,13 @@ impl Game {
         let file = Arc::new(Mutex::new(fs::File::create(&log)?));
         let mut native_arguments = vec![format!("@{}", argument_path.display())];
         native_arguments.extend_from_slice(&arguments[main_position + 1..]);
-        let (mut command, input) = crate::java_bridge::command(&ready.java, &native_arguments)?;
+        let (mut command, input) = crate::java_bridge::game_command(
+            &ready.java,
+            &native_arguments,
+            &runtime.layout.root,
+            #[cfg(target_os = "macos")]
+            &glfw,
+        )?;
         command
             .current_dir(runtime.layout.game())
             .stdin(if input.is_some() {

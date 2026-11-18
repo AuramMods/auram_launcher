@@ -9,10 +9,13 @@ mod desktop_location;
 mod desktop_servers;
 pub mod download;
 pub mod game;
+mod game_branding;
 pub mod inspection;
 pub mod jobs;
 pub mod launch_options;
 pub mod local_work;
+#[cfg(target_os = "macos")]
+mod mac_game_helper;
 pub mod pack;
 pub mod runtime;
 pub mod server;

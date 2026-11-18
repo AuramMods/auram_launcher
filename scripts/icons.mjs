@@ -12,6 +12,9 @@ try {
   for (const name of readdirSync(output)) {
     if (/\.(png|icns|ico)$/.test(name)) copyFileSync(join(output, name), join('src-tauri/icons', name));
   }
+  execFileSync(process.execPath, [cli, 'icon', 'assets/icon.png', '--output', output], { stdio: 'inherit' });
+  copyFileSync(join(output, 'icon.ico'), 'src-tauri/icons/game.ico');
+  copyFileSync(join(output, 'icon.icns'), 'src-tauri/native/macos/Auram.icns');
 } finally {
   rmSync(output, { recursive: true, force: true });
 }

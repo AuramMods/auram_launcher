@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm frontend:dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm frontend:build",
+    "beforeBuildCommand": "pnpm frontend:build && node scripts/package-game-helper.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -36,6 +36,9 @@
     ],
     "macOS": {
       "minimumSystemVersion": "12.0",
+      "files": {
+        "Helpers/Auram.app": "../.build/mac-game-helper/Auram.app"
+      },
       "signingIdentity": "-"
     },
     "windows": {

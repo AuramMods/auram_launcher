@@ -89,6 +89,9 @@ impl ServerConfig {
                 Some(regex::Regex::new(&inclusion.exclusion_filter)?)
             };
             for (path, file) in &full.files {
+                if path.starts_with("minecraft/branding/") {
+                    continue;
+                }
                 let Some(relative) = path.strip_prefix(&format!("{source}/")) else {
                     continue;
                 };
@@ -729,6 +732,35 @@ mod tests {
         assert!(!config.include_mod("client-1.jar"));
         assert!(config.include_mod("appleskin-1.jar"));
         assert!(config.include_mod("server-1.jar"));
+    }
+    #[test]
+    fn server_inclusions_cannot_copy_client_branding() {
+        let config = ServerConfig {
+            inclusions: vec![Inclusion {
+                source: "branding".into(),
+                destination: "config".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let full = Manifest {
+            schema: 1,
+            policy: 1,
+            tag: crate::pack::PackTag {
+                name: "1".into(),
+                sha: "a".repeat(40),
+            },
+            files: BTreeMap::from([(
+                "minecraft/branding/auram-bootstrap.jar".into(),
+                PackFile {
+                    sha: "b".repeat(40),
+                    size: 1,
+                    mode: "100644".into(),
+                    source: None,
+                },
+            )]),
+        };
+        assert!(config.manifest(&full).unwrap().files.is_empty());
     }
     #[test]
     fn remaps_author_paths_and_rejects_escape() {
