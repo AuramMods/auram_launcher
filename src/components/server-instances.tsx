@@ -117,7 +117,7 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
   const recover=!!inspection?.recoveryRequired;
   const canSave=!!draft.name.trim()&&(draft.target.kind==='local'?!!draft.target.directory:!!draft.target.connection.host&&!!draft.target.connection.username);
   return <>
-    <div className="page-heading server-heading"><div><span className="eyebrow">BETTER TOGETHER</span><h1>Your servers<span>.</span></h1><p>Deploy Auram {targetVersion?.name??'from your installed pack'} to a local folder or an SFTP server.</p></div><Button onClick={add} disabled={disabled} aria-label="Add server"><Plus/>Add server</Button></div>
+    <div className="page-heading server-heading"><div><h1>Servers</h1><p>Deploy Auram {targetVersion?.name??'from your installed pack'} to a local folder or an SFTP server.</p></div><Button onClick={add} disabled={disabled} aria-label="Add server"><Plus/>Add server</Button></div>
     {servers.length===0?<div className="servers-empty"><Server/><h2>No servers yet</h2><p>Add a local directory or connect your hosted server over SFTP.</p><Button variant="outline" onClick={add} disabled={disabled}><Plus/>Add your first server</Button></div>:<ul className="server-list" aria-label="Saved servers">{servers.map(server=>{
       const primary=deploymentAction(server.knownVersion,targetVersion);
       const Icon=server.target.kind==='local'?HardDrive:Wifi;

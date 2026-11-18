@@ -85,7 +85,7 @@ export function PackAtmosphere({ paused }: { paused: boolean }) {
 
 export function PackHeadline({ paused }: { paused: boolean }) {
   const reduceMotion = useSyncExternalStore(subscribeToMotion, reducedMotion);
-  return <h2 id="pack-title">
+  return <h1 id="pack-title">
     {reduceMotion || paused ? <>Make something<br/>extraordinary.</> : <>
       <span className="sr-only">Make something extraordinary.</span>
       <span aria-hidden="true">
@@ -102,5 +102,5 @@ export function PackHeadline({ paused }: { paused: boolean }) {
         />
       </span>
     </>}
-  </h2>;
+  </h1>;
 }

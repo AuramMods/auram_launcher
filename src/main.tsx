@@ -162,7 +162,6 @@ function App() {
   return <div className="shell dark">
     <aside className="sidebar">
       <div className="brand"><img src={emblem} alt=""/><span>AURAM<span className="brand-label">LAUNCHER</span></span></div>
-      <div className="nav-label">YOUR WORKSPACE</div>
       <nav className="sidebar-nav" aria-label="Main navigation">{([{id:'play',label:'Play',icon:Gamepad2},{id:'server',label:'Server',icon:Server},{id:'settings',label:'Settings',icon:Settings2}] as const).map(item=><button key={item.id} className={`nav-item ${tab===item.id?'selected':''}`} onClick={()=>setTab(item.id)}><item.icon size={17}/>{item.label}{tab===item.id&&<ChevronRight size={14} className="nav-chevron"/>}</button>)}
         {consoles.map(server=><div key={server.id} className={`nav-console ${consoleId===server.id?'selected':''}`}>
           <button className="nav-console-open" aria-current={consoleId===server.id?'page':undefined} onClick={()=>setTab({serverId:server.id})} title={server.name}>
@@ -172,12 +171,11 @@ function App() {
             disabled={!!serverActions[server.id]} onClick={()=>void controlServer(server.id,'close')}><X size={13}/></button>
         </div>)}
       </nav>
-      <div className="sidebar-bottom"><div className="sidebar-meta"><div className="local-label"><span className={`status-dot ${running?'on':''}`}/>{running?'MINECRAFT RUNNING':'DESKTOP EDITION'}</div><span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div><SidebarAccount account={status?.account??null} disabled={busy||!status} onSignIn={()=>void run('signIn')} onSignOut={()=>void run('signOut')}/></div>
+      <div className="sidebar-bottom"><div className="sidebar-meta">{running&&<div className="local-label"><span className="status-dot on"/>MINECRAFT RUNNING</div>}<span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div><SidebarAccount account={status?.account??null} disabled={busy||!status} onSignIn={()=>void run('signIn')} onSignOut={()=>void run('signOut')}/></div>
     </aside>
     <div className={`workspace ${busy?'is-working':''}`}>
       <main>
         {tab==='play'&&<>
-          <div className="page-heading"><div><span className="eyebrow">THE WORLD IS YOURS</span><h1>Welcome to Auram<span>.</span></h1><p>A world of magic, machines, and everything in between.</p></div></div>
           <section className="pack-panel" aria-labelledby="pack-title">
             <PackAtmosphere paused={running}/>
             <div className="pack-top"><div className="pack-symbol"><img src={emblem} alt="Auram emblem"/></div><Badge variant="outline" className="text-zinc-400 border-zinc-800"><span className="status-dot on"/> {installed?'INSTALLED':'READY TO INSTALL'}</Badge></div>
@@ -214,7 +212,7 @@ function App() {
           onControl={command=>void controlServer(consoleServer.id,command)}
           onOpenFolder={()=>void action('open_server_instance',{id:consoleServer.id})}/>}
         {tab==='settings'&&<>
-          <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
+          <div className="page-heading"><h1>Settings</h1></div>
           <GameMemoryCard automaticMemory={memory??null} preferences={status?.settings.memory??null} disabled={busy}
             onSave={preferences=>action('save_memory_preferences',{preferences})}/>
           <div className="detail-grid mt-5"><Card><CardHeader><CardTitle>Files & diagnostics</CardTitle><CardDescription>Repair checks your managed files and downloads only what is missing or damaged.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>void action('open_folder',{folder:'data'})}><FolderOpen/>Data folder</Button><Button variant="outline" onClick={()=>void action('open_folder',{folder:'logs'})}>Logs</Button><Button variant="secondary" disabled={busy||running||!installed} onClick={()=>void run('repair')}><RefreshCw/>Repair installation</Button></CardContent></Card><Card><CardHeader><CardTitle>Launcher updates</CardTitle><CardDescription>New launcher builds install automatically on startup.</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={busy} onClick={()=>void updateLauncher()}><RefreshCw/>Check for updates</Button><p className="mt-3 text-xs text-muted-foreground" role="status">{updateStatus||`Installed: Build ${status?.build??'…'}`}</p></CardContent></Card></div>
