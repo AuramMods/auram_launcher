@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "version": 1,
+  "roots": ["mmc-pack.json", "instance.cfg", "icon-256.png", "server_config.conf"],
+  "directories": ["minecraft", "server_files"],
+  "excludedMinecraftPrefixes": ["assets/", "libraries/", "versions/", "natives/", "saves/", "screenshots/", "backups/", "logs/", "crash-reports/", "cache/", "lib/", "data/", "mod_data/", ".mixin.out/", "usercache.json", "usernamecache.json", "journeymap/data/", "Distant_Horizons_server_data/"],
+  "excludedServerNames": ["ops.json", "whitelist.json", "banned-ips.json", "banned-players.json", "usercache.json", "usernamecache.json", "eula.txt"],
+  "excludedServerPrefixes": ["world/", "world_nether/", "world_the_end/", "logs/", "backups/"],
+  "replacementDirectories": ["mods", "config", "scripts", "kubejs"],
+  "maximumUpdateBundles": 8,
+  "smallObjectBytes": 1048576,
+  "smallBundleBytes": 1048576,
+  "maximumBundleBytes": 2000000000
+}

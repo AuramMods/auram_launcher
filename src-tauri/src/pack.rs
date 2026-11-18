@@ -11,6 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+pub mod distribution;
 mod source;
 pub use source::Repository;
 use source::{Selection, Source, CLIENT_POLICY};

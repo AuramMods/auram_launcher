@@ -49,6 +49,7 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 ignore = "0.4"
 unicode-normalization = "0.1"
 same-file = "1"
+minisign-verify = "=0.3.0"
 regex = "1"
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
