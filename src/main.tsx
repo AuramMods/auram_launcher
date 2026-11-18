@@ -132,6 +132,12 @@ function App() {
   }
   const installed=!!status?.pack;
   const running=!!status?.game.running;
+  const beforeInstall=status!==null&&!installed;
+  const browseDuringStartup=beforeInstall&&preparingPack&&!active&&!running;
+  function onLocationBusyChange(inProgress:boolean) {
+    if(inProgress)setProgress(null);
+    setActive(inProgress);
+  }
   const memory=status?.memory;
   return <div className="shell dark">
     <aside className="sidebar">
@@ -155,6 +161,9 @@ function App() {
           <section className="pack-panel" aria-labelledby="pack-title">
             <div className="pack-top"><div className="pack-symbol"><img src={emblem} alt="Auram emblem"/></div><Badge variant="outline" className="text-zinc-400 border-zinc-800"><span className="status-dot on"/> {installed?'INSTALLED':'READY TO INSTALL'}</Badge></div>
             <div className="pack-heading"><span className="eyebrow">THE AURAM MODPACK</span><h2 id="pack-title">Make something<br/>extraordinary.</h2><p>Your world. Your way. Everything you need, kept up to date.</p></div>
+            {beforeInstall&&<DataLocationSettings beforeInstall disabled={busy||running}
+              allowPickerWhileBusy={browseDuringStartup} onBusyChange={onLocationBusyChange}
+              onError={showError} onNotice={showNotice}/>}
             <div className="pack-footer"><div className="pack-facts"><div><span>MINECRAFT</span><strong>1.20.1</strong></div><div><span>MOD LOADER</span><strong>Forge</strong></div><div><span>PACK VERSION</span><strong>{status?.pack?.name??'—'}</strong></div></div><Button size="lg" className="play-button" disabled={busy||running||(!status&&!packUpdateFailed)} onClick={()=>{if(packUpdateFailed)void retryPackUpdate();else void run(!installed?'install':!status?.account?'signIn':'launch');}}>{busy?<LoaderCircle className="animate-spin"/>:running?<Check/>:!installed?<ArrowDownToLine/>:<Play fill="currentColor"/>}{running?'Game running':preparingPack?'Updating Auram…':packUpdateFailed?(status?.pack?'Retry pack update':'Retry startup'):!installed?'Install Auram':!status?.account?'Sign in to play':'Launch Auram'}{!busy&&!running&&<ArrowRight/>}</Button></div>
           </section>
           <div className="installation-card">
@@ -188,7 +197,8 @@ function App() {
           <GameMemoryCard automaticMemory={memory??null} preferences={status?.settings.memory??null} disabled={busy}
             onSave={preferences=>action('save_memory_preferences',{preferences})}/>
           <div className="detail-grid mt-5"><Card><CardHeader><CardTitle>Files & diagnostics</CardTitle><CardDescription>Repair checks your managed files and downloads only what is missing or damaged.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>void action('open_folder',{folder:'data'})}><FolderOpen/>Data folder</Button><Button variant="outline" onClick={()=>void action('open_folder',{folder:'logs'})}>Logs</Button><Button variant="secondary" disabled={busy||running||!installed} onClick={()=>void run('repair')}><RefreshCw/>Repair installation</Button></CardContent></Card><Card><CardHeader><CardTitle>Launcher updates</CardTitle><CardDescription>New launcher builds install automatically on startup.</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={busy} onClick={()=>void updateLauncher()}><RefreshCw/>Check for updates</Button><p className="mt-3 text-xs text-muted-foreground" role="status">{updateStatus||`Installed: Build ${status?.build??'…'}`}</p></CardContent></Card></div>
-          <DataLocationSettings disabled={busy||running} onBusyChange={value=>{if(value)setProgress(null);setActive(value);}} onError={showError} onNotice={showNotice}/>
+          <DataLocationSettings disabled={busy||running} allowPickerWhileBusy={browseDuringStartup}
+            onBusyChange={onLocationBusyChange} onError={showError} onNotice={showNotice}/>
           <button className="text-action mt-6" onClick={()=>setAdvanced(!advanced)}>{advanced?'Hide':'Show'} advanced authentication settings</button>{advanced&&<Card className="mt-3"><CardContent className="pt-5"><Label htmlFor="client-id">Microsoft application ID</Label><Input id="client-id" value={settings?.microsoftClientId??''} onChange={event=>setSettings(current=>current?{...current,microsoftClientId:event.target.value}:current)} className="mt-2"/><p className="text-xs text-muted-foreground mt-2">Changing the application ID requires signing in again.</p><div className="mt-4 flex items-center justify-between gap-4"><Label htmlFor="browser-login">Use a configured browser callback</Label><Switch id="browser-login" checked={settings?.browserLogin??false} onCheckedChange={browserLogin=>setSettings(current=>current?{...current,browserLogin}:current)}/></div><p className="text-xs text-muted-foreground mt-2">Enable only for an application registration with the desktop callback configured. The existing Auram registration uses the code flow with automatic session renewal.</p><Button className="mt-3" disabled={busy} onClick={()=>void save()}>Save</Button></CardContent></Card>}
         </>}
       </main>

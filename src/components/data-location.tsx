@@ -8,8 +8,8 @@ import {Dialog,DialogContent,DialogDescription,DialogFooter,DialogHeader,DialogT
 type Location={currentPath:string;defaultPath:string;folderName:string;isDefault:boolean;pendingPath:string|null;cleanupPending:boolean;unavailable:string|null;notice:string|null;applicationPath:string;platform:'windows'|'macos'};
 type Change={kind:'move';parentDirectory:string}|{kind:'reset'|'retry'|'cancel'|'resetUnavailable'};
 type Choice={parentDirectory:string;dataDirectory:string};
-type Props={disabled:boolean;onBusyChange:(busy:boolean)=>void;onError:(message:string)=>void;onNotice:(message:string)=>void};
-export function DataLocationSettings({disabled,onBusyChange,onError,onNotice}:Props) {
+type Props={disabled:boolean;beforeInstall?:boolean;allowPickerWhileBusy?:boolean;onBusyChange:(busy:boolean)=>void;onError:(message:string)=>void;onNotice:(message:string)=>void};
+export function DataLocationSettings({disabled,beforeInstall=false,allowPickerWhileBusy=false,onBusyChange,onError,onNotice}:Props) {
   const [location,setLocation]=React.useState<Location|null>(null);
   const [failure,setFailure]=React.useState<string|null>(null);
   const [choosing,setChoosing]=React.useState(false);
@@ -27,17 +27,120 @@ export function DataLocationSettings({disabled,onBusyChange,onError,onNotice}:Pr
     catch(error){onError(String(error));await refresh();}finally{onBusyChange(false);}
   }
   const locked=disabled||choosing||!location;
+  const pickerLocked=choosing||!location||(disabled&&!allowPickerWhileBusy);
+  let title = 'Move launcher data?';
+  let description = 'Close any Minecraft servers or other programs using these files. Auram will copy and verify your data, remove unchanged originals, and restart.';
+  let confirmLabel = 'Move & restart';
+  if (confirmation?.change.kind === 'resetUnavailable') {
+    title = 'Use the default data folder?';
+    description = 'The unavailable drive’s files will be left in place. Auram will restart using the default folder.';
+    confirmLabel = 'Reset & restart';
+  } else if (location?.cleanupPending) {
+    title = 'Finish moving data?';
+    description = 'Finish removing unchanged original copies. Changed files stay in their old location.';
+    confirmLabel = 'Finish move';
+  } else if (beforeInstall && confirmation?.change.kind === 'move') {
+    title = 'Use this installation location?';
+    description = 'Auram will move any existing launcher files and restart. The pack will install here when you click Install Auram.';
+    confirmLabel = 'Use folder & restart';
+  }
+  const folder = <div className="min-w-0">
+    <p className="text-xs text-muted-foreground">
+      {beforeInstall ? 'Installation location' : `Data folder${location?.isDefault ? ' · Default' : ''}`}
+    </p>
+    <code className="mt-1 block break-all text-xs text-zinc-300">{location?.currentPath ?? 'Loading location…'}</code>
+  </div>;
+  const actions = <div className="flex flex-wrap gap-2">
+    <Button
+      variant="outline"
+      size={beforeInstall ? 'sm' : 'default'}
+      disabled={pickerLocked || !!location?.unavailable || !!location?.pendingPath}
+      onClick={() => void choose()}
+    ><FolderOpen/>{choosing ? 'Choosing…' : 'Choose directory'}</Button>
+    {(!beforeInstall || (location && !location.isDefault)) &&
+      <Button
+        variant="ghost"
+        size={beforeInstall ? 'sm' : 'default'}
+        disabled={locked || !!location?.isDefault || !!location?.pendingPath}
+        onClick={() => location && setConfirmation({ change: { kind: location.unavailable ? 'resetUnavailable' : 'reset' }, destination: location.defaultPath })}
+      ><Undo2/>Reset to default</Button>}
+  </div>;
+  const feedback = <>
+    {failure && <p className="text-xs text-destructive" role="alert">
+      {failure} <button className="underline" onClick={() => void refresh()}>Retry</button>
+    </p>}
+    {location?.unavailable && <p className="text-xs text-muted-foreground" role="alert">{location.unavailable}</p>}
+    {location?.notice && <p className="text-xs text-muted-foreground" role="status">{location.notice}</p>}
+    {location?.pendingPath && <div className="space-y-2 border-t border-zinc-800 pt-3">
+      <p className="text-xs text-muted-foreground">
+        {location.cleanupPending ? 'The new location is active. Finish removing the verified original copies.' : 'An interrupted data move is ready to retry.'}
+      </p>
+      <code className="block break-all text-xs">{location.pendingPath}</code>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" disabled={locked} onClick={() => setConfirmation({change:{kind:'retry'},destination:location.pendingPath!})}>
+          <RefreshCw/>{location.cleanupPending ? 'Finish move' : 'Retry move'}
+        </Button>
+        {!location.cleanupPending && <Button variant="ghost" disabled={locked} onClick={() => void apply({kind:'cancel'})}>
+          Cancel unfinished move
+        </Button>}
+      </div>
+    </div>}
+  </>;
   return <>
-    <Card className="mt-5"><CardHeader><CardTitle>Installation & data location</CardTitle><CardDescription>Client files, worlds, shared downloads, server workspace, settings, and logs live here.</CardDescription></CardHeader><CardContent className="space-y-4">
-      {failure&&<p className="text-xs text-destructive" role="alert">{failure} <button className="underline" onClick={()=>void refresh()}>Retry</button></p>}
-      <div><p className="text-xs text-muted-foreground">Data folder{location?.isDefault?' · Default':''}</p><code className="mt-1 block break-all text-xs text-zinc-300">{location?.currentPath??'Loading location…'}</code></div>
-      <p className="text-xs text-muted-foreground">Choose a parent directory. Auram creates <span className="text-zinc-300">{location?.folderName??'AuramLauncher'}</span> inside it. The app and its data can be on different drives.</p>
-      <div className="flex flex-wrap gap-2"><Button variant="outline" disabled={locked||!!location?.unavailable||!!location?.pendingPath} onClick={()=>void choose()}><FolderOpen/>{choosing?'Choosing…':'Choose directory'}</Button><Button variant="ghost" disabled={locked||!!location?.isDefault||!!location?.pendingPath} onClick={()=>location&&setConfirmation({change:{kind:location.unavailable?'resetUnavailable':'reset'},destination:location.defaultPath})}><Undo2/>Reset to default</Button></div>
-      {location?.unavailable&&<p className="text-xs text-muted-foreground" role="alert">{location.unavailable}</p>}
-      {location?.notice&&<p className="text-xs text-muted-foreground" role="status">{location.notice}</p>}
-      {location?.pendingPath&&<div className="space-y-2 border-t border-zinc-800 pt-3"><p className="text-xs text-muted-foreground">{location.cleanupPending?'The new location is active. Finish removing the verified original copies.':'An interrupted data move is ready to retry.'}</p><code className="block break-all text-xs">{location.pendingPath}</code><div className="flex flex-wrap gap-2"><Button variant="outline" disabled={locked} onClick={()=>setConfirmation({change:{kind:'retry'},destination:location.pendingPath!})}><RefreshCw/>{location.cleanupPending?'Finish move':'Retry move'}</Button>{!location.cleanupPending&&<Button variant="ghost" disabled={locked} onClick={()=>void apply({kind:'cancel'})}>Cancel unfinished move</Button>}</div></div>}
-      <div className="border-t border-zinc-800 pt-3"><p className="text-xs text-muted-foreground">Application folder</p><code className="mt-1 block break-all text-xs text-zinc-400">{location?.applicationPath??'…'}</code><p className="mt-2 text-xs text-muted-foreground">{location?.platform==='windows'?'Choose the application’s installation folder in the Windows installer.':'Move Auram.app to your preferred folder in Finder.'}</p></div>
-    </CardContent></Card>
-    <Dialog open={confirmation!==null} onOpenChange={open=>{if(!open)setConfirmation(null);}}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{confirmation?.change.kind==='resetUnavailable'?'Use the default data folder?':location?.cleanupPending?'Finish moving data?':'Move launcher data?'}</DialogTitle><DialogDescription>{confirmation?.change.kind==='resetUnavailable'?'The unavailable drive’s files will be left in place. Auram will restart using the default folder.':location?.cleanupPending?'Finish removing unchanged original copies. Changed files stay in their old location.':'Close any Minecraft servers or other programs using these files. Auram will copy and verify your data, remove unchanged originals, and restart.'}</DialogDescription></DialogHeader><div className="space-y-3 text-xs"><div><p className="text-muted-foreground">From</p><code className="block break-all mt-1">{location?.currentPath}</code></div><div><p className="text-muted-foreground">To</p><code className="block break-all mt-1 text-violet-200">{confirmation?.destination}</code></div></div><DialogFooter><Button variant="ghost" onClick={()=>setConfirmation(null)}>Cancel</Button><Button disabled={disabled} onClick={()=>{if(confirmation)void apply(confirmation.change);}}>{location?.cleanupPending?'Finish move':confirmation?.change.kind==='resetUnavailable'?'Reset & restart':'Move & restart'}</Button></DialogFooter></DialogContent></Dialog>
+    {beforeInstall ? <div className="space-y-3 border-t border-[#241e2b] py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        {folder}
+        {actions}
+      </div>
+      {feedback}
+    </div> : <Card className="mt-5">
+      <CardHeader>
+        <CardTitle>Installation & data location</CardTitle>
+        <CardDescription>Client files, worlds, shared downloads, server workspace, settings, and logs live here.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {folder}
+        <p className="text-xs text-muted-foreground">
+          Choose a parent directory. Auram creates <span className="text-zinc-300">{location?.folderName ?? 'AuramLauncher'}</span> inside it.
+          The app and its data can be on different drives.
+        </p>
+        {actions}
+        {feedback}
+        <div className="border-t border-zinc-800 pt-3">
+          <p className="text-xs text-muted-foreground">Application folder</p>
+          <code className="mt-1 block break-all text-xs text-zinc-400">{location?.applicationPath ?? '…'}</code>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {location?.platform === 'windows' ? 'Choose the application’s installation folder in the Windows installer.' : 'Move Auram.app to your preferred folder in Finder.'}
+          </p>
+        </div>
+      </CardContent>
+    </Card>}
+    <Dialog open={confirmation !== null} onOpenChange={open => { if (!open) setConfirmation(null); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3 text-xs">
+          <div>
+            <p className="text-muted-foreground">From</p>
+            <code className="block break-all mt-1">{location?.currentPath}</code>
+          </div>
+          <div>
+            <p className="text-muted-foreground">To</p>
+            <code className="block break-all mt-1 text-violet-200">{confirmation?.destination}</code>
+          </div>
+        </div>
+        {disabled && allowPickerWhileBusy && <p className="text-xs text-muted-foreground" role="status">
+          Wait for startup checks to finish before applying the change.
+        </p>}
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => setConfirmation(null)}>Cancel</Button>
+          <Button disabled={disabled} onClick={() => { if (confirmation) void apply(confirmation.change); }}>
+            {confirmLabel}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </>;
 }

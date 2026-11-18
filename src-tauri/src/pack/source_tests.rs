@@ -1618,3 +1618,48 @@ async fn startup_with_no_installation_leaves_initial_install_explicit() {
     assert!(!result.allows_launch());
     assert!(f.requests().is_empty());
 }
+
+#[tokio::test]
+async fn first_pack_install_uses_the_location_selected_before_installing() {
+    let f = Fixture::new().await;
+    let source = f.packs.layout.clone();
+    let destination = tempfile::tempdir().unwrap();
+    let locations = crate::data_location::Locations {
+        default_root: source.root.clone(),
+        control: destination.path().join("location-control"),
+        folder_name: "AuramLauncher".into(),
+    };
+
+    assert!(f.packs.installed().unwrap().is_none());
+    let target = locations.destination(Some(destination.path())).unwrap();
+    let outcome = locations
+        .relocate(&source, target.clone(), &Job::default())
+        .unwrap();
+    assert!(outcome.restart);
+    assert_eq!(locations.resolve().unwrap(), target);
+    assert!(f.requests().is_empty());
+
+    let reopened_layout = Layout::new(locations.resolve().unwrap()).unwrap();
+    let mut reopened = Packs::new(
+        reopened_layout.clone(),
+        Downloader::new(&reopened_layout).unwrap(),
+    );
+    reopened.repository = f.packs.repository.clone();
+    assert!(reopened.installed().unwrap().is_none());
+
+    let latest = f.snapshot(
+        "161",
+        files(&[("minecraft/config/first.cfg", "first installation")]),
+        None,
+        Some(vec![]),
+    );
+    f.latest(&latest);
+    let installed = reopened.update(false, &Job::default()).await.unwrap();
+    assert_eq!(installed.tag.sha, latest.sha);
+    assert_eq!(installed.tag.name, latest.name);
+    assert_eq!(
+        fs::read(target.join("client/minecraft/config/first.cfg")).unwrap(),
+        b"first installation"
+    );
+    assert!(!source.root.exists());
+}
