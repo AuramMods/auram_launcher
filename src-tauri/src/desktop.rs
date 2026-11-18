@@ -6,6 +6,7 @@ use crate::{
     pack::{PackTag, Packs},
     runtime::{Platform, Runtime, Versions},
     server,
+    server_process::{ServerProcesses, ServerStatus},
     storage::{self, Layout, Settings},
 };
 use anyhow::{bail, Context, Result};
@@ -24,6 +25,7 @@ pub struct Core {
     pub game: Game,
     pub settings: Mutex<Settings>,
     pub pack_startup: crate::startup::PackStartup,
+    pub local_servers: ServerProcesses,
     pub server_inspections: crate::inspection::Inspections,
 }
 impl Core {
@@ -55,6 +57,7 @@ impl Core {
             game: Game::default(),
             settings: Mutex::new(settings),
             pack_startup: crate::startup::PackStartup::default(),
+            local_servers: ServerProcesses::default(),
             server_inspections: crate::inspection::Inspections::default(),
         })
     }
@@ -95,6 +98,7 @@ pub struct Status {
     game: GameStatus,
     legacy_available: bool,
     servers: Vec<crate::server_instances::ServerInstance>,
+    local_servers: Vec<ServerStatus>,
     data_path: String,
     client_path: String,
 }
@@ -120,6 +124,7 @@ fn status(core: &Core) -> Result<Status> {
             .any(|p| p.join("minecraft/minecraft").is_dir())
             && !core.layout.state("migration.json").exists(),
         servers: crate::server_instances::Registry::load(&core.layout)?.servers,
+        local_servers: core.local_servers.status(),
         data_path: core.layout.root.display().to_string(),
         client_path: core.layout.client().display().to_string(),
     })
@@ -475,7 +480,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if let Ok(core) = window.state::<Backend>().core() {
-                    if core.game.status().running {
+                    if core.game.status().running || core.local_servers.active() {
                         api.prevent_close();
                         let _ = window.hide();
                     }
@@ -501,17 +506,30 @@ pub fn run() {
             crate::desktop_servers::inspect_server_instance,
             crate::desktop_servers::cancel_server_inspection,
             crate::desktop_servers::deploy_server_instance,
-            crate::desktop_servers::open_server_instance
+            crate::desktop_servers::open_server_instance,
+            crate::desktop_servers::manage_local_server,
+            crate::desktop_servers::local_server_console,
+            crate::desktop_servers::send_server_command
         ])
         .build(tauri::generate_context!())
         .expect("Unable to create the native launcher window");
-    app.run(|handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
             if let Ok(core) = handle.state::<Backend>().core() {
-                if core.game.status().running {
+                if core.game.status().running || core.local_servers.active() {
                     api.prevent_exit();
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.show();
+            }
+        }
+        _ => {}
     });
 }

@@ -26,6 +26,20 @@ pub fn command(java: &Path, arguments: &[String]) -> Result<(Command, Option<Vec
     }
 }
 
+/// Launch Java while leaving stdin available for dedicated server commands.
+pub fn interactive_command(java: &Path, arguments: &[String]) -> Result<Command> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new(helper(java)?);
+        command.arg("--auram-java-cli");
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new(java);
+    command.args(arguments);
+    Ok(command)
+}
+
 pub fn game_command(
     java: &Path,
     arguments: &[String],

@@ -20,6 +20,7 @@ pub mod pack;
 pub mod runtime;
 pub mod server;
 pub mod server_instances;
+pub mod server_process;
 pub mod startup;
 pub mod storage;
 #[cfg(feature = "desktop")]

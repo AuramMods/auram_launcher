@@ -113,6 +113,9 @@ pub async fn change_data_location(
     if core.as_ref().is_ok_and(|core| core.game.status().running) {
         return Err("Close Minecraft before changing the data location".into());
     }
+    if core.as_ref().is_ok_and(|core| core.local_servers.active()) {
+        return Err("Stop local servers before changing the data location".into());
+    }
     let store = Locations::discover().map_err(|e| format!("{e:#}"))?;
     let job = lease.job.clone();
     let result=match change {

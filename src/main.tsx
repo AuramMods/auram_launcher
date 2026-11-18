@@ -2,7 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, ArrowRight, Check, ChevronRight, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, Server, Settings2, Trash2 } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, Check, ChevronRight, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, Server, Settings2, Terminal, Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -10,8 +10,9 @@ import { JobProgressPanel } from '@/components/job-progress';
 import { ForceReinstallDialog } from '@/components/force-reinstall-dialog';
 import { SidebarAccount } from '@/components/sidebar-account';
 import { ServerInstances } from '@/components/server-instances';
+import { ServerConsole } from '@/components/server-console';
 import { DataLocationSettings } from '@/components/data-location';
-import type { ServerInstance } from '@/lib/server-instances';
+import type { LocalServerAction, LocalServerStatus, ServerInstance } from '@/lib/server-instances';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { createStartupTask, type PackPreparation } from '@/lib/startup';
 import { Switch } from '@/components/ui/switch';
@@ -25,15 +26,17 @@ import './style.css';
 type Profile = {name:string;uuid:string;xuid:string};
 type Settings = {schema:number;microsoftClientId:string;browserLogin:boolean};
 type AutomaticMemory = {systemMemoryMib:number|null;maximumMib:number;initialMib:number;profile:string;highSystemMemoryAboveMib:number};
-type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];dataPath:string;clientPath:string};
+type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];localServers:LocalServerStatus[];dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer';
 function App() {
-  const [tab,setTab]=React.useState<'play'|'server'|'settings'>('play');
+  const [tab,setTab]=React.useState<'play'|'server'|'settings'|{serverId:string}>('play');
   const [status,setStatus]=React.useState<Status|null>(null);
   const {notifications,notify,remove}=useNotifications();
   const showError=React.useCallback((message:string)=>notify(message,'error'),[notify]);
   const showNotice=React.useCallback((message:string)=>notify(message,'success'),[notify]);
   const [active,setActive]=React.useState(false);
+  const [serverActions,setServerActions]=React.useState<Partial<Record<string,LocalServerAction>>>({});
+  const [serverErrors,setServerErrors]=React.useState<Partial<Record<string,string>>>({});
   const [confirmReinstall,setConfirmReinstall]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
   const [settings,setSettings]=React.useState<Settings|null>(null);
@@ -94,6 +97,28 @@ function App() {
   async function action(name:string,args?:Record<string,unknown>) {try {await invoke(name,args);await refresh();return true;}catch(e){showError(String(e));return false;}}
   async function save() {if(settings&&await action('save_settings',{settings}))showNotice('Settings saved.');}
   async function updateLauncher() {setUpdateStatus('Checking for launcher updates…');try {const message=await invoke<string>('update_launcher',{manual:true});setUpdateStatus(message);notify(message);}catch(e){setUpdateStatus(String(e));showError(String(e));}}
+  const localServers=new Map(status?.localServers.map(server=>[server.id,server])??[]);
+  const servers=status?.servers??[];
+  const consoles=servers.filter(server=>server.target.kind==='local'&&(localServers.has(server.id)||serverActions[server.id]||serverErrors[server.id]));
+  const consoleId=typeof tab==='object'?tab.serverId:null;
+  const consoleServer=consoles.find(server=>server.id===consoleId);
+  async function controlServer(id:string,command:LocalServerAction) {
+    if(serverActions[id])return;
+    if(command==='start'||command==='restart')setTab({serverId:id});
+    setServerActions(previous=>({...previous,[id]:command}));
+    setServerErrors(previous=>({...previous,[id]:undefined}));
+    try {
+      await invoke('manage_local_server',{id,action:command});
+      if(command==='close')setTab(previous=>typeof previous==='object'&&previous.serverId===id?'server':previous);
+    } catch(error) {
+      const message=String(error);
+      setServerErrors(previous=>({...previous,[id]:message}));
+      if(command==='close'||command==='stop')showError(message);
+    } finally {
+      await refresh().catch(()=>{});
+      setServerActions(previous=>({...previous,[id]:undefined}));
+    }
+  }
   const installed=!!status?.pack;
   const running=!!status?.game.running;
   const memory=status?.memory;
@@ -101,7 +126,15 @@ function App() {
     <aside className="sidebar">
       <div className="brand"><img src={emblem} alt=""/><span>AURAM<span className="brand-label">LAUNCHER</span></span></div>
       <div className="nav-label">YOUR WORKSPACE</div>
-      <nav aria-label="Main navigation">{([{id:'play',label:'Play',icon:Gamepad2},{id:'server',label:'Server',icon:Server},{id:'settings',label:'Settings',icon:Settings2}] as const).map(item=><button key={item.id} className={`nav-item ${tab===item.id?'selected':''}`} onClick={()=>setTab(item.id)}><item.icon size={17}/>{item.label}{tab===item.id&&<ChevronRight size={14} className="nav-chevron"/>}</button>)}</nav>
+      <nav className="sidebar-nav" aria-label="Main navigation">{([{id:'play',label:'Play',icon:Gamepad2},{id:'server',label:'Server',icon:Server},{id:'settings',label:'Settings',icon:Settings2}] as const).map(item=><button key={item.id} className={`nav-item ${tab===item.id?'selected':''}`} onClick={()=>setTab(item.id)}><item.icon size={17}/>{item.label}{tab===item.id&&<ChevronRight size={14} className="nav-chevron"/>}</button>)}
+        {consoles.map(server=><div key={server.id} className={`nav-console ${consoleId===server.id?'selected':''}`}>
+          <button className="nav-console-open" aria-current={consoleId===server.id?'page':undefined} onClick={()=>setTab({serverId:server.id})} title={server.name}>
+            <Terminal size={15}/><span>{server.name}</span>
+          </button>
+          <button className="nav-console-close" aria-label={`Stop and close ${server.name}`} title="Stop and close"
+            disabled={!!serverActions[server.id]} onClick={()=>void controlServer(server.id,'close')}><X size={13}/></button>
+        </div>)}
+      </nav>
       <div className="sidebar-bottom"><div className="sidebar-meta"><div className="local-label"><span className={`status-dot ${running?'on':''}`}/>{running?'MINECRAFT RUNNING':'DESKTOP EDITION'}</div><span className="build-number">Build {status?.build??'…'}</span><button className="text-action" onClick={()=>void updateLauncher()} disabled={busy}><RefreshCw size={12}/>Check launcher updates</button></div><SidebarAccount account={status?.account??null} disabled={busy||!status} onSignIn={()=>void run('signIn')} onSignOut={()=>void run('signOut')}/></div>
     </aside>
     <div className={`workspace ${busy?'is-working':''}`}>
@@ -131,7 +164,14 @@ function App() {
           </div>
           {status?.game.lastExit&&!running&&<p className="last-exit">{status.game.lastExit}</p>}
         </>}
-        {tab==='server'&&<ServerInstances servers={status?.servers??[]} targetVersion={status?.pack??null} busy={busy||running} refresh={refresh} onBusyChange={setActive} onError={showError} onNotice={showNotice}/>}
+        {tab==='server'&&<ServerInstances servers={servers} targetVersion={status?.pack??null} busy={busy} clientRunning={running}
+          localServers={localServers} serverActions={serverActions}
+          onStart={id=>void controlServer(id,'start')} onConsole={id=>setTab({serverId:id})}
+          refresh={refresh} onBusyChange={setActive} onError={showError} onNotice={showNotice}/>}
+        {consoleServer&&<ServerConsole key={consoleServer.id} server={consoleServer} status={localServers.get(consoleServer.id)}
+          pending={serverActions[consoleServer.id]} busy={busy} error={serverErrors[consoleServer.id]}
+          onControl={command=>void controlServer(consoleServer.id,command)}
+          onOpenFolder={()=>void action('open_server_instance',{id:consoleServer.id})}/>}
         {tab==='settings'&&<>
           <div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>A little fine tuning<span>.</span></h1><p>Simple controls for the way you play.</p></div>
           <Card><CardHeader><div className="flex items-center justify-between"><CardTitle>Game memory</CardTitle><Badge variant="outline">Automatic</Badge></div><CardDescription>Auram selects its original memory preset for your computer.</CardDescription></CardHeader><CardContent><div className="memory-value">{memory?(memory.maximumMib/1024).toFixed(1):'…'} <span>GiB</span></div>{memory?<><p className="text-xs text-muted-foreground"><span className="text-violet-200">{memory.profile} tuning</span> · {(memory.initialMib/1024).toFixed(1)} GiB initial allocation. {memory.systemMemoryMib!==null?`${(memory.systemMemoryMib/1024).toFixed(1)} GiB system memory detected.`:'System memory detection unavailable; using the low-memory preset.'}</p><p className="mt-2 text-xs text-muted-foreground">9 GiB maximum on systems with up to {memory.highSystemMemoryAboveMib/1024} GiB of RAM; 20 GiB maximum above that.</p></>:<p className="text-xs text-muted-foreground">Detecting system memory…</p>}</CardContent></Card>

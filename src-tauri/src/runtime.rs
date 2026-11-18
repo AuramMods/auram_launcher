@@ -177,6 +177,40 @@ impl Runtime {
         job.complete_phase();
         find_java(&java_root)
     }
+    pub(crate) async fn server_forge_argfile(
+        &self,
+        directory: &Path,
+        relative: &str,
+        job: &Job,
+    ) -> Result<String> {
+        if self.platform == Platform::MacArm {
+            let original = storage::safe_join(directory, relative)?;
+            let content = fs::read_to_string(&original).context("Read Forge launch arguments")?;
+            let replacements = compat::macos_libraries()?;
+            let libraries = self.layout.runtime().join("libraries");
+            if let Some(content) =
+                compat::server_jna_arguments(&content, &libraries, &replacements)?
+            {
+                let downloads = library_downloads(
+                    &json!({"libraries":replacements}),
+                    &libraries,
+                    self.platform,
+                )?;
+                self.net
+                    .many_named(downloads, job, "macOS server libraries")
+                    .await?;
+                let key = hex::encode(sha2::Sha256::digest(original.to_string_lossy().as_bytes()));
+                let config = self
+                    .layout
+                    .state("server-launch")
+                    .join(format!("{key}.args"));
+                storage::atomic_write(&config, content.as_bytes())?;
+                return Ok(format!("@{}", config.display()));
+            }
+        }
+        Ok(format!("@{relative}"))
+    }
+
     pub async fn installer(&self, versions: &Versions, job: &Job) -> Result<PathBuf> {
         let coordinate = format!("{}-{}", versions.minecraft, versions.forge);
         let url=format!("https://maven.minecraftforge.net/net/minecraftforge/forge/{coordinate}/forge-{coordinate}-installer.jar");

@@ -1,6 +1,13 @@
 use super::Platform;
 use anyhow::Result;
 use serde_json::Value;
+use std::path::Path;
+
+pub(super) fn macos_libraries() -> Result<Vec<Value>> {
+    Ok(serde_json::from_str(include_str!(
+        "../../macos-libraries.json"
+    ))?)
+}
 
 /// Minecraft 1.20.1's JNA 5.12.1 aborts on long macOS dlerror() messages.
 /// Use Mojang's matched 5.13.0 pair (from 1.20.2), which includes JNA #1456.
@@ -9,8 +16,7 @@ pub(super) fn client_metadata(mut metadata: Value, platform: Platform) -> Result
     if platform != Platform::MacArm {
         return Ok(metadata);
     }
-    let replacements: Vec<Value> =
-        serde_json::from_str(include_str!("../../macos-libraries.json"))?;
+    let replacements = macos_libraries()?;
     if let Some(libraries) = metadata["libraries"].as_array_mut() {
         for library in libraries {
             for replacement in &replacements {
@@ -68,6 +74,55 @@ pub(super) fn client_metadata(mut metadata: Value, platform: Platform) -> Result
     Ok(metadata)
 }
 
+/// Keep the original Forge file and substitute only its vanilla JNA pair.
+pub(super) fn server_jna_arguments(
+    content: &str,
+    library_root: &Path,
+    replacements: &[Value],
+) -> Result<Option<String>> {
+    let mut changed = false;
+    let mut result = String::new();
+    for line in content.lines() {
+        let token = line.trim().trim_matches('"');
+        if let Some(classpath) = token.strip_prefix("-DlegacyClassPath=") {
+            let mut entries = classpath.split(':').map(str::to_owned).collect::<Vec<_>>();
+            let mut replaced = false;
+            for library in replacements {
+                let path = library["downloads"]["artifact"]["path"].as_str().unwrap();
+                let old = format!("libraries/{}", path.replace("5.13.0", "5.12.1"));
+                for entry in &mut entries {
+                    if *entry == old {
+                        *entry = crate::storage::safe_join(library_root, path)?
+                            .to_string_lossy()
+                            .into_owned();
+                        replaced = true;
+                    }
+                }
+            }
+            if replaced {
+                result.push_str(&super::argfile(&[format!(
+                    "-DlegacyClassPath={}",
+                    entries.join(":")
+                )]));
+                changed = true;
+                continue;
+            }
+        }
+        // Some generated Forge argfiles also merge these modules by filename.
+        if token.starts_with("-DmergeModules=") {
+            result.push_str(
+                &line
+                    .replace("jna-5.12.1.jar", "jna-5.13.0.jar")
+                    .replace("jna-platform-5.12.1.jar", "jna-platform-5.13.0.jar"),
+            );
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+    Ok(changed.then_some(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,7 +133,7 @@ mod tests {
         storage::{Layout, Settings},
     };
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn metadata(version: &str) -> Value {
         json!({
@@ -135,6 +190,22 @@ mod tests {
             client_metadata(original.clone(), Platform::WindowsX64).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn forge_server_retains_relative_libraries_and_quotes_the_compatible_jna_paths() {
+        let content = "-DmergeModules=jna-5.12.1.jar,jna-platform-5.12.1.jar,other.jar\n-DlegacyClassPath=libraries/other.jar:libraries/net/java/dev/jna/jna/5.12.1/jna-5.12.1.jar:libraries/net/java/dev/jna/jna-platform/5.12.1/jna-platform-5.12.1.jar\n--launchTarget forgeserver";
+        let cached = Path::new("Auram data 世界/libraries");
+        let replacements = macos_libraries().unwrap();
+        let revised = server_jna_arguments(content, cached, &replacements)
+            .unwrap()
+            .unwrap();
+        assert!(revised.contains("-DmergeModules=jna-5.13.0.jar,jna-platform-5.13.0.jar,other.jar"));
+        assert!(revised.contains(r#""-DlegacyClassPath=libraries/other.jar:Auram data 世界/libraries/net/java/dev/jna/jna/5.13.0/jna-5.13.0.jar:Auram data 世界/libraries/net/java/dev/jna/jna-platform/5.13.0/jna-platform-5.13.0.jar""#));
+        assert!(revised.ends_with("--launchTarget forgeserver\n"));
+        assert!(server_jna_arguments(&revised, cached, &replacements)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

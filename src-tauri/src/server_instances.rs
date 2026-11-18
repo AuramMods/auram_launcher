@@ -16,6 +16,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const MIN_SERVER_MEMORY: u8 = 12;
+const MAX_SERVER_MEMORY: u8 = 30;
+
+fn default_memory() -> u8 {
+    MIN_SERVER_MEMORY
+}
+
+pub fn validate_memory(memory_gib: u8) -> Result<()> {
+    if !(MIN_SERVER_MEMORY..=MAX_SERVER_MEMORY).contains(&memory_gib) {
+        bail!("Server memory must be between {MIN_SERVER_MEMORY} and {MAX_SERVER_MEMORY} GB");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Target {
@@ -32,6 +46,8 @@ pub struct ServerInstance {
     pub id: String,
     pub name: String,
     pub target: Target,
+    #[serde(default = "default_memory")]
+    pub memory_gib: u8,
     pub known_version: Option<server::ServerVersion>,
     pub checked_at: Option<String>,
     pub last_error: Option<String>,
@@ -42,6 +58,7 @@ pub struct ServerInput {
     pub id: Option<String>,
     pub name: String,
     pub target: Target,
+    pub memory_gib: Option<u8>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Registry {
@@ -63,6 +80,7 @@ impl Registry {
                             id: "legacy-sftp".into(),
                             name: legacy.host.clone(),
                             target: Target::Sftp { connection: legacy },
+                            memory_gib: default_memory(),
                             known_version: None,
                             checked_at: None,
                             last_error: None,
@@ -123,6 +141,17 @@ impl Registry {
             }
         }
         let unchanged = old.as_ref().is_some_and(|s| s.target == target);
+        let memory_gib = match target {
+            Target::Local { .. } => {
+                let memory = input
+                    .memory_gib
+                    .or_else(|| old.as_ref().map(|s| s.memory_gib))
+                    .unwrap_or_else(default_memory);
+                validate_memory(memory)?;
+                memory
+            }
+            Target::Sftp { .. } => default_memory(),
+        };
         Ok(ServerInstance {
             id: old
                 .as_ref()
@@ -130,6 +159,7 @@ impl Registry {
                 .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>())),
             name,
             target,
+            memory_gib,
             known_version: old
                 .as_ref()
                 .filter(|_| unchanged)

@@ -34,6 +34,9 @@ pub async fn update_launcher(
     let job = &lease.job;
     job.progress("launcherUpdate", "Checking launcher updates", 0, 0);
     let result=async {
+        if core.local_servers.active() {
+            return Ok("Stop local servers before updating the launcher.".into());
+        }
         let builder=app.updater_builder().timeout(Duration::from_secs(20));
         #[cfg(feature="qa")]
         let builder=builder.endpoints(vec![std::env::var("AURAM_QA_UPDATE_URL")?.parse()?])?;

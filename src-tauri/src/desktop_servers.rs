@@ -7,10 +7,11 @@ use crate::{
     jobs::{Job, PhaseSpec},
     server::ServerVersion,
     server_instances::{self, Registry, ServerInput, ServerInstance, Target},
+    server_process::{self, ConsoleLine},
     storage,
 };
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
@@ -60,6 +61,13 @@ pub async fn save_server_instance(
         let mut registry = Registry::load(&core.layout)?;
         let previous = input.id.as_deref().map(|id| registry.get(id)).transpose()?;
         let instance = registry.prepare(&core.layout, input)?;
+        if core.local_servers.running(&instance.id)
+            && previous
+                .as_ref()
+                .is_some_and(|old| old.target != instance.target)
+        {
+            bail!("Stop the local server before changing its folder");
+        }
         if let Target::Sftp { connection } = &instance.target {
             save_credentials(connection, &instance.id, secret, &core)?;
         }
@@ -102,11 +110,15 @@ pub async fn remove_server_instance(
     let result = (|| {
         let mut registry = Registry::load(&core.layout)?;
         let instance = registry.get(&id)?;
+        if core.local_servers.running(&id) {
+            bail!("Stop the local server before removing it");
+        }
         if let Target::Sftp { connection } = instance.target {
             connection.forget_instance_secret(&core.layout, &id)?;
         }
         registry.servers.retain(|s| s.id != id);
-        registry.write(&core.layout)
+        registry.write(&core.layout)?;
+        core.local_servers.forget_stopped(&id)
     })();
     lease
         .job
@@ -170,7 +182,9 @@ pub async fn inspect_server_instance(
         let inspection = match &mut instance.target {
             Target::Local { directory } => {
                 let root = server_instances::local_directory(&core.layout, directory)?;
-                storage::recover(&root, &server_instances::local_journal(&core.layout, &root))?;
+                if !core.local_servers.uses(&root) {
+                    storage::recover(&root, &server_instances::local_journal(&core.layout, &root))?;
+                }
                 job.phase("server-version", "Read version", false);
                 read_inspection(&deploy::local::LocalRemote::new(root)?, job).await?
             }
@@ -286,6 +300,12 @@ pub async fn deploy_server_instance(
             bail!("Close Minecraft before preparing a server deployment");
         }
         let instance = Registry::load(&core.layout)?.get(&id)?;
+        if let Target::Local { directory } = &instance.target {
+            let root = server_instances::local_directory(&core.layout, directory)?;
+            if core.local_servers.uses(&root) {
+                bail!("Stop the local server before deploying to this folder");
+            }
+        }
         if !recover_only {
             server_instances::prepare_payload(&core.packs, &core.runtime, job).await?;
         }
@@ -362,4 +382,119 @@ pub fn open_server_instance(
         Ok::<_, anyhow::Error>(())
     })()
     .map_err(|e| format!("Open server directory: {e:#}"))
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalServerAction {
+    Start,
+    Stop,
+    Restart,
+    Close,
+}
+
+#[tauri::command]
+pub async fn manage_local_server(
+    id: String,
+    action: LocalServerAction,
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Backend>,
+) -> Result<(), String> {
+    let core = backend.core()?;
+    if matches!(action, LocalServerAction::Stop | LocalServerAction::Close) {
+        return async {
+            core.local_servers.stop(&id).await?;
+            if action == LocalServerAction::Close {
+                core.local_servers.forget_stopped(&id)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .map_err(|error| format!("{error:#}"));
+    }
+    let restarting = action == LocalServerAction::Restart;
+    let mut phases = Vec::new();
+    if restarting {
+        phases.push(PhaseSpec("server-stop", "Stop server", false));
+    }
+    phases.extend([
+        PhaseSpec("java", "Java 17", false),
+        PhaseSpec("server-start", "Start server", false),
+    ]);
+    let lease = core
+        .jobs
+        .begin(
+            if restarting {
+                "Restarting server"
+            } else {
+                "Starting server"
+            },
+            &phases,
+            Arc::new(move |progress| {
+                let _ = app.emit("progress", progress);
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    let job = &lease.job;
+    let result = async {
+        let instance = Registry::load(&core.layout)?.get(&id)?;
+        let Target::Local { directory } = instance.target else {
+            bail!("Only local servers can be started here");
+        };
+        let directory = server_instances::local_directory(&core.layout, &directory)?;
+        if restarting {
+            job.progress(
+                "server-stop",
+                "Waiting for the server to save and stop",
+                0,
+                0,
+            );
+            tokio::select! {
+                result = core.local_servers.stop(&id) => result?,
+                _ = job.cancel.cancelled() => bail!("Server restart cancelled"),
+            }
+            job.complete_phase();
+        }
+        if core.local_servers.uses(&directory) {
+            bail!("A local server is already running in this folder");
+        }
+        storage::recover(
+            &directory,
+            &server_instances::local_journal(&core.layout, &directory),
+        )?;
+        job.phase("java", "Java 17", false);
+        let arguments =
+            server_process::launch_arguments(&directory, &core.runtime, instance.memory_gib, job)
+                .await?;
+        let java = core.runtime.java(job).await?;
+        job.check()?;
+        job.phase("server-start", "Start server", false);
+        core.local_servers.start(&id, directory, &java, &arguments)
+    }
+    .await;
+    job.finish(result.as_ref().err().map(|error| format!("{error:#}")));
+    result.map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+pub fn local_server_console(
+    id: String,
+    after: u64,
+    backend: tauri::State<'_, Backend>,
+) -> Result<Vec<ConsoleLine>, String> {
+    Ok(backend.core()?.local_servers.console(&id, after))
+}
+
+#[tauri::command]
+pub async fn send_server_command(
+    id: String,
+    command: String,
+    backend: tauri::State<'_, Backend>,
+) -> Result<(), String> {
+    backend
+        .core()?
+        .local_servers
+        .send(&id, &command)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }

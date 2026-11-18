@@ -21,6 +21,7 @@ fn saved_instances_start_empty_persist_independently_and_keep_only_nonsecret_met
         .prepare(
             &layout,
             ServerInput {
+                memory_gib: None,
                 id: None,
                 name: " Local ".into(),
                 target: Target::Local {
@@ -33,6 +34,7 @@ fn saved_instances_start_empty_persist_independently_and_keep_only_nonsecret_met
         .prepare(
             &layout,
             ServerInput {
+                memory_gib: None,
                 id: None,
                 name: "Hosted".into(),
                 target: Target::Sftp {
@@ -90,6 +92,7 @@ fn destination_edits_invalidate_versions_and_cannot_forge_host_pins_or_share_cre
         .prepare(
             &layout,
             ServerInput {
+                memory_gib: None,
                 id: None,
                 name: "A".into(),
                 target: Target::Sftp {
@@ -109,6 +112,7 @@ fn destination_edits_invalidate_versions_and_cannot_forge_host_pins_or_share_cre
         .prepare(
             &layout,
             ServerInput {
+                memory_gib: None,
                 id: Some(saved.id.clone()),
                 name: "Renamed".into(),
                 target: saved.target.clone(),
@@ -120,6 +124,7 @@ fn destination_edits_invalidate_versions_and_cannot_forge_host_pins_or_share_cre
         .prepare(
             &layout,
             ServerInput {
+                memory_gib: None,
                 id: Some(saved.id.clone()),
                 name: "A".into(),
                 target: Target::Sftp {
@@ -235,4 +240,44 @@ async fn local_transport_checks_version_files_limits_paths_and_cancelled_transfe
         std::os::unix::fs::symlink(temp.path(), temp.path().join("link")).unwrap();
         assert!(remote.write("link/escaped", b"bad").await.is_err());
     }
+}
+
+#[test]
+fn legacy_local_servers_default_to_twelve_and_memory_updates_preserve_the_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(temp.path().join("data")).unwrap();
+    let local = temp.path().join("Server");
+    fs::create_dir(&local).unwrap();
+    let directory = local_directory(&layout, local.to_str().unwrap()).unwrap();
+    storage::write_json(
+        &layout.state("servers.json"),
+        &serde_json::json!({"schema":1,"servers":[{
+            "id":"local","name":"Local","target":{"kind":"local","directory":directory},
+            "knownVersion":version("161")
+        }]}),
+    )
+    .unwrap();
+    let mut registry = Registry::load(&layout).unwrap();
+    let saved = registry.get("local").unwrap();
+    assert_eq!(saved.memory_gib, 12);
+    let edit = |memory| ServerInput {
+        id: Some(saved.id.clone()),
+        name: saved.name.clone(),
+        target: saved.target.clone(),
+        memory_gib: Some(memory),
+    };
+    assert!(registry.prepare(&layout, edit(11)).is_err());
+    assert!(registry.prepare(&layout, edit(31)).is_err());
+    let changed = registry.prepare(&layout, edit(30)).unwrap();
+    assert_eq!(changed.known_version.as_ref().unwrap().version, "161");
+    registry.put(changed);
+    registry.write(&layout).unwrap();
+    assert_eq!(
+        Registry::load(&layout)
+            .unwrap()
+            .get("local")
+            .unwrap()
+            .memory_gib,
+        30
+    );
 }

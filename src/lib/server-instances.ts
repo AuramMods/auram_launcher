@@ -1,8 +1,8 @@
 export type ServerVersion={version:string;commit:string;minecraft:string;forge:string};
 export type SftpSettings={schema:number;host:string;port:number;username:string;directory:string;authentication:string;keyPath:string;fingerprint:string};
 export type ServerTarget={kind:'local';directory:string}|{kind:'sftp';connection:SftpSettings};
-export type ServerInstance={id:string;name:string;target:ServerTarget;knownVersion:ServerVersion|null;checkedAt:string|null;lastError:string|null};
-export type ServerDraft={id:string|null;name:string;target:ServerTarget};
+export type ServerInstance={id:string;name:string;target:ServerTarget;memoryGib:number;knownVersion:ServerVersion|null;checkedAt:string|null;lastError:string|null};
+export type ServerDraft={id:string|null;name:string;target:ServerTarget;memoryGib:number};
 export type ServerInspection={version:ServerVersion|null;hostKey:{fingerprint:string;changed:boolean}|null;recoveryRequired:boolean};
 export const emptyConnection=():SftpSettings=>({schema:1,host:'',port:22,username:'',directory:'.',authentication:'password',keyPath:'',fingerprint:''});
 export function deploymentAction(version:ServerVersion|null,target:{name:string;sha:string}|null) {
@@ -14,3 +14,9 @@ export function deploymentAction(version:ServerVersion|null,target:{name:string;
 export function serverAddress(target:ServerTarget) {
   return target.kind==='local'?target.directory:`${target.connection.username}@${target.connection.host}:${target.connection.port} · ${target.connection.directory}`;
 }
+
+export const minimumServerMemory=12;
+export const maximumServerMemory=30;
+export type LocalServerStatus={id:string;state:'running'|'stopping'|'stopped';exit:string|null};
+export type LocalServerAction='start'|'stop'|'restart'|'close';
+export type ServerConsoleLine={id:number;source:'stdout'|'stderr'|'command'|'launcher';text:string};
