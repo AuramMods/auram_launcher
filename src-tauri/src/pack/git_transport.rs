@@ -12,6 +12,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_OBJECT: u64 = 512 * 1024 * 1024;
@@ -30,6 +31,10 @@ impl std::error::Error for Unavailable {}
 pub struct GitCache {
     pub directory: PathBuf,
     pub remote: String,
+}
+struct SystemGit {
+    executable: PathBuf,
+    disabled: AtomicBool,
 }
 fn repository(path: &Path) -> Result<git2::Repository> {
     match git2::Repository::open_bare(path) {
@@ -156,9 +161,32 @@ impl GitCache {
         oids: Vec<String>,
         metadata: bool,
         limit: u64,
+        system: Option<&SystemGit>,
         job: &Job,
     ) -> Result<()> {
         job.check()?;
+        if let Some(system) = system.filter(|git| !git.disabled.load(Ordering::Relaxed)) {
+            match super::system_git::fetch(
+                &system.executable,
+                &self.directory,
+                &self.remote,
+                &oids,
+                metadata,
+                job,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    job.check()?;
+                    system.disabled.store(true, Ordering::Relaxed);
+                    job.detail(
+                        "pack-git",
+                        format!("{error}. Using the bundled Git transport."),
+                    );
+                }
+            }
+        }
         fs::create_dir_all(&self.directory)?;
         let response = self
             .directory
@@ -191,6 +219,17 @@ impl GitCache {
         files: &BTreeMap<String, Entry>,
         job: &Job,
     ) -> Result<()> {
+        self.ensure_with(packs, catalog, files, super::system_git::configured(), job)
+            .await
+    }
+    async fn ensure_with(
+        &self,
+        packs: &Packs,
+        catalog: &Catalog,
+        files: &BTreeMap<String, Entry>,
+        executable: Option<PathBuf>,
+        job: &Job,
+    ) -> Result<()> {
         job.check()?;
         let relative = self
             .directory
@@ -203,7 +242,14 @@ impl GitCache {
                 .context("Git cache path is not UTF-8")?
                 .replace('\\', "/"),
         )?;
-        match self.ensure_once(packs, catalog, files, job).await {
+        let system = executable.map(|executable| SystemGit {
+            executable,
+            disabled: AtomicBool::new(false),
+        });
+        match self
+            .ensure_once(packs, catalog, files, system.as_ref(), job)
+            .await
+        {
             Err(error) if error.downcast_ref::<git2::Error>().is_some() => {
                 job.check()?;
                 if self.directory == packs.layout.root.join("cache")
@@ -220,7 +266,8 @@ impl GitCache {
                     "pack-git",
                     "Recovering the Git cache; verified content files remain reusable",
                 );
-                self.ensure_once(packs, catalog, files, job).await
+                self.ensure_once(packs, catalog, files, system.as_ref(), job)
+                    .await
             }
             result => result,
         }
@@ -230,6 +277,7 @@ impl GitCache {
         packs: &Packs,
         catalog: &Catalog,
         files: &BTreeMap<String, Entry>,
+        system: Option<&SystemGit>,
         job: &Job,
     ) -> Result<()> {
         let path = self.directory.clone();
@@ -250,6 +298,7 @@ impl GitCache {
                 vec![catalog.target.sha.clone()],
                 true,
                 EXTRA_BYTES,
+                system,
                 job,
             )
             .await?;
@@ -326,7 +375,7 @@ impl GitCache {
             local_work::Progress::new(job, "Retrieving sparse Git batches", batches.len());
         let completed = &progress;
         futures_util::stream::iter(batches.into_iter().map(|(oids, size)| async move {
-            self.fetch(packs, oids, false, size + EXTRA_BYTES, job)
+            self.fetch(packs, oids, false, size + EXTRA_BYTES, system, job)
                 .await?;
             completed.complete();
             Ok::<_, anyhow::Error>(())

@@ -59,6 +59,10 @@ tauri-plugin-dialog = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 axum = "0.8"

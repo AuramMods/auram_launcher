@@ -35,6 +35,16 @@ Large objects are separate payloads; small objects share bounded archives. Count
 refer to actually required uncached archives after final-state/cache reuse, not
 numeric version differences. Metadata-only transitions need no payload archive.
 
+Auram ships its own Git transport and fetches public snapshots anonymously by
+default. To use an existing Git installation and its saved credentials, set
+`AURAM_PACK_GIT` to the absolute path of the installed Git executable before
+starting the launcher. Use a real installation, such as Homebrew Git on macOS,
+or Git for Windows on Windows. Git is invoked without interactive prompts or
+hooks in the same private object cache. If it cannot fetch, Auram retries with
+its bundled transport. The launcher never reads or copies the credentials.
+See [Git fetch](https://git-scm.com/docs/git-fetch) and
+[credential helpers](https://git-scm.com/docs/gitcredentials).
+
 The latest endpoint is the complete envelope at
 `https://github.com/AuramMods/Auram/releases/latest/download/auram-pack.json`.
 Exact-target discovery uses `/releases/download/<tag>/auram-pack.json`. No normal

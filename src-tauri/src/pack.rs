@@ -18,6 +18,7 @@ mod distribution_tests;
 pub mod git_transport;
 mod replacement;
 mod source;
+mod system_git;
 pub use source::Repository;
 use source::{Selection, Source, CLIENT_POLICY};
 
