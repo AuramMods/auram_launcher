@@ -378,11 +378,9 @@ fn record_line(session: &Session, source: &'static str, line: &mut Vec<u8>, trun
 pub async fn launch_arguments(
     directory: &Path,
     runtime: &Runtime,
-    memory_gib: u8,
+    (mut arguments, forge_file): (Vec<String>, String),
     job: &Job,
 ) -> Result<Vec<String>> {
-    let (mut arguments, forge_file) =
-        deployed_arguments(directory, runtime.platform, memory_gib).await?;
     arguments.push(
         runtime
             .server_forge_argfile(directory, &forge_file, job)
@@ -392,7 +390,7 @@ pub async fn launch_arguments(
     Ok(arguments)
 }
 
-async fn deployed_arguments(
+pub async fn deployed_arguments(
     directory: &Path,
     platform: Platform,
     memory_gib: u8,
@@ -424,22 +422,6 @@ async fn deployed_arguments(
     );
     std::fs::File::open(storage::safe_join(directory, &forge_args)?)
         .with_context(|| format!("Open the deployed Forge launch arguments at {forge_args}"))?;
-    let eula = storage::safe_join(directory, "eula.txt")?;
-    let accepted = match std::fs::read_to_string(eula) {
-        Ok(text) => text
-            .lines()
-            .rev()
-            .find_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                (key.trim() == "eula").then(|| value.trim().eq_ignore_ascii_case("true"))
-            })
-            .unwrap_or(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(error).context("Read the server's eula.txt"),
-    };
-    if !accepted {
-        bail!("Read the Minecraft EULA at https://aka.ms/MinecraftEULA and set eula=true in the server folder's eula.txt");
-    }
     crate::server_instances::validate_memory(memory_gib)?;
     let mut args = Vec::new();
     let user_args = storage::safe_join(directory, "user_jvm_args.txt")?;
@@ -456,6 +438,27 @@ async fn deployed_arguments(
         format!("-Xmx{memory_gib}G"),
     ]);
     Ok((args, forge_args))
+}
+
+pub(crate) fn ensure_eula(directory: &Path, agree: bool) -> Result<bool> {
+    let eula = storage::safe_join(directory, "eula.txt")?;
+    let accepted = match std::fs::read_to_string(eula) {
+        Ok(text) => text
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "eula").then(|| value.trim().eq_ignore_ascii_case("true"))
+            })
+            .unwrap_or(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("Read the server's eula.txt"),
+    };
+    if !accepted && agree {
+        crate::server::write_eula(directory, true)?;
+        return Ok(true);
+    }
+    Ok(accepted)
 }
 
 #[cfg(test)]

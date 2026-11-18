@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use std::{collections::BTreeMap, fs, io::Read, path::Path};
 
+pub(crate) const EULA_URL: &str = "https://aka.ms/MinecraftEULA";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerVersion {
@@ -339,10 +341,7 @@ fn write_start_scripts(root: &Path, java: &Path, versions: &Versions) -> Result<
         &root.join("user_jvm_args.txt"),
         format!("-Xms512M\n-Xmx{}M\n", server_memory).as_bytes(),
     )?;
-    storage::atomic_write(
-        &root.join("eula.txt"),
-        b"# Read https://aka.ms/MinecraftEULA before accepting in Auram.\neula=false\n",
-    )?;
+    write_eula(root, false)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -668,10 +667,15 @@ pub fn accept_eula(server: &Path, accepted: bool) -> Result<()> {
     if !server.join(".auram-manifest.json").exists() {
         bail!("Build a server first");
     }
+    write_eula(server, accepted)
+}
+
+pub(crate) fn write_eula(server: &Path, accepted: bool) -> Result<()> {
     storage::atomic_write(
-        &server.join("eula.txt"),
-        format!("# Minecraft EULA: https://aka.ms/MinecraftEULA\neula={accepted}\n").as_bytes(),
+        &storage::safe_join(server, "eula.txt")?,
+        format!("# Minecraft EULA: {EULA_URL}\neula={accepted}\n").as_bytes(),
     )
+    .context("Write the server's eula.txt")
 }
 #[cfg(test)]
 mod tests {

@@ -31,6 +31,8 @@ type AuthSettings = {microsoftClientId:string;browserLogin:boolean};
 type Settings = AuthSettings & {memory:MemoryPreferences};
 type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];localServers:LocalServerStatus[];dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer';
+type ServerEulaPrompt = {id:string; command:'start'|'restart'; directory:string};
+type LocalServerOutcome = {status:'done'} | {status:'eulaRequired'; directory:string};
 function App() {
   const [tab,setTab]=React.useState<'play'|'server'|'settings'|{serverId:string}>('play');
   const [status,setStatus]=React.useState<Status|null>(null);
@@ -40,6 +42,7 @@ function App() {
   const [active,setActive]=React.useState(false);
   const [serverActions,setServerActions]=React.useState<Partial<Record<string,LocalServerAction>>>({});
   const [serverErrors,setServerErrors]=React.useState<Partial<Record<string,string>>>({});
+  const [serverEula,setServerEula]=React.useState<ServerEulaPrompt|null>(null);
   const [confirmReinstall,setConfirmReinstall]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
   const [settings,setSettings]=React.useState<AuthSettings|null>(null);
@@ -111,16 +114,20 @@ function App() {
   async function updateLauncher() {setUpdateStatus('Checking for launcher updates…');try {const message=await invoke<string>('update_launcher',{manual:true});setUpdateStatus(message);notify(message);}catch(e){setUpdateStatus(String(e));showError(String(e));}}
   const localServers=new Map(status?.localServers.map(server=>[server.id,server])??[]);
   const servers=status?.servers??[];
-  const consoles=servers.filter(server=>server.target.kind==='local'&&(localServers.has(server.id)||serverActions[server.id]||serverErrors[server.id]));
+  const consoles=servers.filter(server=>server.target.kind==='local'&&(localServers.has(server.id)||serverActions[server.id]||serverErrors[server.id]||serverEula?.id===server.id));
   const consoleId=typeof tab==='object'?tab.serverId:null;
   const consoleServer=consoles.find(server=>server.id===consoleId);
-  async function controlServer(id:string,command:LocalServerAction) {
+  async function controlServer(id:string,command:LocalServerAction,acceptEulaFor?:string) {
     if(serverActions[id])return;
     if(command==='start'||command==='restart')setTab({serverId:id});
     setServerActions(previous=>({...previous,[id]:command}));
     setServerErrors(previous=>({...previous,[id]:undefined}));
+    let eulaPrompt:ServerEulaPrompt|null=null;
     try {
-      await invoke('manage_local_server',{id,action:command});
+      const result=await invoke<LocalServerOutcome>('manage_local_server',{id,action:command,acceptEulaFor});
+      if(result?.status==='eulaRequired'&&(command==='start'||command==='restart')) {
+        eulaPrompt={id,command,directory:result.directory};
+      }
       if(command==='close')setTab(previous=>typeof previous==='object'&&previous.serverId===id?'server':previous);
     } catch(error) {
       const message=String(error);
@@ -129,7 +136,19 @@ function App() {
     } finally {
       await refresh().catch(()=>{});
       setServerActions(previous=>({...previous,[id]:undefined}));
+      if(eulaPrompt)setServerEula(eulaPrompt);
     }
+  }
+  function dismissServerEula() {
+    if(!serverEula)return;
+    const id=serverEula.id;
+    if(!localServers.has(id))setTab(previous=>typeof previous==='object'&&previous.serverId===id?'server':previous);
+    setServerEula(null);
+  }
+  function agreeToServerEula() {
+    if(!serverEula)return;
+    setServerEula(null);
+    void controlServer(serverEula.id,serverEula.command,serverEula.directory);
   }
   const installed=!!status?.pack;
   const running=!!status?.game.running;
@@ -207,6 +226,23 @@ function App() {
       {busy&&<footer className="activity-bar"><JobProgressPanel progress={progress} onCancel={()=>void action('cancel_operation')}/></footer>}
     </div>
     <Notifications notifications={notifications} onRemove={remove}/>
+    <Dialog open={serverEula!==null} onOpenChange={open=>{if(!open)dismissServerEula();}}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Accept the Minecraft EULA?</DialogTitle>
+          <DialogDescription>
+            Read the <a href="https://aka.ms/MinecraftEULA" onClick={event=>{
+              event.preventDefault();
+              void invoke('open_minecraft_eula').catch(error=>showError(String(error)));
+            }}>Minecraft EULA</a>. Click Agree to accept it for {servers.find(server=>server.id===serverEula?.id)?.name??'this server'} and continue startup.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" onClick={dismissServerEula}>Cancel</Button>
+          <Button onClick={agreeToServerEula}>Agree</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
     <ForceReinstallDialog open={confirmReinstall} onOpenChange={setConfirmReinstall} clientPath={status?.clientPath} busy={busy||running} onConfirm={()=>{setConfirmReinstall(false);void run('forceReinstall');}}/>
     <Dialog open={challenge!==null} onOpenChange={open=>{if(!open){setChallenge(null);void invoke('cancel_operation');}}}>
       <DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Sign in with Microsoft</DialogTitle><DialogDescription>Copy your code, then enter it on Microsoft’s sign-in page. Auram will remember your session securely.</DialogDescription></DialogHeader>

@@ -534,6 +534,7 @@ pub fn run() {
             crate::desktop_servers::cancel_server_inspection,
             crate::desktop_servers::deploy_server_instance,
             crate::desktop_servers::open_server_instance,
+            crate::desktop_servers::open_minecraft_eula,
             crate::desktop_servers::manage_local_server,
             crate::desktop_servers::local_server_console,
             crate::desktop_servers::send_server_command

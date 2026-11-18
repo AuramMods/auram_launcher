@@ -18,17 +18,6 @@ async fn launch_uses_the_deployed_version_memory_and_platform_arguments() {
         std::fs::write(forge.join(name), "forge.fixture.Main").unwrap();
     }
     std::fs::write(root.join("user_jvm_args.txt"), "-Xmx4G\n-Dflag=retained").unwrap();
-    std::fs::write(root.join("eula.txt"), "eula=false\n").unwrap();
-    assert!(deployed_arguments(root, Platform::MacArm, 12)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("eula=true"));
-    std::fs::write(
-        root.join("eula.txt"),
-        "# Accepted for tests\r\neula=true\r\n",
-    )
-    .unwrap();
     let (args, forge_file) = deployed_arguments(root, Platform::WindowsX64, 30)
         .await
         .unwrap();
@@ -60,6 +49,49 @@ async fn launch_uses_the_deployed_version_memory_and_platform_arguments() {
         .unwrap_err()
         .to_string()
         .contains("Recover"));
+}
+
+#[test]
+fn agreement_is_required_and_recorded_only_in_the_selected_folder() {
+    let selected = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let path = selected.path().join("eula.txt");
+    let unaccepted = "# Existing file\r\neula=false\r\n";
+    std::fs::write(&path, unaccepted).unwrap();
+
+    assert!(!ensure_eula(selected.path(), false).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unaccepted);
+    assert!(!ensure_eula(other.path(), false).unwrap());
+    assert!(!other.path().join("eula.txt").exists());
+
+    assert!(ensure_eula(selected.path(), true).unwrap());
+    assert!(ensure_eula(selected.path(), false).unwrap());
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .ends_with("eula=true\n"));
+    assert!(!other.path().join("eula.txt").exists());
+    assert!(ensure_eula(other.path(), true).unwrap());
+    assert!(ensure_eula(other.path(), false).unwrap());
+
+    let previously_accepted = "# Accepted outside Auram\r\neula=true\r\n";
+    std::fs::write(&path, previously_accepted).unwrap();
+    assert!(ensure_eula(selected.path(), true).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), previously_accepted);
+}
+
+#[cfg(unix)]
+#[test]
+fn agreement_does_not_follow_an_eula_symlink() {
+    let selected = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "eula=false\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), selected.path().join("eula.txt")).unwrap();
+
+    assert!(ensure_eula(selected.path(), true).is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.path()).unwrap(),
+        "eula=false\n"
+    );
 }
 
 #[cfg(unix)]

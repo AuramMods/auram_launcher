@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
 
@@ -393,13 +393,27 @@ pub enum LocalServerAction {
     Close,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum LocalServerOutcome {
+    Done,
+    EulaRequired { directory: String },
+}
+
+#[tauri::command]
+pub fn open_minecraft_eula() -> Result<(), String> {
+    tauri_plugin_opener::open_url(crate::server::EULA_URL, None::<&str>)
+        .map_err(|error| format!("Open the Minecraft EULA: {error}"))
+}
+
 #[tauri::command]
 pub async fn manage_local_server(
     id: String,
     action: LocalServerAction,
+    accept_eula_for: Option<String>,
     app: tauri::AppHandle,
     backend: tauri::State<'_, Backend>,
-) -> Result<(), String> {
+) -> Result<LocalServerOutcome, String> {
     let core = backend.core()?;
     if matches!(action, LocalServerAction::Stop | LocalServerAction::Close) {
         return async {
@@ -407,7 +421,7 @@ pub async fn manage_local_server(
             if action == LocalServerAction::Close {
                 core.local_servers.forget_stopped(&id)?;
             }
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(LocalServerOutcome::Done)
         }
         .await
         .map_err(|error| format!("{error:#}"));
@@ -442,6 +456,34 @@ pub async fn manage_local_server(
             bail!("Only local servers can be started here");
         };
         let directory = server_instances::local_directory(&core.layout, &directory)?;
+        if accept_eula_for
+            .as_deref()
+            .is_some_and(|expected| Path::new(expected) != directory)
+        {
+            bail!("The server folder has changed. Start it again to review the EULA.");
+        }
+        if core.local_servers.uses(&directory) {
+            if !restarting || !core.local_servers.running(&id) {
+                bail!("A local server is already running in this folder");
+            }
+        } else {
+            storage::recover(
+                &directory,
+                &server_instances::local_journal(&core.layout, &directory),
+            )?;
+        }
+        let deployment = server_process::deployed_arguments(
+            &directory,
+            core.runtime.platform,
+            instance.memory_gib,
+        )
+        .await?;
+        job.check()?;
+        if !server_process::ensure_eula(&directory, accept_eula_for.is_some())? {
+            return Ok(LocalServerOutcome::EulaRequired {
+                directory: directory.to_string_lossy().into_owned(),
+            });
+        }
         if restarting {
             job.progress(
                 "server-stop",
@@ -458,18 +500,15 @@ pub async fn manage_local_server(
         if core.local_servers.uses(&directory) {
             bail!("A local server is already running in this folder");
         }
-        storage::recover(
-            &directory,
-            &server_instances::local_journal(&core.layout, &directory),
-        )?;
         job.phase("java", "Java 17", false);
         let arguments =
-            server_process::launch_arguments(&directory, &core.runtime, instance.memory_gib, job)
-                .await?;
+            server_process::launch_arguments(&directory, &core.runtime, deployment, job).await?;
         let java = core.runtime.java(job).await?;
         job.check()?;
         job.phase("server-start", "Start server", false);
-        core.local_servers.start(&id, directory, &java, &arguments)
+        core.local_servers
+            .start(&id, directory, &java, &arguments)?;
+        Ok(LocalServerOutcome::Done)
     }
     .await;
     job.finish(result.as_ref().err().map(|error| format!("{error:#}")));
