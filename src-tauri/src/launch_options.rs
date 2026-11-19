@@ -29,7 +29,7 @@ impl AutomaticMemory {
         let high_boundary = HIGH_SYSTEM_MEMORY_ABOVE_MIB * MIB;
         let (maximum_gib, initial_gib, profile) = if bytes > high_boundary {
             (20, 12, MemoryTuning::High)
-        } else if bytes > MID_SYSTEM_MEMORY_ABOVE_MIB * MIB && bytes < high_boundary {
+        } else if bytes > MID_SYSTEM_MEMORY_ABOVE_MIB * MIB {
             (12, 9, MemoryTuning::Low)
         } else {
             (9, 9, MemoryTuning::Low)
@@ -255,7 +255,7 @@ mod tests {
             (23 * gib + 1, 12, 9, Low),
             (32 * gib, 12, 9, Low),
             (35 * gib - 1, 12, 9, Low),
-            (35 * gib, 9, 9, Low),
+            (35 * gib, 12, 9, Low),
             (35 * gib + 1, 20, 12, High),
             (64 * gib, 20, 12, High),
         ] {
