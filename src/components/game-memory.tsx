@@ -26,7 +26,7 @@ export function GameMemoryCard({ automaticMemory, preferences, disabled, onSave 
   const [saving, setSaving] = React.useState(false);
   const selection = draft ?? preferences;
   const memory = selection && automaticMemory
-    ? describeGameMemory(selection, automaticMemory.maximumMib)
+    ? describeGameMemory(selection, automaticMemory)
     : null;
   const locked = disabled || saving || !memory;
   const changed = draft !== null

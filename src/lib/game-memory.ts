@@ -4,6 +4,8 @@ export type MemoryPreferences = { automatic: boolean; manualHeapGib: number | nu
 export type AutomaticMemory = {
   systemMemoryMib: number | null;
   maximumMib: number;
+  initialMib: number;
+  profile: 'Low memory' | 'High memory';
 };
 
 const mibPerGib = 1024;
@@ -19,11 +21,11 @@ export function heapPosition(heapGib: number) {
   return (heapGib - minimumHeapGib) / (maximumHeapGib - minimumHeapGib) * 100;
 }
 
-export function describeGameMemory(preferences: MemoryPreferences, automaticMib: number) {
+export function describeGameMemory(preferences: MemoryPreferences, automatic: AutomaticMemory) {
   const manual = preferences.manualHeapGib;
   const useManual = !preferences.automatic && manual !== null && Number.isInteger(manual)
     && manual >= minimumHeapGib && manual <= maximumHeapGib;
-  const heapGib = useManual ? manual : automaticMib / mibPerGib;
+  const heapGib = useManual ? manual : automatic.maximumMib / mibPerGib;
   const profile = heapGib >= highTuningAtGib ? profiles.high : profiles.low;
   const warnings: string[] = [];
   if (heapGib < recommendedMinimumGib) {
@@ -38,8 +40,8 @@ export function describeGameMemory(preferences: MemoryPreferences, automaticMib:
 
   return {
     heapGib,
-    initialGib: Math.min(heapGib, profile.initialMemoryMib / mibPerGib),
-    profile: profile.label,
+    initialGib: useManual ? Math.min(heapGib, profile.initialMemoryMib / mibPerGib) : automatic.initialMib / mibPerGib,
+    profile: useManual ? profile.label : automatic.profile,
     totalGib: heapGib + heapOverheadGib,
     warnings,
   };

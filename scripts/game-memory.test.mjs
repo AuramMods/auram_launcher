@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { describeGameMemory, heapNotches, heapPosition, maximumHeapGib, minimumHeapGib } from '../src/lib/game-memory.ts';
 
+const highPreset = { systemMemoryMib: 64 * 1024, maximumMib: 20 * 1024, initialMib: 12 * 1024, profile: 'High memory' };
+
 test('the heap slider covers 4–32 GB with three labeled positions', () => {
   assert.equal(minimumHeapGib, 4);
   assert.equal(maximumHeapGib, 32);
@@ -23,7 +25,7 @@ test('the heap thresholds are inclusive only for the high tuning profile', () =>
     [21, 12, ['can cause instability']],
     [32, 12, ['can cause instability']],
   ]) {
-    const result = describeGameMemory({ automatic: false, manualHeapGib: heap }, 20 * 1024);
+    const result = describeGameMemory({ automatic: false, manualHeapGib: heap }, highPreset);
     assert.equal(result.heapGib, heap);
     assert.equal(result.totalGib, heap + 2);
     assert.equal(result.initialGib, expectedInitial);
@@ -35,11 +37,18 @@ test('the heap thresholds are inclusive only for the high tuning profile', () =>
 
 test('automatic selection uses the detected preset and shows its own guidance', () => {
   const auto = { automatic: true, manualHeapGib: 32 };
-  const low = describeGameMemory(auto, 9 * 1024);
+  const lowPreset = { systemMemoryMib: 23 * 1024, maximumMib: 9 * 1024, initialMib: 9 * 1024, profile: 'Low memory' };
+  const low = describeGameMemory(auto, lowPreset);
   assert.equal(low.heapGib, 9);
   assert.equal(low.totalGib, 11);
   assert.match(low.warnings.join(' '), /disable Distant Horizons/);
-  const high = describeGameMemory(auto, 20 * 1024);
+  const medium = describeGameMemory(auto, { ...lowPreset, systemMemoryMib: 32 * 1024, maximumMib: 12 * 1024 });
+  assert.equal(medium.heapGib, 12);
+  assert.equal(medium.initialGib, 9);
+  assert.equal(medium.profile, 'Low memory');
+  assert.equal(medium.totalGib, 14);
+  assert.deepEqual(medium.warnings, []);
+  const high = describeGameMemory(auto, highPreset);
   assert.equal(high.heapGib, 20);
   assert.equal(high.totalGib, 22);
   assert.deepEqual(high.warnings, []);

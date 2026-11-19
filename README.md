@@ -46,7 +46,7 @@ Production data lives at `~/Library/Application Support/AuramLauncher` on macOS 
 
 Minecraft stays running when its launcher window closes. The launcher remains in the background while collecting redacted logs; reopening the application shows the existing window. Java failures and early game exits are reported with a log location.
 
-Game memory is automatic by default. Auram picks a **9 GB** heap on systems with up to **35 GB** of RAM and **20 GB** above that. If RAM detection fails, it uses the 9 GB preset. Clear **Manage memory automatically** in Settings to save a custom heap from **4 to 32 GB**. The original high-memory JVM flags apply at **12 GB** and above. Changes take effect on the next game launch.
+Game memory is automatic by default. Auram picks a **12 GB** heap with low-memory JVM flags on systems above **23 GB** and below **35 GB** of RAM. Systems above **35 GB** use **20 GB** with high-memory flags. Systems with up to **23 GB** or exactly **35 GB** use **9 GB** with low-memory flags, as does the fallback when RAM detection fails. Clear **Manage memory automatically** in Settings to save a custom heap from **4 to 32 GB**. Manual heaps of **12 GB** or more use high-memory flags. Changes take effect on the next game launch.
 
 The memory card estimates total usage at about **2 GB above the heap** for Distant Horizons off-heap memory. It flags out-of-memory risk under **9 GB**, recommends disabling Distant Horizons rendering under **12 GB**, and warns about instability during demanding workloads above **20 GB**. Automatic mode shows the same guidance for its selected heap.
 

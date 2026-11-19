@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     let job = Job::default();
     let java = runtime.java(&job).await?;
     let memory = launch_options::automatic_memory();
-    let mut arguments = launch_options::jvm_arguments(memory.maximum_mib)?;
+    let mut arguments = launch_options::configured_jvm_arguments(Default::default())?;
     arguments.extend(["-XX:+PrintFlagsFinal".into(), "-version".into()]);
     let log = runtime.layout.root.join("logs/automatic-memory-probe.log");
     runtime::run_logged(&java, &arguments, &runtime.layout.root, &log, &job, &[]).await?;
@@ -44,6 +44,6 @@ async fn main() -> Result<()> {
             "{name} was {actual:?}, expected {expected}"
         );
     }
-    println!("PASS: {} preset; {} MiB maximum, {} MiB initial; detected RAM {:?} MiB; managed Java accepted original G1 flags",memory.profile,memory.maximum_mib,memory.initial_mib,memory.system_memory_mib);
+    println!("PASS: {:?} memory preset; {} MiB maximum, {} MiB initial; detected RAM {:?} MiB; managed Java accepted original G1 flags",memory.profile,memory.maximum_mib,memory.initial_mib,memory.system_memory_mib);
     Ok(())
 }
