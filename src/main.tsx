@@ -2,7 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, ArrowRight, Check, ChevronRight, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, Server, Settings2, Terminal, Trash2, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, Check, ChevronRight, FolderOpen, Gamepad2, HardDrive, History, LoaderCircle, Play, RefreshCw, Server, Settings2, Terminal, Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -14,8 +14,9 @@ import { ServerConsole } from '@/components/server-console';
 import { DataLocationSettings } from '@/components/data-location';
 import { GameMemoryCard } from '@/components/game-memory';
 import { PackAtmosphere, PackHeadline } from '@/components/pack-atmosphere';
+import { PackVersionPicker } from '@/components/pack-version-picker';
 import type { AutomaticMemory, MemoryPreferences } from '@/lib/game-memory';
-import type { LocalServerAction, LocalServerStatus, ServerInstance } from '@/lib/server-instances';
+import type { LocalServerAction, LocalServerStatus, PackVersion, ServerInstance } from '@/lib/server-instances';
 import { isNewerProgress, type JobProgress } from '@/lib/job-progress';
 import { createStartupTask, type PackPreparation } from '@/lib/startup';
 import { Switch } from '@/components/ui/switch';
@@ -28,7 +29,7 @@ import './style.css';
 
 type Profile = {name:string;uuid:string;xuid:string};
 type AuthSettings = {microsoftClientId:string;browserLogin:boolean};
-type Settings = AuthSettings & {memory:MemoryPreferences};
+type Settings = AuthSettings & {memory:MemoryPreferences;packVersion:PackVersion|null};
 type Status = {build:string;pack:{name:string;sha:string}|null;account:Profile|null;accountError:string|null;settings:Settings;memory:AutomaticMemory;packUpdate:PackPreparation;busy:boolean;progress:JobProgress|null;game:{running:boolean;pid:number|null;lastExit:string|null};servers:ServerInstance[];localServers:LocalServerStatus[];dataPath:string;clientPath:string};
 type Operation = 'install'|'forceReinstall'|'repair'|'launch'|'signIn'|'signOut'|'buildServer';
 type ServerEulaPrompt = {id:string; command:'start'|'restart'; directory:string};
@@ -44,6 +45,7 @@ function App() {
   const [serverErrors,setServerErrors]=React.useState<Partial<Record<string,string>>>({});
   const [serverEula,setServerEula]=React.useState<ServerEulaPrompt|null>(null);
   const [confirmReinstall,setConfirmReinstall]=React.useState(false);
+  const [choosePackVersion,setChoosePackVersion]=React.useState(false);
   const [progress,setProgress]=React.useState<JobProgress|null>(null);
   const [settings,setSettings]=React.useState<AuthSettings|null>(null);
   const [challenge,setChallenge]=React.useState<{code:string;verificationUri:string;expiresAt:number}|null>(null);
@@ -109,6 +111,22 @@ function App() {
     catch(e){showError(String(e));}
     finally {setActive(false);setChallenge(null);const next=await refresh().catch(()=>null);if(next&&(operation==='install'||operation==='forceReinstall'))setPackPreparation(next.packUpdate);}
   }
+  async function switchPackVersion(version:string|null) {
+    setChoosePackVersion(false);
+    setActive(true);
+    setProgress(null);
+    try {
+      const prepared=await invoke<PackPreparation>('switch_client_version',{version});
+      await refresh();
+      acceptPreparation(prepared);
+      showNotice(version?`Auram ${version} is installed and pinned.`:'Auram is following the latest pack version.');
+    } catch(error) {
+      showError(String(error));
+      await refresh().catch(()=>{});
+    } finally {
+      setActive(false);
+    }
+  }
   async function action(name:string,args?:Record<string,unknown>) {try {await invoke(name,args);await refresh();return true;}catch(e){showError(String(e));return false;}}
   async function save() {if(settings&&await action('save_settings',{settings}))showNotice('Settings saved.');}
   async function updateLauncher() {setUpdateStatus('Checking for launcher updates…');try {const message=await invoke<string>('update_launcher',{manual:true});setUpdateStatus(message);notify(message);}catch(e){setUpdateStatus(String(e));showError(String(e));}}
@@ -151,6 +169,7 @@ function App() {
     void controlServer(serverEula.id,serverEula.command,serverEula.directory);
   }
   const installed=!!status?.pack;
+  const pinnedPack=status?.settings.packVersion;
   const running=!!status?.game.running;
   const beforeInstall=status!==null&&!installed;
   const browseDuringStartup=beforeInstall&&preparingPack&&!active&&!running;
@@ -189,8 +208,11 @@ function App() {
             <Card>
               <CardHeader><CardTitle className="section-title"><HardDrive/>Your installation</CardTitle><CardDescription>Changelist updates. Cached files reused. Updates and repair preserve your worlds.</CardDescription></CardHeader>
               <CardContent className="installation-actions">
-                <Button variant="outline" className="installation-tile" disabled={busy||running||!installed} onClick={()=>void run('install')}>
+                {!pinnedPack&&<Button variant="outline" className="installation-tile" disabled={busy||running||!installed} onClick={()=>void run('install')}>
                   <RefreshCw className="size-5"/><span className="installation-tile-copy"><span>Check pack updates</span><small>Find the latest pack</small></span>
+                </Button>}
+                <Button variant="outline" className="installation-tile" disabled={busy||running||!status} onClick={()=>setChoosePackVersion(true)}>
+                  <History className="size-5"/><span className="installation-tile-copy"><span>Change version</span><small>{pinnedPack?`Pinned to ${pinnedPack.name}`:'Following latest'}</small></span>
                 </Button>
                 <Button variant="outline" className="installation-tile" onClick={()=>void action('open_folder',{folder:'client'})}>
                   <FolderOpen className="size-5"/><span className="installation-tile-copy"><span>Open game folder</span><small>Browse client files</small></span>
@@ -224,6 +246,16 @@ function App() {
       {busy&&<footer className="activity-bar"><JobProgressPanel progress={progress} onCancel={()=>void action('cancel_operation')}/></footer>}
     </div>
     <Notifications notifications={notifications} onRemove={remove}/>
+    <Dialog open={choosePackVersion} onOpenChange={setChoosePackVersion}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Change client version</DialogTitle>
+          <DialogDescription>Install a specific Auram build or follow the latest release.</DialogDescription>
+        </DialogHeader>
+        <PackVersionPicker installed={status?.pack?.name} pinned={pinnedPack?.name} followLabel="Follow latest"
+          disabled={busy||running} onSelect={version=>void switchPackVersion(version)}/>
+      </DialogContent>
+    </Dialog>
     <Dialog open={serverEula!==null} onOpenChange={open=>{if(!open)dismissServerEula();}}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>

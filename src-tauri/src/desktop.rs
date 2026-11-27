@@ -72,6 +72,9 @@ impl Core {
         if self.jobs.busy() {
             return Err("Wait for the current operation to finish".into());
         }
+        self.write_settings(apply)
+    }
+    fn write_settings(&self, apply: impl FnOnce(&mut Settings)) -> Result<(), String> {
         let mut current = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = current.clone();
         apply(&mut next);
@@ -252,7 +255,10 @@ async fn prepare_pack(
                     let _ = app.emit("progress", progress);
                 }),
             )?;
-            let result = core.packs.prepare_installed(&lease.job).await;
+            let result = match core.settings().pack_version {
+                Some(tag) => core.packs.prepare_pinned(&tag, &lease.job).await,
+                None => core.packs.prepare_installed(&lease.job).await,
+            };
             lease
                 .job
                 .finish(result.as_ref().err().map(|error| format!("{error:#}")));
@@ -268,6 +274,56 @@ async fn prepare_pack_update(
 ) -> Result<crate::startup::PackPreparation, String> {
     let core = backend.core()?;
     Ok(prepare_pack(&core, &app, retry).await)
+}
+
+#[tauri::command]
+async fn list_pack_versions(backend: tauri::State<'_, Backend>) -> Result<Vec<String>, String> {
+    backend
+        .core()?
+        .packs
+        .release_names(&crate::jobs::Job::default())
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn switch_client_version(
+    version: Option<String>,
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Backend>,
+) -> Result<crate::startup::PackPreparation, String> {
+    let core = backend.core()?;
+    let (_, mut phases) = Operation::Install.progress_plan();
+    phases.rotate_left(3);
+    let lease = core
+        .jobs
+        .begin(
+            "Switching Auram version",
+            &phases,
+            Arc::new(move |progress| {
+                let _ = app.emit("progress", progress);
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    let job = &lease.job;
+    let result = async {
+        if core.game.status().running {
+            bail!("Close Minecraft before switching pack versions");
+        }
+        let tag = core.packs.release(version.as_deref(), job).await?;
+        let versions = core.packs.release_versions(&tag, job).await?;
+        core.runtime.ensure(versions, job).await?;
+        job.check()?;
+        core.packs.switch_release(tag.clone(), job).await?;
+        core.write_settings(|settings| settings.pack_version = version.map(|_| tag.clone()))
+            .map_err(anyhow::Error::msg)?;
+        let prepared = crate::startup::PackPreparation::ready(&tag.name);
+        core.pack_startup.record(prepared.clone());
+        Ok::<_, anyhow::Error>(prepared)
+    }
+    .await;
+    job.finish(result.as_ref().err().map(|error| format!("{error:#}")));
+    result.map_err(|error| format!("{error:#}"))
 }
 #[tauri::command]
 async fn run_operation(
@@ -334,12 +390,18 @@ async fn run_operation(
         }
         match operation {
             Operation::Install => {
-                core.packs.update(false, job).await?;
+                if let Some(tag) = core.settings().pack_version {
+                    core.packs.prepare_pinned(&tag, job).await?;
+                } else {
+                    core.packs.update(false, job).await?;
+                }
                 let versions = Versions::read(&core.layout.client())?;
                 core.runtime.ensure(versions, job).await?;
             }
             Operation::ForceReinstall => {
-                core.packs.force_reinstall(job).await?;
+                core.packs
+                    .force_reinstall_selected(core.settings().pack_version, job)
+                    .await?;
                 core.runtime
                     .ensure(Versions::read(&core.layout.client())?, job)
                     .await?;
@@ -517,6 +579,8 @@ pub fn run() {
             crate::updater::update_launcher,
             get_status,
             prepare_pack_update,
+            list_pack_versions,
+            switch_client_version,
             retry_initialize,
             run_operation,
             cancel_operation,
@@ -529,6 +593,7 @@ pub fn run() {
             open_folder,
             crate::desktop_servers::choose_server_directory,
             crate::desktop_servers::save_server_instance,
+            crate::desktop_servers::select_server_pack_version,
             crate::desktop_servers::remove_server_instance,
             crate::desktop_servers::inspect_server_instance,
             crate::desktop_servers::cancel_server_inspection,

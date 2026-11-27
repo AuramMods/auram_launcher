@@ -67,7 +67,10 @@ pub struct Versions {
 }
 impl Versions {
     pub fn read(client: &Path) -> Result<Self> {
-        let value: Value = storage::read_json(&client.join("mmc-pack.json"))?;
+        Self::read_file(&client.join("mmc-pack.json"))
+    }
+    pub(crate) fn read_file(file: &Path) -> Result<Self> {
+        let value: Value = storage::read_json(file)?;
         let entries = value["components"]
             .as_array()
             .context("Pack components missing")?;

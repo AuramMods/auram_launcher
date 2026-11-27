@@ -6,7 +6,7 @@ pub use adaptive::MAX_CONNECTIONS;
 pub mod local;
 mod plan;
 mod transaction;
-pub use plan::{inspect, DeploymentPlan};
+pub use plan::{inspect, inspect_selected, DeploymentPlan};
 pub use transaction::{apply, recover};
 
 pub async fn read_version(

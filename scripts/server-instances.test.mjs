@@ -7,6 +7,8 @@ test('server actions distinguish unversioned servers, pack updates and exact ins
   assert.equal(deploymentAction({version:'145',commit:''},target).label,'Deploy Update 151');
   assert.equal(deploymentAction({version:'151',commit:''},target).current,true);
   assert.equal(deploymentAction({version:'151',commit:'b'.repeat(40)},target).current,false);
+  assert.equal(deploymentAction({version:'151',commit:'b'.repeat(40)},target).label,'Switch to 151');
+  assert.equal(deploymentAction({version:'173',commit:''},target).label,'Switch to 151');
   assert.equal(deploymentAction({version:'151',commit:target.sha},target).label,'Up to date');
   assert.equal(deploymentAction(null,null).label,'Install Auram first');
 });

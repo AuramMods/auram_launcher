@@ -172,11 +172,20 @@ fn relative_resource(source: &str, default_prefix: &str) -> Result<String> {
     )
 }
 pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
-    job.phase("server-pack", "Server inputs", false);
     let installed = packs
         .installed()?
         .context("Install the client pack before building a server")?;
-    let full = packs.manifest(installed.tag.clone(), job).await?;
+    build_release(packs, runtime, installed.tag, job).await
+}
+
+pub async fn build_release(
+    packs: &Packs,
+    runtime: &Runtime,
+    tag: crate::pack::PackTag,
+    job: &Job,
+) -> Result<()> {
+    job.phase("server-pack", "Server inputs", false);
+    let full = packs.manifest(tag.clone(), job).await?;
     let config: ServerConfig = toml::from_str(&fs::read_to_string(
         packs.file(&full, "server_config.conf", job).await?,
     )?)
@@ -189,7 +198,7 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
         filter_sided_mods(packs, &full, &config, &mut desired, old.as_ref(), job).await?;
     resolve_dependencies(packs, &full, &mut desired, metadata, old.as_ref(), job).await?;
     let payload = desired.clone();
-    let versions = Versions::read(&packs.layout.client())?;
+    let versions = Versions::read_file(&packs.file(&full, "mmc-pack.json", job).await?)?;
     let java = runtime.java(job).await?;
     job.phase("server-forge", "Forge server", false);
     job.progress("server", "Verifying Forge server runtime", 0, 0);
@@ -277,8 +286,8 @@ pub async fn build(packs: &Packs, runtime: &Runtime, job: &Job) -> Result<()> {
     desired.files.extend(imported);
     let version = ServerVersion {
         schema: 1,
-        version: installed.tag.name.clone(),
-        commit: installed.tag.sha.clone(),
+        version: tag.name,
+        commit: tag.sha,
         minecraft: versions.minecraft.clone(),
         forge: versions.forge.clone(),
     };

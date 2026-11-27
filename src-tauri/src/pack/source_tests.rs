@@ -239,6 +239,102 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn exact_release_switch_restores_pack_files_and_keeps_the_pin_at_startup() {
+    let f = Fixture::new().await;
+    let old = f.snapshot(
+        "145",
+        files(&[
+            ("minecraft/mods/old.jar", "old jar"),
+            ("minecraft/config/rules.toml", "old config"),
+            ("minecraft/shaderpacks/old.zip", "old shader"),
+            ("minecraft/scripts/rules.zs", "old script"),
+            ("minecraft/kubejs/server_scripts/rules.js", "old KubeJS"),
+        ]),
+        None,
+        None,
+    );
+    let new = f.snapshot(
+        "173",
+        files(&[
+            ("minecraft/mods/new.jar", "new jar"),
+            ("minecraft/config/rules.toml", "new config"),
+            ("minecraft/shaderpacks/new.zip", "new shader"),
+            ("minecraft/scripts/rules.zs", "new script"),
+            ("minecraft/kubejs/server_scripts/rules.js", "new KubeJS"),
+        ]),
+        None,
+        None,
+    );
+    f.install(&new).await;
+    let client = f.packs.layout.client();
+    storage::atomic_write(
+        &client.join("minecraft/config/rules.toml"),
+        b"local config edit",
+    )
+    .unwrap();
+    storage::atomic_write(
+        &client.join("minecraft/shaderpacks/custom.zip"),
+        b"custom shader",
+    )
+    .unwrap();
+    storage::atomic_write(&client.join("minecraft/saves/world/level.dat"), b"world").unwrap();
+    f.clear_requests();
+    let job = Job::default();
+    let selected = f.packs.release(Some("145"), &job).await.unwrap();
+    assert_eq!(selected, old);
+    f.packs.switch_release(selected, &job).await.unwrap();
+    for (file, content) in [
+        ("mods/old.jar", "old jar"),
+        ("config/rules.toml", "old config"),
+        ("shaderpacks/old.zip", "old shader"),
+        ("shaderpacks/custom.zip", "custom shader"),
+        ("scripts/rules.zs", "old script"),
+        ("kubejs/server_scripts/rules.js", "old KubeJS"),
+        ("saves/world/level.dat", "world"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(client.join("minecraft").join(file)).unwrap(),
+            content
+        );
+    }
+    for path in ["mods/new.jar", "shaderpacks/new.zip"] {
+        assert!(!client.join("minecraft").join(path).exists());
+    }
+    assert!(walkdir::WalkDir::new(f.packs.layout.root.join("backups"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .any(|entry| std::fs::read(entry.path()).unwrap() == b"local config edit"));
+    assert!(f.payloads().iter().all(|path| path.contains(&old.sha)));
+    f.clear_requests();
+    let startup = f.packs.prepare_pinned(&old, &job).await.unwrap();
+    assert_eq!(startup.version.as_deref(), Some("145"));
+    assert!(f.requests().is_empty());
+    f.packs.switch_release(new.clone(), &job).await.unwrap();
+    assert_eq!(f.packs.installed().unwrap().unwrap().tag, new);
+    assert!(
+        f.payloads().is_empty(),
+        "Verified pack bytes should be reused"
+    );
+}
+
+#[tokio::test]
+async fn selector_lists_legacy_tags_in_order_and_reuses_the_cached_list() {
+    let f = Fixture::new().await;
+    f.response(
+        "/api/tags?per_page=100&page=1",
+        json!([
+            {"name":"9"}, {"name":"173"}, {"name":"1.0.7"}, {"name":"19"}, {"name":"notes"}
+        ]),
+    );
+    let job = Job::default();
+    let expected = vec!["173", "19", "9", "1.0.7"];
+    assert_eq!(f.packs.release_names(&job).await.unwrap(), expected);
+    f.state.lock().unwrap().bodies.clear();
+    assert_eq!(f.packs.release_names(&job).await.unwrap(), expected);
+}
+
 // Stage the same versioned source and immutable objects produced by a real
 // server build, without needing Java/Forge in a deterministic transport test.
 async fn stage_server(f: &Fixture, tag: &PackTag) {

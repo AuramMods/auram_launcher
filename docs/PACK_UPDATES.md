@@ -24,13 +24,15 @@ The expected release inventory is cached separately from the instance's ownershi
 
 Incremental updates inspect the affected managed paths. **Repair** inspects the complete selected target, including files untouched by recent releases. Repair can fetch missing content from Git for the same installed version while leaving other files in place.
 
+An explicit client version switch reconciles the selected inventory file by file, including when sparse Git supplies the downloads. It restores tracked configuration, shader packs, mods, scripts, and KubeJS files to the selected release, retains backups of overwritten edits, and removes obsolete tracked paths. Untracked files outside those changed paths remain in place. A pinned launch skips the latest-pack check, and force reinstall uses the pinned version when one is set.
+
 All downloaded files are size/hash checked before activation. Git's blob SHA-1 includes its `blob <length>\0` header. Unsupported symlinks/submodules, unsafe destination names and case/Unicode-normalization collisions fail explicitly. Regular executable modes are applied to private staging copies without modifying shared cache objects.
 
 Full replacement stages `mods`, `config`, `scripts` and `kubejs` on the destination volume before activation. Custom files inside those folders move with the originals to `.auram-backups/<transaction>/original` in the instance. To restore a custom file, close Minecraft or the server and copy the needed file from that backup. Client metadata and other pack paths still follow ordinary ownership rules. Worlds, screenshots, options, resource and shader packs, server properties, EULA and access lists are preserved. The manifest activates last. Interrupted replacements roll back from retained originals.
 
 ## Explicit force reinstall
 
-**Force reinstall** under **Your installation** is a separate destructive operation. Its confirmation names the client directory and warns that all local client files are permanently deleted, including worlds, screenshots, options, resource/shader packs, custom mods, and the installed manifest. It then installs the currently published pack into the empty client instance and verifies its Java/Minecraft/Forge resources. Valid shared cache content is reused instead of downloaded again.
+**Force reinstall** under **Your installation** is a separate destructive operation. Its confirmation names the client directory and warns that all local client files are permanently deleted, including worlds, screenshots, options, resource/shader packs, custom mods, and the installed manifest. It then installs the selected pack version into the empty client instance and verifies its Java/Minecraft/Forge resources. Valid shared cache content is reused instead of downloaded again.
 
 This action retains launcher settings, Microsoft credentials, SFTP connection details, local/remote server data, shared caches, partial downloads, and earlier retained backups. Cancellation or a failed reinstall does not restore deleted client data. If installation fails after deletion, the UI shows the client as uninstalled so **Install Auram** can retry a fresh install.
 

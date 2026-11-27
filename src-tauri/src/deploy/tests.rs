@@ -424,6 +424,58 @@ async fn missing_changelist_route_replaces_custom_configuration_and_retains_back
     assert!(backups.iter().any(|b| b == b"old"));
 }
 
+#[tokio::test]
+async fn downgrade_uses_saved_ownership_and_restores_the_selected_payload() {
+    let (_temp, packs) = packs();
+    let remote = DiskRemote::new();
+    let installed = [
+        ("mods/shared.jar", b"newer".as_slice()),
+        ("mods/new-only.jar", b"new only"),
+        ("config/rules.toml", b"new config"),
+        ("scripts/rules.zs", b"new script"),
+        ("kubejs/server_scripts/rules.js", b"new KubeJS"),
+    ];
+    let newer = payload(&packs, "653", &installed);
+    for (path, bytes) in installed {
+        if path == "mods/shared.jar" {
+            remote.put("mods/shared.jar.client", bytes);
+        } else {
+            remote.put(path, bytes);
+        }
+    }
+    remote.put("config/rules.toml", b"local edit");
+    remote.put("config/custom.toml", b"untracked");
+    remote.put("world/level.dat", b"world");
+    baseline(&remote, &newer, "653");
+    let target = [
+        ("mods/shared.jar", b"older".as_slice()),
+        ("mods/old-only.jar", b"old only"),
+        ("config/rules.toml", b"old config"),
+        ("scripts/rules.zs", b"old script"),
+        ("kubejs/server_scripts/rules.js", b"old KubeJS"),
+    ];
+    payload(&packs, "651", &target);
+    let job = Job::default();
+    let plan = inspect(&packs, &remote, &job).await.unwrap();
+    assert_eq!(plan.strategy, "versionDiff");
+    assert_eq!(plan.replacements, 0);
+    assert_eq!(plan.removals, 1);
+    apply(&packs, &remote, plan, &job).await.unwrap();
+    for (path, bytes) in target {
+        let path = if path == "mods/shared.jar" {
+            "mods/shared.jar.client"
+        } else {
+            path
+        };
+        assert_eq!(remote.get(path).as_deref(), Some(bytes));
+    }
+    assert!(remote.get("mods/shared.jar").is_none());
+    assert!(remote.get("mods/new-only.jar").is_none());
+    assert_eq!(remote.get("config/custom.toml").unwrap(), b"untracked");
+    assert_eq!(remote.get("world/level.dat").unwrap(), b"world");
+    assert_eq!(read_version(&remote).await.unwrap().unwrap().version, "651");
+}
+
 async fn transaction_fixture() -> (tempfile::TempDir, Packs, DiskRemote, DeploymentPlan) {
     let (t, packs) = packs();
     let remote = DiskRemote::new();

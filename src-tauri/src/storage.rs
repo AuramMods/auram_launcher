@@ -356,6 +356,7 @@ pub fn copy_missing(source: &Path, destination: &Path, exclude: &[&str]) -> Resu
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub schema: u32,
+    pub pack_version: Option<crate::pack::PackTag>,
     pub memory: crate::launch_options::MemoryPreferences,
     pub microsoft_client_id: String,
     pub browser_login: bool,
@@ -364,6 +365,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             schema: 1,
+            pack_version: None,
             memory: Default::default(),
             microsoft_client_id: "cf95d5d7-7830-4ad4-a70e-d54e50e80b40".into(),
             browser_login: false,

@@ -21,7 +21,7 @@
 .account-menu-item[data-disabled]{opacity:.5;pointer-events:none}
 .account-menu-separator{height:1px;background:var(--border);margin:4px}
 .installation-card{margin-top:18px}.installation-card [data-slot=card]{gap:16px}
-.installation-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.installation-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(135px,100%),1fr));gap:10px}
 .installation-actions .installation-tile{height:auto;min-height:106px;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:14px;padding:16px;text-align:left;white-space:normal}
 .installation-tile>svg{color:#b7a3cf}.installation-tile-copy{display:grid;gap:4px;font-size:11px;line-height:1.4}.installation-tile-copy small{font-size:10px;font-weight:400;color:var(--muted-foreground)}
 @media(max-width:930px){.installation-actions{gap:8px}.installation-actions .installation-tile{padding:12px}.installation-tile-copy{font-size:10px}.installation-tile-copy small{font-size:9px}}

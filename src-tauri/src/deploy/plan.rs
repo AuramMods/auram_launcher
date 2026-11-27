@@ -197,11 +197,14 @@ async fn patch(
     plan: &mut DeploymentPlan,
     remote: &impl Remote,
     previous: Option<&Baseline>,
-    base: &Manifest,
+    base: Option<&Manifest>,
     job: &Job,
 ) -> Result<()> {
-    let old = previous.map(|b| b.files.clone()).unwrap_or_else(|| {
-        base.files
+    let old = if let Some(previous) = previous {
+        previous.files.clone()
+    } else {
+        base.context("Missing deployed pack inventory")?
+            .files
             .iter()
             .filter_map(|(source, file)| {
                 let path = source.strip_prefix("minecraft/").unwrap_or(source);
@@ -217,7 +220,7 @@ async fn patch(
                 ))
             })
             .collect()
-    });
+    };
     let obsolete = old
         .iter()
         .filter(|(key, _)| !plan.baseline.files.contains_key(*key))
@@ -315,6 +318,44 @@ async fn patch(
 }
 
 pub async fn inspect(packs: &Packs, remote: &impl Remote, job: &Job) -> Result<DeploymentPlan> {
+    inspect_selected(packs, remote, false, job).await
+}
+
+async fn previous_baseline(
+    remote: &impl Remote,
+    version: &ServerVersion,
+    plan: &mut DeploymentPlan,
+    job: &Job,
+) -> Result<Option<Baseline>> {
+    match super::connection::wait(
+        job,
+        "reading deployment ownership",
+        std::time::Duration::from_secs(30),
+        optional_json::<Baseline>(remote, ".auram-deploy.json"),
+    )
+    .await
+    {
+        Ok(value) => Ok(value.filter(|b| {
+            validate_baseline(b).is_ok()
+                && b.version.version == version.version
+                && (version.commit.is_empty() || b.version.commit == version.commit)
+        })),
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            plan.notes.push(
+                "Invalid ownership metadata ignored; using the released server inventory.".into(),
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn inspect_selected(
+    packs: &Packs,
+    remote: &impl Remote,
+    explicit: bool,
+    job: &Job,
+) -> Result<DeploymentPlan> {
     job.phase("sftp-plan", "Plan server update", false);
     job.progress("sftp-plan", "Reading the remote Auram version", 0, 0);
     let (payload, target_version) = super::built_payload(packs)?;
@@ -370,6 +411,37 @@ pub async fn inspect(packs: &Packs, remote: &impl Remote, job: &Job) -> Result<D
             plan.notes.push("The server version already matches the built pack. No remote payload files were read.".into());
             return Ok(plan);
         }
+        let current = crate::pack::version(&version.version);
+        let target = crate::pack::version(&target_version.version);
+        if explicit
+            || current
+                .zip(target)
+                .is_some_and(|(current, target)| current >= target)
+        {
+            plan.strategy = "versionDiff".into();
+            job.progress(
+                "sftp-plan",
+                "Comparing the deployed and selected pack versions",
+                0,
+                0,
+            );
+            let previous = previous_baseline(remote, version, &mut plan, job).await?;
+            let base = if previous.is_some() {
+                None
+            } else {
+                Some(
+                    super::connection::wait(
+                        job,
+                        "resolving the deployed version inventory",
+                        std::time::Duration::from_secs(180),
+                        packs.server_baseline(&version.version, &version.commit, job),
+                    )
+                    .await?,
+                )
+            };
+            patch(&mut plan, remote, previous.as_ref(), base.as_ref(), job).await?;
+            return Ok(plan);
+        }
         job.progress(
             "sftp-plan",
             "Resolving the server version and validated changelist route",
@@ -386,26 +458,8 @@ pub async fn inspect(packs: &Packs, remote: &impl Remote, job: &Job) -> Result<D
         {
             Ok((base, _changes, count)) => {
                 plan.changelists = count;
-                let previous = match super::connection::wait(
-                    job,
-                    "reading deployment ownership",
-                    std::time::Duration::from_secs(30),
-                    optional_json::<Baseline>(remote, ".auram-deploy.json"),
-                )
-                .await
-                {
-                    Ok(value) => value.filter(|b| {
-                        validate_baseline(b).is_ok()
-                            && b.version.version == version.version
-                            && (version.commit.is_empty() || b.version.commit == version.commit)
-                    }),
-                    Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
-                        plan.notes.push("Invalid ownership metadata ignored; applying the validated version route.".into());
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-                patch(&mut plan, remote, previous.as_ref(), &base, job).await?;
+                let previous = previous_baseline(remote, version, &mut plan, job).await?;
+                patch(&mut plan, remote, previous.as_ref(), Some(&base), job).await?;
                 return Ok(plan);
             }
             Err(error) => {

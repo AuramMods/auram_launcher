@@ -173,6 +173,9 @@ impl<'a> Source<'a> {
         if let Some(catalog) = super::distribution_source::named(self.packs, name, job).await? {
             return Ok(catalog.target);
         }
+        if let Some(tag) = super::distribution_source::cached_tag(self.packs, name)? {
+            return Ok(tag);
+        }
         let reference: Ref = self.api(&format!("/git/ref/tags/{name}"), job).await?;
         let mut object = reference.object;
         let mut seen = BTreeSet::new();
@@ -229,7 +232,17 @@ impl<'a> Source<'a> {
                     == Some(reqwest::StatusCode::NOT_FOUND) => {}
             Err(error) => return Err(error),
         }
-        // Compatibility with releases predating auram.json; do not require GitHub Release objects.
+        let tags = self.tags(job).await?;
+        self.resolve(
+            tags.first()
+                .context("The pack repository has no version tags")?,
+            job,
+        )
+        .await
+    }
+
+    // Compatibility with releases predating auram.json; do not require GitHub Release objects.
+    pub(super) async fn tags(&self, job: &Job) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct Tag {
             name: String,
@@ -247,14 +260,7 @@ impl<'a> Source<'a> {
         }
         tags.retain(|t| version(&t.name).is_some());
         tags.sort_by(|a, b| version(&b.name).cmp(&version(&a.name)));
-        self.resolve(
-            &tags
-                .first()
-                .context("The pack repository has no version tags")?
-                .name,
-            job,
-        )
-        .await
+        Ok(tags.into_iter().map(|tag| tag.name).collect())
     }
     async fn tree(&self, sha: &str, recursive: bool, job: &Job) -> Result<Tree> {
         oid(sha)?;

@@ -22,7 +22,7 @@ mod system_git;
 pub use source::Repository;
 use source::{Selection, Source, CLIENT_POLICY};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackTag {
     pub name: String,
     pub sha: String,
@@ -71,6 +71,7 @@ struct InspectedFile {
 #[derive(Clone, Copy)]
 enum ReconcileScope {
     Client,
+    ClientVersion,
     Server,
     Runtime,
 }
@@ -212,6 +213,81 @@ impl Packs {
     pub async fn latest(&self) -> Result<PackTag> {
         self.source().discover(&Job::default()).await
     }
+    pub async fn release(&self, name: Option<&str>, job: &Job) -> Result<PackTag> {
+        match name {
+            Some(name) => self.source().resolve(name, job).await,
+            None => self.source().discover(job).await,
+        }
+    }
+    pub async fn release_names(&self, job: &Job) -> Result<Vec<String>> {
+        let mut releases = BTreeSet::new();
+        let cache = self.layout.state("pack-release-tags.json");
+        let source = self.source();
+        let (catalog, tags) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                distribution_source::latest(self, job)
+            ),
+            tokio::time::timeout(std::time::Duration::from_secs(10), source.tags(job)),
+        );
+        if let Ok(Ok(Some(catalog))) = &catalog {
+            releases.insert(catalog.target.name.clone());
+            releases.extend(
+                catalog
+                    .history
+                    .iter()
+                    .filter_map(|link| link.base.as_ref().map(|tag| tag.name.clone())),
+            );
+        }
+        if let Ok(Ok(tags)) = &tags {
+            releases.extend(tags.iter().cloned());
+        } else if let Some(cached) = storage::read_optional::<Vec<String>>(&cache)? {
+            releases.extend(cached);
+        }
+        if let Some(installed) = self.installed()? {
+            releases.insert(installed.tag.name);
+        }
+        let mut names = releases
+            .into_iter()
+            .filter(|name| version(name).is_some())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            catalog??;
+            tags??;
+            bail!("No Auram release tags are available");
+        }
+        names.sort_by_cached_key(|name| std::cmp::Reverse(version(name)));
+        if tags.is_ok_and(|result| result.is_ok()) {
+            storage::write_json(&cache, &names)?;
+        }
+        Ok(names)
+    }
+    pub async fn release_versions(
+        &self,
+        tag: &PackTag,
+        job: &Job,
+    ) -> Result<crate::runtime::Versions> {
+        let manifest = self.manifest(tag.clone(), job).await?;
+        let path = self.file(&manifest, "mmc-pack.json", job).await?;
+        crate::runtime::Versions::read_file(&path)
+    }
+    pub(crate) async fn server_baseline(
+        &self,
+        version: &str,
+        commit: &str,
+        job: &Job,
+    ) -> Result<Manifest> {
+        let tag = self.release(Some(version), job).await?;
+        if !commit.is_empty() && tag.sha != commit {
+            bail!("Deployed server commit disagrees with its pack tag");
+        }
+        let source = self.manifest(tag, job).await?;
+        let config: crate::server::ServerConfig = toml::from_str(
+            &tokio::fs::read_to_string(self.file(&source, "server_config.conf", job).await?)
+                .await?,
+        )?;
+        config.manifest(&source)
+    }
     pub async fn manifest(&self, tag: PackTag, job: &Job) -> Result<Manifest> {
         if let Some(catalog) = distribution_source::catalog(self, &tag, job).await? {
             return Ok(catalog.manifest());
@@ -289,8 +365,15 @@ impl Packs {
         {
             return Ok(item.target);
         }
-        distribution_source::prepare(self, manifest, std::slice::from_ref(&item), None, job)
-            .await?;
+        distribution_source::prepare(
+            self,
+            manifest,
+            std::slice::from_ref(&item),
+            None,
+            false,
+            job,
+        )
+        .await?;
         self.net.get(&item, job).await?;
         Ok(item.target)
     }
@@ -304,7 +387,7 @@ impl Packs {
         if downloads.is_empty() {
             return Ok(());
         }
-        distribution_source::prepare(self, manifest, &downloads, baseline, job).await?;
+        distribution_source::prepare(self, manifest, &downloads, baseline, false, job).await?;
         self.net
             .many_named(downloads, job, "Verified pack source files")
             .await
@@ -369,6 +452,23 @@ impl Packs {
         self.prepare_installed_with_timeout(job, std::time::Duration::from_secs(20))
             .await
     }
+    pub async fn prepare_pinned(
+        &self,
+        tag: &PackTag,
+        job: &Job,
+    ) -> Result<crate::startup::PackPreparation> {
+        self.recover_scoped_pack(&self.layout.client()).await?;
+        if self
+            .installed()?
+            .is_none_or(|installed| installed.tag != *tag)
+        {
+            self.switch_release(tag.clone(), job).await?;
+        }
+        Ok(crate::startup::PackPreparation::ready(&tag.name))
+    }
+    pub async fn switch_release(&self, tag: PackTag, job: &Job) -> Result<Manifest> {
+        self.apply_client(false, job, None, Some(tag)).await
+    }
     async fn prepare_installed_with_timeout(
         &self,
         job: &Job,
@@ -413,6 +513,16 @@ impl Packs {
         job: &Job,
         discovery_timeout: Option<std::time::Duration>,
     ) -> Result<Manifest> {
+        self.apply_client(repair, job, discovery_timeout, None)
+            .await
+    }
+    async fn apply_client(
+        &self,
+        repair: bool,
+        job: &Job,
+        discovery_timeout: Option<std::time::Duration>,
+        explicit: Option<PackTag>,
+    ) -> Result<Manifest> {
         let layout = self.layout.clone();
         job.phase("pack-plan", "Read pack", false);
         let recover_job = job.clone();
@@ -424,7 +534,10 @@ impl Packs {
         })
         .await?;
         let old = self.installed()?;
-        let tag = if repair {
+        let switching = explicit.is_some();
+        let tag = if let Some(tag) = explicit {
+            tag
+        } else if repair {
             old.as_ref()
                 .context("Install the pack before repairing it")?
                 .tag
@@ -438,7 +551,7 @@ impl Packs {
         };
         let (desired, changed) = self
             .source()
-            .client_target(tag, old.as_ref(), repair, job)
+            .client_target(tag, old.as_ref(), repair || switching, job)
             .await?;
         self.reconcile_plan(
             &self.layout.client(),
@@ -446,13 +559,24 @@ impl Packs {
             old.as_ref(),
             &desired,
             job,
-            ReconcileScope::Client,
+            if switching {
+                ReconcileScope::ClientVersion
+            } else {
+                ReconcileScope::Client
+            },
             changed.as_ref(),
             ("pack-files", "pack-apply"),
         )
         .await
     }
     pub async fn force_reinstall(&self, job: &Job) -> Result<Manifest> {
+        self.force_reinstall_selected(None, job).await
+    }
+    pub async fn force_reinstall_selected(
+        &self,
+        tag: Option<PackTag>,
+        job: &Job,
+    ) -> Result<Manifest> {
         job.check()?;
         job.phase("client-reset", "Delete client pack", false);
         job.progress(
@@ -469,7 +593,10 @@ impl Packs {
         })
         .await??;
         job.check()?;
-        self.update(false, job).await
+        match tag {
+            Some(tag) => self.switch_release(tag, job).await,
+            None => self.update(false, job).await,
+        }
     }
     pub async fn reconcile(
         &self,
@@ -532,7 +659,7 @@ impl Packs {
         touched: Option<&BTreeSet<String>>,
         phases: (&str, &str),
     ) -> Result<Manifest> {
-        let server = !matches!(scope, ReconcileScope::Client);
+        let server = matches!(scope, ReconcileScope::Server | ReconcileScope::Runtime);
         let recovered = self.recover_scoped_pack(root).await?;
         let recovered_baseline = if recovered {
             storage::read_optional::<Manifest>(&root.join(".auram-manifest.json"))?
@@ -567,7 +694,7 @@ impl Packs {
                 inspect_old.as_ref(),
                 &inspect_desired,
                 &inspect_job,
-                server,
+                scope,
                 inspect_touched.as_ref(),
             )
         })
@@ -580,9 +707,18 @@ impl Packs {
         let prepared = if matches!(scope, ReconcileScope::Runtime) {
             distribution_source::Prepared::Legacy
         } else {
-            distribution_source::prepare(self, desired, &downloads, old, job).await?
+            distribution_source::prepare(
+                self,
+                desired,
+                &downloads,
+                old,
+                matches!(scope, ReconcileScope::ClientVersion),
+                job,
+            )
+            .await?
         };
-        let replace = prepared == distribution_source::Prepared::Sparse
+        let replace = !matches!(scope, ReconcileScope::ClientVersion)
+            && prepared == distribution_source::Prepared::Sparse
             && old.is_none_or(|m| {
                 m.tag.sha != desired.tag.sha || m.schema != 1 || m.policy != desired.policy
             });
@@ -674,9 +810,13 @@ impl Packs {
         old: Option<&Manifest>,
         desired: &Manifest,
         job: &Job,
-        server: bool,
+        scope: ReconcileScope,
         touched: Option<&BTreeSet<String>>,
     ) -> Result<Reconciliation> {
+        let server = matches!(scope, ReconcileScope::Server | ReconcileScope::Runtime);
+        let restore = |path: &str| {
+            matches!(scope, ReconcileScope::ClientVersion) && versioned_client_path(path)
+        };
         source::validate_inventory(desired)?;
         storage::recover(root, transaction)?;
         let mut next = desired.clone();
@@ -693,7 +833,8 @@ impl Packs {
                 old.files
                     .iter()
                     .filter(|(path, _)| {
-                        !desired.files.contains_key(*path) && !mutable(path, server)
+                        !desired.files.contains_key(*path)
+                            && (!mutable(path, server) || restore(path))
                     })
                     .collect::<Vec<_>>()
             })
@@ -769,8 +910,9 @@ impl Packs {
                                 .any(|prefix| relative.starts_with(prefix))
                             && !previous_valid;
                         if modified_server_config
-                            || mutable(relative, server)
-                            || (previous.is_none() && old.is_some())
+                            || (!restore(relative)
+                                && (mutable(relative, server)
+                                    || (previous.is_none() && old.is_some())))
                         {
                             if let Some(previous) = previous {
                                 part.baseline = Some((relative.clone(), previous.clone()));
@@ -842,7 +984,7 @@ impl Packs {
         })
     }
 }
-fn version(raw: &str) -> Option<semver::Version> {
+pub(crate) fn version(raw: &str) -> Option<semver::Version> {
     let raw = raw.trim_start_matches('v');
     let mut components = raw.split('-').next()?.split('.').count();
     let mut value = raw.to_owned();
@@ -852,6 +994,19 @@ fn version(raw: &str) -> Option<semver::Version> {
         components += 1;
     }
     semver::Version::parse(&value).ok()
+}
+fn versioned_client_path(path: &str) -> bool {
+    let path = path.strip_prefix("minecraft/").unwrap_or(path);
+    [
+        "mods/",
+        "config/",
+        "defaultconfigs/",
+        "shaderpacks/",
+        "scripts/",
+        "kubejs/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 fn runtime_or_userdata(path: &str) -> bool {
     let path = path.strip_prefix("minecraft/").unwrap_or("");

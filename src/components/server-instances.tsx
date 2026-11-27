@@ -4,6 +4,7 @@ import {ArrowUpFromLine,FolderOpen,HardDrive,LoaderCircle,Play,Plus,RefreshCw,Se
 import {Button} from './ui/button';
 import {Input} from './ui/input';
 import {Label} from './ui/label';
+import {PackVersionPicker} from './pack-version-picker';
 import {Dialog,DialogContent,DialogHeader,DialogTitle,DialogDescription,DialogFooter} from './ui/dialog';
 import {deploymentAction,emptyConnection,maximumServerMemory,minimumServerMemory,serverAddress,type LocalServerAction,type LocalServerStatus,type ServerDraft,type ServerInspection,type ServerInstance,type SftpSettings} from '../lib/server-instances';
 
@@ -21,6 +22,7 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
   const [inspection,setInspection]=React.useState<ServerInspection|null>(null);
   const [pending,setPending]=React.useState(false);
   const [detailError,setDetailError]=React.useState('');
+  const [versionPicker,setVersionPicker]=React.useState(false);
   const request=React.useRef(0);
   const selected=React.useRef<string|null>(null);
   const mounted=React.useRef(true);
@@ -40,7 +42,7 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
   const savedActive=!!saved&&serverActive(saved.id);
   const dirty=JSON.stringify(draft)!==baseline||!!password||!!passphrase;
   const disabled=busy||pending;
-  function close(value:boolean) {setOpen(value);if(!value){request.current++;selected.current=null;cancelInspection();setPending(false);setPassword('');setPassphrase('');}}
+  function close(value:boolean) {setOpen(value);if(!value){request.current++;selected.current=null;cancelInspection();setPending(false);setVersionPicker(false);setPassword('');setPassphrase('');}}
   function edit(next:ServerDraft) {request.current++;setDraft(next);setInspection(null);setDetailError('');}
   function connection<K extends keyof SftpSettings>(key:K,value:SftpSettings[K]) {
     if(draft.target.kind==='sftp')edit({...draft,target:{kind:'sftp',connection:{...draft.target.connection,[key]:value}}});
@@ -112,28 +114,52 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
     catch(error){onError(String(error));}
     finally{await refresh().catch(()=>{});working(false);}
   }
+  async function selectVersion(id:string,version:string|null) {
+    working(true);
+    try {
+      await invoke('select_server_pack_version',{id,version});
+      await refresh();
+      setVersionPicker(false);
+    } catch(error) {
+      onError(String(error));
+    } finally {
+      working(false);
+    }
+  }
   const version=inspection&&!inspection.hostKey?inspection.version:saved?.knownVersion??null;
-  const action=deploymentAction(version,targetVersion);
+  const destinationVersion=saved?.packVersion??targetVersion;
+  const action=deploymentAction(version,destinationVersion);
   const recover=!!inspection?.recoveryRequired;
   const canSave=!!draft.name.trim()&&(draft.target.kind==='local'?!!draft.target.directory:!!draft.target.connection.host&&!!draft.target.connection.username);
   return <>
-    <div className="page-heading server-heading"><div><h1>Servers</h1><p>Deploy Auram {targetVersion?.name??'from your installed pack'} to a local folder or an SFTP server.</p></div><Button onClick={add} disabled={disabled} aria-label="Add server"><Plus/>Add server</Button></div>
+    <div className="page-heading server-heading"><div><h1>Servers</h1><p>Deploy Auram to a local folder or an SFTP server.</p></div><Button onClick={add} disabled={disabled} aria-label="Add server"><Plus/>Add server</Button></div>
     {servers.length===0?<div className="servers-empty"><Server/><h2>No servers yet</h2><p>Add a local directory or connect your hosted server over SFTP.</p><Button variant="outline" onClick={add} disabled={disabled}><Plus/>Add your first server</Button></div>:<ul className="server-list" aria-label="Saved servers">{servers.map(server=>{
-      const primary=deploymentAction(server.knownVersion,targetVersion);
+      const deploymentTarget=server.packVersion??targetVersion;
+      const primary=deploymentAction(server.knownVersion,deploymentTarget);
       const Icon=server.target.kind==='local'?HardDrive:Wifi;
-      return <li className="server-row" key={server.id}><button className="server-open" onClick={()=>details(server)} disabled={disabled} aria-label={`Open ${server.name}`}><span className="server-icon"><Icon size={20}/></span><span className="server-identity"><strong>{server.name}</strong><span className="server-address">{serverAddress(server.target)}</span><span className="server-version">{server.knownVersion?`Auram ${server.knownVersion.version}`:'Unknown version'}{server.lastError&&<span className="server-check-error"> · Last check failed</span>}</span></span></button><div className="server-row-actions">
+      return <li className="server-row" key={server.id}><button className="server-open" onClick={()=>details(server)} disabled={disabled} aria-label={`Open ${server.name}`}><span className="server-icon"><Icon size={20}/></span><span className="server-identity"><strong>{server.name}</strong><span className="server-address">{serverAddress(server.target)}</span><span className="server-version">{server.knownVersion?`Auram ${server.knownVersion.version}`:'Unknown version'}{server.packVersion&&` · Pinned to ${server.packVersion.name}`}{server.lastError&&<span className="server-check-error"> · Last check failed</span>}</span></span></button><div className="server-row-actions">
         {server.target.kind==='local'&&(server.knownVersion||serverActive(server.id))&&
           <Button variant={primary.current?'default':'outline'} disabled={disabled&&!serverActive(server.id)} onClick={()=>startOrOpen(server)}
             aria-label={`${serverActive(server.id)?'Open console':'Start server'} · ${server.name}`}>
             {serverActive(server.id)?<><Terminal/>Console</>:<><Play/>Start server</>}
           </Button>}
-        <Button className="server-deploy" variant={primary.current?'outline':'default'} disabled={disabled||clientRunning||serverActive(server.id)||!targetVersion||primary.current} onClick={()=>void deploy(server)} aria-label={`${primary.label} · ${server.name}`}><ArrowUpFromLine/>{primary.label}</Button></div></li>;
+        <Button className="server-deploy" variant={primary.current?'outline':'default'} disabled={disabled||clientRunning||serverActive(server.id)||!deploymentTarget||primary.current} onClick={()=>void deploy(server)} aria-label={`${primary.label} · ${server.name}`}><ArrowUpFromLine/>{primary.label}</Button></div></li>;
     })}</ul>}
     <Dialog open={open} onOpenChange={close}><DialogContent className="server-dialog sm:max-w-xl"><DialogHeader><DialogTitle>{draft.id?draft.name:'Add server'}</DialogTitle><DialogDescription>{draft.id?'Manage this server and its deployment.':'Choose where to create or update an Auram server.'}</DialogDescription></DialogHeader>
       <div className="server-dialog-body">
         {!draft.id&&<div className="server-types" role="group" aria-label="Server location"><Button variant={draft.target.kind==='local'?'secondary':'outline'} aria-pressed={draft.target.kind==='local'} disabled={disabled} onClick={()=>edit(newDraft())}><HardDrive/>Local directory</Button><Button variant={draft.target.kind==='sftp'?'secondary':'outline'} aria-pressed={draft.target.kind==='sftp'} disabled={disabled} onClick={()=>edit({id:null,name:'SFTP server',target:{kind:'sftp',connection:emptyConnection()},memoryGib:minimumServerMemory})}><Wifi/>SFTP</Button></div>}
         {draft.id&&<div className="server-version-card" aria-live="polite"><span>CURRENT SERVER VERSION</span><strong>{pending?<><LoaderCircle className="animate-spin" size={17}/>Checking server…</>:version?`Auram ${version.version}`:'Unknown version'}</strong><p>{pending?'Reading auram.json from this destination…':dirty?'Save changes to check this destination.':detailError?'Version check failed. The last known version is shown above.':inspection&&!inspection.hostKey?(inspection.version?'Read from the server’s auram.json.':'No recognized auram.json found. A full deploy will replace the pack directories.'):'The version has not been checked yet.'}</p></div>}
         {detailError&&<div className="server-dialog-error" role="alert"><p>{detailError}</p>{draft.id&&<Button variant="outline" size="sm" disabled={disabled||dirty} onClick={()=>void inspect(draft.id!)}><RefreshCw/>Retry connection</Button>}</div>}
+        {saved&&<div className="mb-4 grid gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">Target: {saved.packVersion?`Auram ${saved.packVersion.name} · Pinned`:destinationVersion?`Auram ${destinationVersion.name} · Following client`:'Following client'}</p>
+            <Button variant="outline" size="sm" aria-expanded={versionPicker} disabled={disabled} onClick={()=>setVersionPicker(value=>!value)}>
+              {versionPicker?'Hide versions':'Change version'}
+            </Button>
+          </div>
+          {versionPicker&&<PackVersionPicker installed={version?.version} pinned={saved.packVersion?.name} followLabel="Follow client version"
+            disabled={disabled} onSelect={value=>void selectVersion(saved.id,value)}/>}
+        </div>}
         {inspection?.hostKey&&<div className="sftp-preview"><div className="section-title"><ShieldCheck/>{inspection.hostKey.changed?'SSH host key changed':'Verify SSH host key'}</div><p className="sftp-help">Compare this fingerprint with your server provider. Credentials are sent only after the host key is trusted.</p><code className="sftp-fingerprint">{inspection.hostKey.fingerprint}</code><Button className="mt-3" variant="secondary" disabled={disabled} onClick={()=>void inspect(draft.id!,inspection.hostKey!.fingerprint)}>Trust key & connect</Button></div>}
         <details className="server-configuration" open={draft.id?undefined:true}><summary>{draft.id?'Server settings':'Connection details'}</summary><div className="server-form">
           <div className="server-form-wide"><Label htmlFor="server-name">Name</Label><Input id="server-name" value={draft.name} disabled={disabled} onChange={event=>edit({...draft,name:event.target.value})}/></div>
@@ -157,7 +183,7 @@ export function ServerInstances({servers,targetVersion,busy,clientRunning,localS
         </div></details>
         {draft.id&&<><p className="sftp-help">Stop the server before deploying. {draft.target.kind==='sftp'?'Only mods, scripts, config and kubejs are synced. Worlds, properties and runtime files stay on the host.':'Java 17, Forge and start scripts are prepared automatically. Worlds, properties and access lists are preserved.'} If there’s no usable changelist route, the four pack directories are replaced with backups.</p>{recover&&<p className="sftp-help">An interrupted or active deployment owns the server lock. Recover only after the other deployment has stopped.</p>}<div className="server-detail-actions">{draft.target.kind==='local'&&<Button variant="outline" size="sm" disabled={disabled} onClick={()=>void invoke('open_server_instance',{id:draft.id}).catch(error=>setDetailError(String(error)))}><FolderOpen/>Open folder</Button>}<Button variant="ghost" size="sm" disabled={disabled||dirty} onClick={()=>void inspect(draft.id!)}><RefreshCw/>Check version</Button><Button variant="ghost" size="sm" disabled={disabled||savedActive} onClick={()=>void remove()}><Trash2/>Remove from list</Button></div><p className="server-remove-note">Removing a saved server leaves its files in place.</p></>}
       </div>
-      <DialogFooter><Button variant="ghost" onClick={()=>close(false)}>Close</Button>{!draft.id?<Button disabled={disabled||!canSave} onClick={()=>void save()}><Plus/>Add server</Button>:<>{dirty&&<Button variant="outline" disabled={disabled||!canSave} onClick={()=>void save()}>Save changes</Button>}<Button disabled={disabled||clientRunning||savedActive||dirty||!!detailError||!!inspection?.hostKey||!inspection||(!recover&&(!targetVersion||action.current))} onClick={()=>{if(saved)void deploy(saved,recover);}}><ArrowUpFromLine/>{recover?'Recover deployment':action.label}</Button>
+      <DialogFooter><Button variant="ghost" onClick={()=>close(false)}>Close</Button>{!draft.id?<Button disabled={disabled||!canSave} onClick={()=>void save()}><Plus/>Add server</Button>:<>{dirty&&<Button variant="outline" disabled={disabled||!canSave} onClick={()=>void save()}>Save changes</Button>}<Button disabled={disabled||clientRunning||savedActive||dirty||!!detailError||!!inspection?.hostKey||!inspection||(!recover&&(!destinationVersion||action.current))} onClick={()=>{if(saved)void deploy(saved,recover);}}><ArrowUpFromLine/>{recover?'Recover deployment':action.label}</Button>
         {saved?.target.kind==='local'&&(version||savedActive)&&
           <Button variant={action.current?'default':'outline'} disabled={disabled||dirty||recover||!!detailError} onClick={()=>startOrOpen(saved)}>
             {savedActive?<><Terminal/>Open console</>:<><Play/>Start server</>}

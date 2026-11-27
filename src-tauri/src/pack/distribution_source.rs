@@ -161,8 +161,26 @@ pub(super) async fn catalog(packs: &Packs, tag: &PackTag, job: &Job) -> Result<O
         }
     } else if cached.is_some() {
         bail!("Cached pack signature is invalid and no verified replacement is available");
+    } else if let Some(catalog) = cached_latest(packs)?.and_then(|latest| latest.at(tag)) {
+        catalog.validate()?;
+        remember(packs, &catalog);
+        return Ok(Some(catalog));
     }
     Ok(remote)
+}
+
+fn cached_latest(packs: &Packs) -> Result<Option<Catalog>> {
+    storage::read_optional::<Envelope>(&packs.layout.state("pack-distribution-latest.json"))?
+        .map(|envelope| verified(packs, &envelope))
+        .transpose()
+}
+
+pub(super) fn cached_tag(packs: &Packs, name: &str) -> Result<Option<PackTag>> {
+    Ok(cached_latest(packs)?.and_then(|catalog| {
+        std::iter::once(catalog.target)
+            .chain(catalog.history.into_iter().filter_map(|link| link.base))
+            .find(|tag| tag.name == name)
+    }))
 }
 
 pub(super) fn selection(catalog: &Catalog) -> Result<super::source::Selection> {
@@ -410,6 +428,7 @@ pub(super) async fn prepare(
     manifest: &Manifest,
     downloads: &[Download],
     old: Option<&Manifest>,
+    explicit: bool,
     job: &Job,
 ) -> Result<Prepared> {
     let Some(catalog) = catalog(packs, &manifest.tag, job).await? else {
@@ -459,7 +478,10 @@ pub(super) async fn prepare(
             required += 1;
         }
     }
-    if route && complete && required <= super::distribution::policy().maximum_update_bundles {
+    if (route || explicit && old.is_some())
+        && complete
+        && required <= super::distribution::policy().maximum_update_bundles
+    {
         job.detail(
             "pack-files",
             format!("Updating through {required} partial pack bundle(s)"),

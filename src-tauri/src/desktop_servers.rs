@@ -98,6 +98,34 @@ pub async fn save_server_instance(
     result.map_err(|e| format!("Save server: {e:#}"))
 }
 #[tauri::command]
+pub async fn select_server_pack_version(
+    id: String,
+    version: Option<String>,
+    backend: tauri::State<'_, Backend>,
+) -> Result<(), String> {
+    let core = backend.core()?;
+    let lease = core
+        .jobs
+        .begin("Selecting server pack version", &[], Arc::new(|_| {}))
+        .map_err(|error| error.to_string())?;
+    let result = async {
+        let mut registry = Registry::load(&core.layout)?;
+        let mut instance = registry.get(&id)?;
+        instance.pack_version = match version {
+            Some(version) => Some(core.packs.release(Some(&version), &lease.job).await?),
+            None => None,
+        };
+        registry.put(instance);
+        registry.write(&core.layout)
+    }
+    .await;
+    lease
+        .job
+        .finish(result.as_ref().err().map(|error| format!("{error:#}")));
+    result.map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
 pub async fn remove_server_instance(
     id: String,
     backend: tauri::State<'_, Backend>,
@@ -300,6 +328,7 @@ pub async fn deploy_server_instance(
             bail!("Close Minecraft before preparing a server deployment");
         }
         let instance = Registry::load(&core.layout)?.get(&id)?;
+        let explicit = instance.pack_version.is_some();
         if let Target::Local { directory } = &instance.target {
             let root = server_instances::local_directory(&core.layout, directory)?;
             if core.local_servers.uses(&root) {
@@ -307,7 +336,11 @@ pub async fn deploy_server_instance(
             }
         }
         if !recover_only {
-            server_instances::prepare_payload(&core.packs, &core.runtime, job).await?;
+            if let Some(tag) = instance.pack_version.clone() {
+                crate::server::build_release(&core.packs, &core.runtime, tag, job).await?;
+            } else {
+                server_instances::prepare_payload(&core.packs, &core.runtime, job).await?;
+            }
         }
         let version = match &instance.target {
             Target::Local { directory } => {
@@ -317,7 +350,15 @@ pub async fn deploy_server_instance(
                     deploy::recover(&remote, job).await?;
                     deploy::read_version(&remote).await?
                 } else {
-                    Some(server_instances::deploy_local(&core.packs, directory, job).await?)
+                    Some(
+                        server_instances::deploy_local_selected(
+                            &core.packs,
+                            directory,
+                            explicit,
+                            job,
+                        )
+                        .await?,
+                    )
                 }
             }
             Target::Sftp { connection } => {
@@ -333,7 +374,15 @@ pub async fn deploy_server_instance(
                         deploy::recover(&remote, job).await?;
                         return deploy::read_version(&remote).await;
                     }
-                    let plan = deploy::inspect(&core.packs, &remote, job).await?;
+                    let plan =
+                        deploy::inspect_selected(&core.packs, &remote, explicit, job).await?;
+                    if let Some(note) = plan
+                        .notes
+                        .iter()
+                        .find(|note| note.starts_with("The target requires Forge"))
+                    {
+                        job.detail("sftp-plan", note);
+                    }
                     let version = plan.target_version.clone();
                     deploy::apply(&core.packs, &remote, plan, job).await?;
                     Ok::<_, anyhow::Error>(Some(version))

@@ -48,6 +48,8 @@ pub struct ServerInstance {
     pub target: Target,
     #[serde(default = "default_memory")]
     pub memory_gib: u8,
+    #[serde(default)]
+    pub pack_version: Option<crate::pack::PackTag>,
     pub known_version: Option<server::ServerVersion>,
     pub checked_at: Option<String>,
     pub last_error: Option<String>,
@@ -81,6 +83,7 @@ impl Registry {
                             name: legacy.host.clone(),
                             target: Target::Sftp { connection: legacy },
                             memory_gib: default_memory(),
+                            pack_version: None,
                             known_version: None,
                             checked_at: None,
                             last_error: None,
@@ -160,6 +163,7 @@ impl Registry {
             name,
             target,
             memory_gib,
+            pack_version: old.as_ref().and_then(|server| server.pack_version.clone()),
             known_version: old
                 .as_ref()
                 .filter(|_| unchanged)
@@ -228,6 +232,15 @@ pub async fn deploy_local(
     directory: &str,
     job: &Job,
 ) -> Result<server::ServerVersion> {
+    deploy_local_selected(packs, directory, false, job).await
+}
+
+pub async fn deploy_local_selected(
+    packs: &Packs,
+    directory: &str,
+    explicit: bool,
+    job: &Job,
+) -> Result<server::ServerVersion> {
     use deploy::connection::Remote;
     let destination = local_directory(&packs.layout, directory)?;
     let journal = local_journal(&packs.layout, &destination);
@@ -261,7 +274,7 @@ pub async fn deploy_local(
             fs::Permissions::from_mode(0o755),
         )?;
     }
-    let plan = deploy::inspect(packs, &remote, job).await?;
+    let plan = deploy::inspect_selected(packs, &remote, explicit, job).await?;
     let version = plan.target_version.clone();
     deploy::apply(packs, &remote, plan, job).await?;
     Ok(version)
